@@ -121,7 +121,8 @@ pub(crate) struct ImageInfo<'a> {
     pub name: &'a config::ImageName,
     pub profiles: &'a [String],
     pub created: Option<&'a str>,
-    pub size_bytes: u64,
+    /// `None` when the backend keeps image content outside coop's data dir.
+    pub size_bytes: Option<u64>,
 }
 
 // ── profiles list ────────────────────────────────────────────
@@ -281,11 +282,11 @@ mod tests {
             name: &name,
             profiles: &[],
             created: None,
-            size_bytes: 0,
+            size_bytes: None,
         };
         assert_eq!(
             to_value(&view),
-            json!({ "name": "default", "profiles": [], "created": Value::Null, "size_bytes": 0 })
+            json!({ "name": "default", "profiles": [], "created": Value::Null, "size_bytes": Value::Null })
         );
     }
 
@@ -297,7 +298,7 @@ mod tests {
             name: &name,
             profiles: &profiles,
             created: Some("2026-06-01T12:00:00Z"),
-            size_bytes: 8_589_934_592,
+            size_bytes: Some(8_589_934_592),
         };
         assert_eq!(
             to_value(&view),

@@ -718,7 +718,9 @@ coop images --delete old-image
 With `--json`, each element is `{ "name", "profiles", "created", "size_bytes" }`.
 Absence is modelled honestly: `profiles` is `[]` (not `"none"`), `created` is
 `null` (not `"unknown"`), and `size_bytes` is the raw byte count (the text path's
-`"8.0 GiB"` is presentation only).
+`"8.0 GiB"` is presentation only), or `null` on the Apple Container backend,
+whose images live in the runtime's image store rather than coop's data
+directory.
 
 ### `resize`
 

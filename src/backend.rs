@@ -1178,6 +1178,12 @@ pub trait VmBackend: std::fmt::Display {
         image: &ImageName,
     ) -> Result<()>;
     fn is_running(&self, inst: &Instance) -> bool;
+    /// Whether an image's content lives under its coop data directory, so
+    /// that directory's size is the image's size. `false` for backends whose
+    /// images live in a runtime-owned store.
+    fn images_in_data_dir(&self) -> bool {
+        true
+    }
     /// [`Self::is_running`] for listings, where a state the backend cannot
     /// determine must surface as an error (shown as `unknown`) rather than as
     /// "not running".

@@ -1420,6 +1420,10 @@ impl VmBackend for AppleContainerBackend {
             .is_ok_and(|rec| rec.status == MachineStatus::Running)
     }
 
+    fn images_in_data_dir(&self) -> bool {
+        false
+    }
+
     fn probe_running(&self, inst: &Instance) -> Result<bool> {
         if let Some(journal) = Journal::try_load(inst)? {
             bail!(AppleError::OperationUncertain(format!(

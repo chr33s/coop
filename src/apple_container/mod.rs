@@ -705,8 +705,18 @@ impl Runtime {
     }
 }
 
-/// Argument vector for `machine create`, including the required isolation
-/// extension flags.
+/// The one command that reconciles an unfinished `operation`: `start`
+/// finishes an interrupted resize; `destroy` removes or finishes the rest.
+fn recovery_hint(operation: Operation, name: &crate::config::InstanceName) -> String {
+    match operation {
+        Operation::SetResources => format!("run `coop start {name}` to finish it"),
+        Operation::Create => {
+            format!("run `coop destroy {name}` to remove what it created, then `coop up` again")
+        }
+        Operation::Destroy => format!("run `coop destroy {name}` to finish it"),
+    }
+}
+
 /// `container machine run --root -n <name> -- <command>`. The runtime joins
 /// everything after `--` with spaces and runs it through the guest shell
 /// (`$SHELL -c "$*"` in the machine init script), so `command` is sent as a
@@ -726,6 +736,8 @@ fn machine_run_args(name: &MachineName, command: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// Argument vector for `machine create`, including the required isolation
+/// extension flags.
 fn create_machine_args(
     name: &MachineName,
     network: &NetworkName,
@@ -848,9 +860,11 @@ impl AppleContainerBackend {
         let owner = Owner::load(cfg)?;
         if let Some(journal) = Journal::try_load(inst)? {
             bail!(AppleError::OperationUncertain(format!(
-                "instance '{}' has an unfinished {:?} operation (stage {:?}); run \
-                 `coop start {}` (resize) or `coop destroy {}` (create/destroy) to reconcile it",
-                inst.name, journal.operation, journal.stage, inst.name, inst.name
+                "instance '{}' has an unfinished {:?} operation (stage {:?}); {}",
+                inst.name,
+                journal.operation,
+                journal.stage,
+                recovery_hint(journal.operation, &inst.name)
             )));
         }
         let sidecar = MachineSidecar::load(inst)?;
@@ -1404,6 +1418,28 @@ impl VmBackend for AppleContainerBackend {
         self.runtime()
             .and_then(|rt| rt.inspect_machine(&sidecar.machine_id))
             .is_ok_and(|rec| rec.status == MachineStatus::Running)
+    }
+
+    fn probe_running(&self, inst: &Instance) -> Result<bool> {
+        if let Some(journal) = Journal::try_load(inst)? {
+            bail!(AppleError::OperationUncertain(format!(
+                "instance '{}' has an unfinished {:?} operation",
+                inst.name, journal.operation
+            )));
+        }
+        let Some(sidecar) = MachineSidecar::try_load(inst)? else {
+            return Ok(false);
+        };
+        let rec = self.runtime()?.inspect_machine(&sidecar.machine_id)?;
+        match rec.status {
+            MachineStatus::Running => Ok(true),
+            MachineStatus::Stopped => Ok(false),
+            other => bail!(AppleError::OperationUncertain(format!(
+                "machine {} is {}",
+                sidecar.machine_id,
+                other.label()
+            ))),
+        }
     }
 
     fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<Option<RunningInstance>> {
@@ -1982,6 +2018,81 @@ mod tests {
         fixture("machine-inspect-extended.json")
             .replace("coop-0a1b2c3d-00112233445566ff", name.as_str())
             .replace("\"stopped\"", &format!("\"{status}\""))
+    }
+
+    #[test]
+    fn recovery_hint_names_the_command_for_each_operation() {
+        let name = InstanceName::new("vm1").unwrap();
+        assert!(recovery_hint(Operation::SetResources, &name).contains("`coop start vm1`"));
+        let create = recovery_hint(Operation::Create, &name);
+        assert!(
+            create.contains("`coop destroy vm1`") && create.contains("`coop up`"),
+            "{create}"
+        );
+        let destroy = recovery_hint(Operation::Destroy, &name);
+        assert!(
+            destroy.contains("`coop destroy vm1`") && !destroy.contains("coop up"),
+            "{destroy}"
+        );
+    }
+
+    /// Listings report `unknown` (an error here) instead of `stopped` when
+    /// the state cannot be read or an operation is unfinished.
+    #[test]
+    fn probe_running_distinguishes_unknown_from_stopped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(tmp.path());
+        let owner = Owner::load_or_init(&cfg).unwrap();
+        let inst = test_inst(&cfg);
+        write_sidecar(&inst, &owner);
+        let name = machine_name(&owner);
+
+        for (status, expected) in [
+            ("running", Some(true)),
+            ("stopped", Some(false)),
+            ("stopping", None),
+        ] {
+            let json = inspect_json(&name, status);
+            let (be, _) = backend(Box::new(move |args| {
+                base_response(args, true).unwrap_or_else(|| ok(&json))
+            }));
+            let probe = be.probe_running(&inst);
+            assert_eq!(probe.as_ref().ok().copied(), expected, "{status}");
+            if let Err(e) = probe {
+                assert!(matches!(
+                    e.downcast_ref::<AppleError>(),
+                    Some(AppleError::OperationUncertain(_))
+                ));
+            }
+        }
+
+        // No machine record yet: nothing exists to be running.
+        let bare = Instance {
+            name: InstanceName::new("fresh").unwrap(),
+            dir: cfg.instances_dir().join("fresh"),
+            ..inst.clone()
+        };
+        std::fs::create_dir_all(&bare.dir).unwrap();
+        let (be, _) = backend(Box::new(|args| {
+            base_response(args, true).unwrap_or_else(|| fail("unexpected runtime call"))
+        }));
+        assert_eq!(be.probe_running(&bare).ok(), Some(false));
+
+        let (be, _) = backend(Box::new(|args| {
+            base_response(args, true).unwrap_or_else(|| fail("XPC connection interrupted"))
+        }));
+        assert!(be.probe_running(&inst).is_err());
+
+        Journal::begin(&inst, &owner, Operation::Create, name.clone(), name.clone()).unwrap();
+        let json = inspect_json(&name, "stopped");
+        let (be, _) = backend(Box::new(move |args| {
+            base_response(args, true).unwrap_or_else(|| ok(&json))
+        }));
+        let err = be.probe_running(&inst).unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<AppleError>(),
+            Some(AppleError::OperationUncertain(_))
+        ));
     }
 
     #[test]

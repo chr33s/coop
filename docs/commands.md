@@ -416,7 +416,7 @@ coop destroy --all
 
 ### `list`
 
-Print every instance with its state (`running` or `stopped`). Reads from local on-disk state only — no SSH probing, so it returns instantly even when VMs are unreachable. Use `status` instead when you need resource usage or per-instance detail.
+Print every instance with its state: `running`, `stopped`, or `unknown` when the backend cannot determine it (shown with a warning, for example an Apple Container instance with an unfinished operation). It never connects to a guest over SSH, so it returns quickly even when VMs are unreachable; Lima and Firecracker read local state, and Apple Container asks the runtime (`machine inspect`). Use `status` instead when you need resource usage or per-instance detail.
 
 ```
 coop list

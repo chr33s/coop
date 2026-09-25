@@ -1175,6 +1175,12 @@ pub trait VmBackend: std::fmt::Display {
         image: &ImageName,
     ) -> Result<()>;
     fn is_running(&self, inst: &Instance) -> bool;
+    /// [`Self::is_running`] for listings, where a state the backend cannot
+    /// determine must surface as an error (shown as `unknown`) rather than as
+    /// "not running".
+    fn probe_running(&self, inst: &Instance) -> Result<bool> {
+        Ok(self.is_running(inst))
+    }
     /// Probe the live state of `inst`, returning a `RunningInstance`
     /// when it is up. This is the single chokepoint for "is this VM
     /// alive?" — call sites that need to operate on a running VM

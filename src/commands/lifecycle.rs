@@ -1844,6 +1844,18 @@ pub(crate) fn cmd_destroy(
     Ok(())
 }
 
+/// A listing's state for one instance: a probe error is shown as `unknown`
+/// (with a warning), never as `stopped`.
+fn listed_state(name: &config::InstanceName, probe: Result<bool>) -> json::InstanceState {
+    match probe {
+        Ok(running) => json::InstanceState::from_running(running),
+        Err(e) => {
+            tracing::warn!("Could not determine the state of '{name}': {e:#}");
+            json::InstanceState::Unknown
+        }
+    }
+}
+
 pub(crate) fn cmd_list(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
@@ -1855,7 +1867,7 @@ pub(crate) fn cmd_list(
         .iter()
         .map(|inst| json::InstanceSummary {
             name: &inst.name,
-            state: json::InstanceState::from_running(be.is_running(inst)),
+            state: listed_state(&inst.name, be.probe_running(inst)),
         })
         .collect();
 
@@ -2692,6 +2704,23 @@ mod tests {
                 "gpt-5"
             ]
         );
+    }
+
+    #[test]
+    fn listed_state_reports_probe_errors_as_unknown() {
+        let name = super::config::InstanceName::new("myvm").expect("valid instance name");
+        assert!(matches!(
+            super::listed_state(&name, Ok(true)),
+            super::json::InstanceState::Running
+        ));
+        assert!(matches!(
+            super::listed_state(&name, Ok(false)),
+            super::json::InstanceState::Stopped
+        ));
+        assert!(matches!(
+            super::listed_state(&name, Err(anyhow::anyhow!("probe failed"))),
+            super::json::InstanceState::Unknown
+        ));
     }
 
     #[test]

@@ -255,8 +255,8 @@ clap tests that assert `matches!(cli.command, Commands::List)` (`src/lib.rs:1670
 and `:1676`) — update them to `Commands::List { .. }`.
 
 Deliberately **smaller** than `InstanceStatus`: `cmd_list` only calls
-`is_running` and does **not** run the per-instance usage SSH query that `status`
-runs. Keep `list` cheap — do not add usage here. Consumers who want usage call
+`probe_running` (by default `is_running`; an error lists as `unknown`) and does
+**not** run the per-instance usage SSH query that `status` runs. Keep `list` cheap — do not add usage here. Consumers who want usage call
 `status --json`. Reusing `InstanceState` keeps the two consistent where they
 overlap.
 

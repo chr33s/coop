@@ -76,7 +76,7 @@ impl HomeMount {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MachinePolicy {
     /// Selected network; `None` is the runtime's built-in shared network,
-    /// which the extension reports by omitting `network`.
+    /// which the extension reports as `"network": null` (older builds omit it).
     pub(crate) network: Option<String>,
     pub(crate) ssh_agent_forwarding: bool,
 }
@@ -142,8 +142,8 @@ pub(crate) fn parse_machine_inspect(json: &str, expected: &MachineName) -> Resul
     if only.memory == 0 {
         bail!("machine reports zero memory");
     }
-    // `sshAgentForwarding` marks an extended runtime; `network` is then
-    // omitted only for the built-in network.
+    // `sshAgentForwarding` marks an extended runtime; its `network` is then
+    // null (or, on older builds, absent) only for the built-in network.
     let policy = match (only.network, only.ssh_agent_forwarding) {
         (network, Some(ssh_agent_forwarding)) => Some(MachinePolicy {
             network,
@@ -467,6 +467,13 @@ mod tests {
                 ssh_agent_forwarding: false,
             })
         );
+        // Current builds emit an explicit null for the built-in network.
+        let explicit = fixture("machine-inspect-extended.json").replace(
+            "\"network\" : \"coop-0a1b2c3d-00112233445566ff\"",
+            "\"network\" : null",
+        );
+        let rec = parse_machine_inspect(&explicit, &machine()).unwrap();
+        assert_eq!(rec.policy.and_then(|p| p.network), None);
     }
 
     #[test]

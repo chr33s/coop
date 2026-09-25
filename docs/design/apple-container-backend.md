@@ -3,7 +3,7 @@
 **Document ID:** COOP-APPLE-001  
 **Version:** 0.1.0  
 **Date:** 2026-09-25  
-**Status:** Implemented; qualified on `1.4.1+coop.707eb44` / macOS 27 (§17.3). Firecracker default-backend regression pending  
+**Status:** Implemented; qualified on `1.4.1+coop.83b256f` / macOS 27 (§17.3). Firecracker default-backend regression pending  
 **Target repository:** `trailofbits/coop`  
 **Coop source baseline:** `338228c44977ed4c408ae7c83d79f2e03f60693c`  
 **Apple source baseline:** `apple/container` tag `1.4.1`  
@@ -249,7 +249,7 @@ If the existing boolean `is_running()` API must remain, errors must never grant 
 
 ### 7.1 Explicit dependency
 
-Implement and qualify the following small extension in an upstream contribution or a pinned fork of Apple Container. The flags and fields in this section are not available in stock 1.4.1. They are implemented in the pinned fork [chr33s/container](https://github.com/chr33s/container), vendored as the `vendor/container` submodule (commit `707eb44`); installation is described in `docs/backends.md`.
+Implement and qualify the following small extension in an upstream contribution or a pinned fork of Apple Container. The flags and fields in this section are not available in stock 1.4.1. They are implemented in the pinned fork [chr33s/container](https://github.com/chr33s/container), vendored as the `vendor/container` submodule (commit `83b256f`); installation is described in `docs/backends.md`.
 
 | Surface | Required change |
 |---|---|
@@ -755,7 +755,7 @@ These items are validation work, not evidence that testing has already occurred.
 
 ### 17.3 Qualification evidence (2026-09-25)
 
-Runtime `1.4.1+coop.707eb44` (fork `vendor/container`), macOS 27.0, Apple Silicon. Results are recorded in `docs/backends.md` ("Supported combinations", "Validation status"): fork machine and cross-network isolation tests, coop end-to-end lifecycle, credential/proxy/host-exposure checks with synthetic credentials, service restart, SIGKILL at every journaled stage, and 30 sequential plus concurrent lifecycles without leaks. The stock-runtime contract (`tests/apple-container-contract.sh`) passes against Homebrew 1.4.1. The default Lima backend's integration suite passes on macOS except three `ssh <alias>` checks, which fail because the run used a scratch `HOME` that OpenSSH ignores when locating `~/.ssh/config`; the same alias connects with `ssh -F <scratch config>`. Still open: the Firecracker integration suite on Linux, which requires a remote Linux/KVM host.
+Runtime `1.4.1+coop.83b256f` (fork `vendor/container`; the full coop checks ran on the preceding `707eb44`), macOS 27.0, Apple Silicon. Results are recorded in `docs/backends.md` ("Supported combinations", "Validation status"): fork machine and cross-network isolation tests, coop end-to-end lifecycle, credential/proxy/host-exposure checks with synthetic credentials, service restart, SIGKILL at every journaled stage, and 30 sequential plus concurrent lifecycles without leaks. The stock-runtime contract (`tests/apple-container-contract.sh`) passes against Homebrew 1.4.1. The default Lima backend's integration suite passes on macOS except three `ssh <alias>` checks, which fail because the run used a scratch `HOME` that OpenSSH ignores when locating `~/.ssh/config`; the same alias connects with `ssh -F <scratch config>`. Still open: the Firecracker integration suite on Linux, which requires a remote Linux/KVM host.
 
 ## 18. Source registry
 

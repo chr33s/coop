@@ -421,15 +421,7 @@ impl Runtime {
     /// Boot `name` with a fixed no-op command; `machine run` boots on demand.
     fn boot(&self, name: &MachineName) -> Result<()> {
         let req = Request::new(
-            [
-                "machine",
-                "run",
-                "--root",
-                "-n",
-                name.as_str(),
-                "--",
-                "/usr/bin/true",
-            ],
+            machine_run_args(name, &["/usr/bin/true"]),
             self.settings.boot,
             MAX_TEXT_OUTPUT,
         )
@@ -522,16 +514,7 @@ impl Runtime {
         loop {
             crate::signal::check_shutdown()?;
             let req = Request::new(
-                [
-                    "machine",
-                    "run",
-                    "--root",
-                    "-n",
-                    name.as_str(),
-                    "--",
-                    "/bin/cat",
-                    "/etc/ssh/ssh_host_ed25519_key.pub",
-                ],
+                machine_run_args(name, &["/bin/cat", "/etc/ssh/ssh_host_ed25519_key.pub"]),
                 self.settings.probe,
                 MAX_PUBKEY_OUTPUT,
             );
@@ -655,11 +638,13 @@ impl Runtime {
             if Instant::now() >= deadline {
                 let mut states = vec!["/usr/bin/systemctl", "is-active"];
                 states.extend_from_slice(services);
-                let mut req = vec!["machine", "run", "--root", "-n", name.as_str(), "--"];
-                req.extend(states);
                 let detail = self
                     .exec
-                    .run(&Request::new(req, self.settings.probe, MAX_TEXT_OUTPUT))
+                    .run(&Request::new(
+                        machine_run_args(name, &states),
+                        self.settings.probe,
+                        MAX_TEXT_OUTPUT,
+                    ))
                     .map(|o| cli::sanitize_for_display(&String::from_utf8_lossy(&o.stdout)))
                     .unwrap_or_default();
                 bail!(
@@ -673,26 +658,18 @@ impl Runtime {
     }
 
     /// Which of `paths` are not executable in the machine, from one
-    /// `machine run`. Paths travel as separate arguments, never shell text.
+    /// `machine run`. Paths reach the script as positional parameters, each
+    /// escaped once by [`machine_run_args`], never as script text.
     fn missing_executables(&self, name: &MachineName, paths: &[String]) -> Result<Vec<String>> {
-        let mut args: Vec<String> = [
-            "machine",
-            "run",
-            "--root",
-            "-n",
-            name.as_str(),
-            "--",
+        let mut command = vec![
             "/bin/sh",
             "-c",
             r#"for p; do test -x "$p" || printf '%s\n' "$p"; done"#,
             "sh",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect();
-        args.extend(paths.iter().cloned());
+        ];
+        command.extend(paths.iter().map(String::as_str));
         let out = self.checked(&Request::new(
-            args,
+            machine_run_args(name, &command),
             self.settings.operation,
             MAX_TEXT_OUTPUT,
         ))?;
@@ -701,11 +678,9 @@ impl Runtime {
 
     /// Run a fixed root command in the machine; `true` on exit 0.
     fn run_root_ok(&self, name: &MachineName, command: &[&str]) -> bool {
-        let mut args = vec!["machine", "run", "--root", "-n", name.as_str(), "--"];
-        args.extend_from_slice(command);
         self.exec
             .run(&Request::new(
-                args,
+                machine_run_args(name, command),
                 self.settings.operation,
                 MAX_TEXT_OUTPUT,
             ))
@@ -732,6 +707,25 @@ impl Runtime {
 
 /// Argument vector for `machine create`, including the required isolation
 /// extension flags.
+/// `container machine run --root -n <name> -- <command>`. The runtime joins
+/// everything after `--` with spaces and runs it through the guest shell
+/// (`$SHELL -c "$*"` in the machine init script), so `command` is sent as a
+/// single shell string with every word escaped exactly once.
+fn machine_run_args(name: &MachineName, command: &[&str]) -> Vec<String> {
+    let mut rendered = crate::remote_command::RemoteCommand::new();
+    for (i, word) in command.iter().enumerate() {
+        if i > 0 {
+            rendered = rendered.literal(" ");
+        }
+        rendered = rendered.arg(word);
+    }
+    ["machine", "run", "--root", "-n", name.as_str(), "--"]
+        .into_iter()
+        .map(String::from)
+        .chain([rendered.into_string()])
+        .collect()
+}
+
 fn create_machine_args(
     name: &MachineName,
     network: &NetworkName,
@@ -1843,6 +1837,40 @@ mod tests {
             dir,
             image: ImageName::new("default").unwrap(),
         }
+    }
+
+    /// The machine init script runs `$SHELL -c "$*"` over the words after
+    /// `--`; the rendered command must reach the guest with its argv intact.
+    #[test]
+    fn machine_run_args_survive_the_guest_shell() {
+        let name = MachineName::new("coop-0a1b2c3d-00112233445566ff").unwrap();
+        let words = [
+            "/usr/bin/printf",
+            "%s\\n",
+            "a b",
+            "it's",
+            "$(id)",
+            "; true",
+            "",
+        ];
+        let args = machine_run_args(&name, &words);
+        let (fixed, rest) = args.split_at(6);
+        assert_eq!(
+            fixed,
+            ["machine", "run", "--root", "-n", name.as_str(), "--"]
+        );
+        assert_eq!(rest.len(), 1, "command must be a single word: {rest:?}");
+        let command = rest.first().unwrap();
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", r#"exec /bin/sh -c "$*""#, "init"])
+            .arg(command)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            "a b\nit's\n$(id)\n; true\n\n"
+        );
     }
 
     /// Commands that change runtime state. None may run before the gate passes.

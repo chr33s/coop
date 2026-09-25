@@ -197,8 +197,10 @@ pub(crate) fn parse_image_digest(json: &str) -> Result<String> {
             v.len()
         ))
     })?;
+    // Current runtimes nest the descriptor under `configuration`.
     let digest = only
-        .pointer("/descriptor/digest")
+        .pointer("/configuration/descriptor/digest")
+        .or_else(|| only.pointer("/descriptor/digest"))
         .or_else(|| only.get("digest"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
@@ -224,7 +226,7 @@ RUN set -eux; \
     apt-get update -qq; \
     apt-get install -y -qq --no-install-recommends \
         ca-certificates curl gnupg systemd systemd-sysv dbus openssh-server sudo \
-        iproute2 iputils-ping; \
+        iproute2 iputils-ping lsb-release; \
     bash {CONTEXT_DIR}/provision.sh; \
     bash {CONTEXT_DIR}/machine-setup.sh; \
     rm -rf {CONTEXT_DIR}
@@ -327,6 +329,13 @@ mod tests {
         }
     }
 
+    /// `scripts/guest/docker-repo.sh` resolves the Ubuntu codename with
+    /// `lsb_release`, which the `ubuntu` base image does not ship.
+    #[test]
+    fn dockerfile_installs_provision_prerequisites() {
+        assert!(dockerfile().contains(" lsb-release"));
+    }
+
     #[test]
     fn manifest_id_tracks_inputs() {
         let user = GuestUser::default();
@@ -389,5 +398,18 @@ mod tests {
         assert!(parse_image_digest(&good).unwrap().starts_with("sha256:"));
         assert!(parse_image_digest("[]").is_err());
         assert!(parse_image_digest(r#"[{"descriptor":{"digest":"md5:1"}}]"#).is_err());
+    }
+
+    #[test]
+    fn digest_parsing_reads_the_current_runtime_shape() {
+        let json = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/apple-container/image-inspect-coop-707eb44.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            parse_image_digest(&json).unwrap(),
+            "sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3"
+        );
     }
 }

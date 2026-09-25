@@ -1,0 +1,76 @@
+[
+  {
+    "configuration" : {
+      "creationDate" : "2026-09-11T11:53:37Z",
+      "descriptor" : {
+        "digest" : "sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3",
+        "mediaType" : "application/vnd.oci.image.index.v1+json",
+        "size" : 6688
+      },
+      "name" : "docker.io/library/ubuntu:24.04"
+    },
+    "id" : "008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3",
+    "variants" : [
+      {
+        "config" : {
+          "architecture" : "arm64",
+          "config" : {
+            "Cmd" : [
+              "/bin/bash"
+            ],
+            "Env" : [
+              "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            ],
+            "Labels" : {
+              "org.opencontainers.image.version" : "24.04"
+            },
+            "User" : "",
+            "WorkingDir" : ""
+          },
+          "created" : "2026-09-11T11:53:37.343727408Z",
+          "history" : [
+            {
+              "created" : "2026-09-11T11:53:33.530556871Z",
+              "created_by" : "/bin/sh -c #(nop)  ARG RELEASE",
+              "empty_layer" : true
+            },
+            {
+              "created" : "2026-09-11T11:53:33.593072428Z",
+              "created_by" : "/bin/sh -c #(nop)  ARG LAUNCHPAD_BUILD_ARCH",
+              "empty_layer" : true
+            },
+            {
+              "created" : "2026-09-11T11:53:33.652277582Z",
+              "created_by" : "/bin/sh -c #(nop)  LABEL org.opencontainers.image.version=24.04",
+              "empty_layer" : true
+            },
+            {
+              "created" : "2026-09-11T11:53:37.008578994Z",
+              "created_by" : "/bin/sh -c #(nop) ADD file:ff1ce8d2ee022926eb353ff9248358531fbe1661ef12d8784e68fbc52738ed34 in / "
+            },
+            {
+              "created" : "2026-09-11T11:53:37.343727408Z",
+              "created_by" : "/bin/sh -c #(nop)  CMD [\"/bin/bash\"]",
+              "empty_layer" : true
+            }
+          ],
+          "os" : "linux",
+          "rootfs" : {
+            "diff_ids" : [
+              "sha256:8edaba05454265cd17270d38ec146446c640d1d25637413c3da64a3eff296c36"
+            ],
+            "type" : "layers"
+          },
+          "variant" : "v8"
+        },
+        "digest" : "sha256:11dc1ccb427f0464a2369e645454c272bb0baece7357c892ba69d313b3a332cf",
+        "platform" : {
+          "architecture" : "arm64",
+          "os" : "linux",
+          "variant" : "v8"
+        },
+        "size" : 28944073
+      }
+    ]
+  }
+]

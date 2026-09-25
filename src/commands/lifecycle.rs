@@ -3214,7 +3214,16 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         // 0xFF is not valid UTF-8 in any position.
         let host_path = tmp.path().join(std::ffi::OsStr::from_bytes(b"proj-\xff"));
-        std::fs::create_dir(&host_path).expect("create non-UTF-8 dir");
+        if let Err(e) = std::fs::create_dir(&host_path) {
+            // UTF-8-only filesystems (APFS) refuse the name, so no such
+            // directory can exist there and there is nothing to check.
+            assert_eq!(
+                e.raw_os_error(),
+                Some(libc::EILSEQ),
+                "create non-UTF-8 dir: {e}"
+            );
+            return;
+        }
         assert!(
             host_path.is_dir(),
             "the is-dir guard must not be what trips"

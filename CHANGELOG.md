@@ -13,6 +13,14 @@
   stock 1.4.1 lacks, and refuses to start guests without it. Its state lives
   in `~/.coop-apple`, and `coop update` is disabled for this build. See
   [`docs/backends.md`](docs/backends.md).
+- **Apple Container runtime fork vendored at `vendor/container`** — a git
+  submodule of [chr33s/container](https://github.com/chr33s/container) that
+  adds `container machine create --network` / `--no-ssh-agent` and reports
+  both in `machine inspect`, which the Apple Container backend requires.
+  [`docs/backends.md`](docs/backends.md) describes building and installing
+  it. The backend now treats a `machine inspect` record that reports
+  `sshAgentForwarding` without `network` as a machine on the runtime's
+  built-in network (and refuses it), instead of as an unqualified runtime.
 
 ### Fixes
 

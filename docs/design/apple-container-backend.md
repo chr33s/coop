@@ -249,7 +249,7 @@ If the existing boolean `is_running()` API must remain, errors must never grant 
 
 ### 7.1 Explicit dependency
 
-Implement and qualify the following small extension in an upstream contribution or a pinned fork of Apple Container. The flags and fields in this section are **proposed**, not available in stock 1.4.1.
+Implement and qualify the following small extension in an upstream contribution or a pinned fork of Apple Container. The flags and fields in this section are not available in stock 1.4.1. They are implemented in the pinned fork [chr33s/container](https://github.com/chr33s/container), vendored as the `vendor/container` submodule (commit `707eb44`); installation is described in `docs/backends.md`.
 
 | Surface | Required change |
 |---|---|

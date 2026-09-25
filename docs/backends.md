@@ -55,7 +55,7 @@ Lima runs as the current user. No `sudo` is required for any Lima operation: set
 
 Build with `cargo build --release --features apple-container` to replace Lima with Apple's [`container machine`](https://github.com/apple/container/blob/1.4.1/docs/container-machine.md) runtime. Selecting the feature on a non-macOS target is a compile error. The default macOS build never calls, requires, or modifies Apple Container.
 
-> **Status: blocked on a runtime extension.** Stock Apple Container 1.4.1 attaches every machine to one shared built-in network and forwards the host SSH agent into it, and its machine CLI has no switch for either. coop requires a runtime build whose `container machine create` accepts `--network <id>` and `--no-ssh-agent`, and whose `machine inspect` reports `network` and `sshAgentForwarding`. On a runtime without them, `coop setup`, `up`, `start`, `shell`, and every other command that needs a guest fail with `APPLE_RUNTIME_UNQUALIFIED` before any credential, workspace, agent, or project hook reaches a guest. There is no override. Listing, stopping, and destroying already-owned resources still work.
+> **Requires the vendored runtime fork.** Stock Apple Container 1.4.1 attaches every machine to one shared built-in network and forwards the host SSH agent into it, and its machine CLI has no switch for either. coop requires a runtime whose `container machine create` accepts `--network <id>` and `--no-ssh-agent`, and whose `machine inspect` reports `network` and `sshAgentForwarding`. The fork at [`vendor/container`](../vendor/container) ([chr33s/container](https://github.com/chr33s/container)) adds both; see [Installing the runtime](#installing-the-runtime). On a runtime without them, `coop setup`, `up`, `start`, `shell`, and every other command that needs a guest fail with `APPLE_RUNTIME_UNQUALIFIED` before any credential, workspace, agent, or project hook reaches a guest. There is no override. Listing, stopping, and destroying already-owned resources still work.
 
 ### Prerequisites
 
@@ -64,6 +64,20 @@ Build with `cargo build --release --features apple-container` to replace Lima wi
 - The runtime binary is taken from `[apple_container] binary`, or else `/usr/local/bin/container` or `/opt/homebrew/bin/container`. `PATH` and project files are never consulted, and a binary that is group/world-writable or owned by another user is rejected.
 
 Neither Lima nor host Docker is needed. Docker still runs *inside* the guest.
+
+### Installing the runtime
+
+The fork is a git submodule; build it into Apple's installer package with a version coop accepts (`<upstream base>+coop.<commit>`):
+
+```bash
+git submodule update --init vendor/container
+v="1.4.1+coop.$(git -C vendor/container rev-parse --short=7 HEAD)"
+make -C vendor/container BUILD_CONFIGURATION=release RELEASE_VERSION="$v" build installer-pkg
+```
+
+The package is `vendor/container/bin/release/container-installer-unsigned.pkg` and installs to `/usr/local`, the first location coop searches. Only one Apple Container service can run at a time: stop any other installation's service (for Homebrew, `/opt/homebrew/bin/container system stop`) before installing, then `sudo installer -pkg <pkg> -target /` and `/usr/local/bin/container system start`. A Homebrew `container` earlier on `PATH` still shadows the fork for your own shell commands; coop always uses `/usr/local/bin/container` or `[apple_container] binary`.
+
+`container --version` reports the fork commit in the version and `commit:` fields, and coop records that line with each image and instance.
 
 ### Configuration
 
@@ -148,7 +162,7 @@ Runtime commands run with a cleared environment: only `HOME`, `USER`, `LOGNAME`,
 
 ### Not yet validated
 
-Nothing in this section has been exercised against a qualified runtime, because none exists yet. The machine/network/SSH-agent extension still has to be implemented and reviewed in Apple Container. After that, the real-hardware acceptance suite still needs to run: cross-network IPv4/IPv6 isolation, the host-exposure and agent canaries, first-boot identity, restart, crash recovery, and endurance. Until then, the stock-runtime refusal is the only runtime behaviour this backend has been tested for.
+The fork's own machine integration tests cover the extension: attachment to only the selected network across restarts, boot failure when that network is deleted, no agent socket or `SSH_AUTH_SOCK` in the guest with `--no-ssh-agent` even when the host sets one, the `machine inspect` fields, and first boot through `machine run` without a terminal (as coop boots). `testSeparateNetworksAreIsolated` checks cross-network isolation on macOS 27: a machine on one network cannot reach a machine on another by TCP or ICMP over IPv4 or IPv6, including after adding an on-link route or an address inside the other network's subnet, while a machine on the target's own network can. Still untested: neighbor impersonation against host-to-peer SSH, UDP/broadcast/multicast, whether forwarded ports and the credential proxy are reachable from another guest, and coop's end-to-end flow (`setup`, `up`, the isolation gate, host-key pinning, restart, destroy) against the fork, along with first-boot identity, crash recovery, and endurance.
 
 ## Linux / Firecracker
 

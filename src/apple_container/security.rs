@@ -3,8 +3,8 @@
 //! Stock Apple Container 1.4.1 attaches every machine to the built-in shared
 //! network and forwards the caller's SSH agent into it. coop therefore
 //! requires a runtime extension (a per-machine `--network` and
-//! `--no-ssh-agent`, reported back by `machine inspect`) and fails closed
-//! without it. No flag or config key relaxes these checks.
+//! `--no-ssh-agent`, reported back by `machine inspect`), provided by the
+//! fork vendored at `vendor/container`, and fails closed without it. No flag or config key relaxes these checks.
 
 use anyhow::{Result, bail};
 
@@ -100,10 +100,14 @@ pub(crate) fn verify_machine_config(record: &MachineRecord, network: &NetworkNam
             record.id
         )));
     }
-    if policy.network != network.as_str() {
+    if policy.network.as_deref() != Some(network.as_str()) {
+        let configured = policy.network.as_deref().map_or_else(
+            || "the built-in network".to_owned(),
+            |n| format!("network {n:?}"),
+        );
         bail!(AppleError::NetworkIsolation(format!(
-            "machine {} is configured for network {:?}, expected its dedicated network {network}",
-            record.id, policy.network
+            "machine {} is configured for {configured}, expected its dedicated network {network}",
+            record.id
         )));
     }
     Ok(())
@@ -224,7 +228,7 @@ mod tests {
             cpus: 2,
             memory_bytes: 1 << 32,
             policy: Some(MachinePolicy {
-                network: net().to_string(),
+                network: Some(net().to_string()),
                 ssh_agent_forwarding: false,
             }),
         }
@@ -272,12 +276,13 @@ mod tests {
 
     #[test]
     fn extended_runtime_qualifies() {
-        let help = fixture("machine-create-help-1.4.1.txt").replace(
-            "  --home-mount <home-mount>",
-            "  --network <network>     Network to attach\n  --no-ssh-agent          Disable agent\n  --home-mount <home-mount>",
-        );
-        let q = qualify(&fixture("version-1.4.1.txt"), &help).unwrap();
-        assert!(q.identity.contains("1.4.1"));
+        let q = qualify(
+            &fixture("version-coop-fdddb59.txt"),
+            &fixture("machine-create-help-coop-fdddb59.txt"),
+        )
+        .unwrap();
+        assert!(q.identity.contains("1.4.1+coop.fdddb59"));
+        let help = fixture("machine-create-help-coop-fdddb59.txt");
         assert!(qualify("container CLI version 1.3.0 (build: release)", &help).is_err());
     }
 
@@ -307,15 +312,17 @@ mod tests {
             AppleError::RuntimeUnqualified(_)
         ));
 
-        let mut r = record();
-        r.policy = Some(MachinePolicy {
-            network: "default".into(),
-            ssh_agent_forwarding: false,
-        });
-        assert!(matches!(
-            kind(&verify_machine_config(&r, &net()).unwrap_err()),
-            AppleError::NetworkIsolation(_)
-        ));
+        for network in [Some("default".to_owned()), None] {
+            let mut r = record();
+            r.policy = Some(MachinePolicy {
+                network,
+                ssh_agent_forwarding: false,
+            });
+            assert!(matches!(
+                kind(&verify_machine_config(&r, &net()).unwrap_err()),
+                AppleError::NetworkIsolation(_)
+            ));
+        }
 
         let mut c = container();
         c.ssh_agent_forwarding = true;

@@ -119,7 +119,8 @@ cargo test --features apple-container
 
 Parser fixtures live in `tests/fixtures/apple-container/`. That directory's
 README records which files were captured from a real runtime and which were
-derived from the pinned 1.4.1 source.
+derived from source: the pinned 1.4.1 tag for stock-runtime shapes, and the
+`vendor/container` fork for the extension fields.
 
 `tests/apple-container-contract.sh` runs a feature build against the installed
 runtime. It checks that a stock runtime (no machine network / SSH-agent

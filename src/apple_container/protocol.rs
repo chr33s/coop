@@ -75,7 +75,9 @@ impl HomeMount {
 /// absence is how an unqualified runtime is detected per machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MachinePolicy {
-    pub(crate) network: String,
+    /// Selected network; `None` is the runtime's built-in shared network,
+    /// which the extension reports by omitting `network`.
+    pub(crate) network: Option<String>,
     pub(crate) ssh_agent_forwarding: bool,
 }
 
@@ -140,13 +142,15 @@ pub(crate) fn parse_machine_inspect(json: &str, expected: &MachineName) -> Resul
     if only.memory == 0 {
         bail!("machine reports zero memory");
     }
+    // `sshAgentForwarding` marks an extended runtime; `network` is then
+    // omitted only for the built-in network.
     let policy = match (only.network, only.ssh_agent_forwarding) {
-        (Some(network), Some(ssh_agent_forwarding)) => Some(MachinePolicy {
+        (network, Some(ssh_agent_forwarding)) => Some(MachinePolicy {
             network,
             ssh_agent_forwarding,
         }),
         (None, None) => None,
-        _ => bail!(AppleError::RuntimeUnqualified(
+        (Some(_), None) => bail!(AppleError::RuntimeUnqualified(
             "machine inspect reports only part of the network/SSH-agent policy".into()
         )),
     };
@@ -408,7 +412,7 @@ mod tests {
         assert_eq!(
             rec.policy,
             Some(MachinePolicy {
-                network: "coop-0a1b2c3d-00112233445566ff".into(),
+                network: Some("coop-0a1b2c3d-00112233445566ff".into()),
                 ssh_agent_forwarding: false,
             })
         );
@@ -449,6 +453,20 @@ mod tests {
         let partial =
             fixture("machine-inspect-extended.json").replace("\"sshAgentForwarding\" : false,", "");
         assert!(parse_machine_inspect(&partial, &m).is_err());
+    }
+
+    #[test]
+    fn extended_inspect_without_network_is_the_builtin_network() {
+        let json = fixture("machine-inspect-extended.json")
+            .replace("\"network\" : \"coop-0a1b2c3d-00112233445566ff\",", "");
+        let rec = parse_machine_inspect(&json, &machine()).unwrap();
+        assert_eq!(
+            rec.policy,
+            Some(MachinePolicy {
+                network: None,
+                ssh_agent_forwarding: false,
+            })
+        );
     }
 
     #[test]
@@ -500,6 +518,20 @@ mod tests {
         assert!(help_lists_flag(&help, "--no-boot"));
         assert!(!help_lists_flag(&help, "--network"));
         assert!(!help_lists_flag(&help, "--no-ssh-agent"));
+
+        let (line, v) = parse_version(&fixture("version-coop-fdddb59.txt")).unwrap();
+        assert_eq!(v, "1.4.1+coop.fdddb59".parse::<semver::Version>().unwrap());
+        assert!(line.contains("commit: fdddb59"));
+        let help = fixture("machine-create-help-coop-fdddb59.txt");
+        for flag in [
+            "--network",
+            "--no-ssh-agent",
+            "--home-mount",
+            "--no-boot",
+            "--progress",
+        ] {
+            assert!(help_lists_flag(&help, flag), "{flag}");
+        }
     }
 
     #[test]

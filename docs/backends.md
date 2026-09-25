@@ -43,7 +43,7 @@ The Lima template configures:
 
 ### Resize (disk, memory, vCPUs)
 
-Resizing a stopped instance's disk truncates the Lima disk to the new size. Cloud-init's `growpart` module expands the partition and filesystem on next boot. Shrinking is not supported.
+Resizing a stopped instance's disk records the new size as `disk:` in its `lima.yaml` (Lima 2.x refuses to boot when the disk is larger than that value) and truncates the Lima disk to it. Cloud-init's `growpart` module expands the partition and filesystem on next boot. Shrinking is not supported. Re-running `coop resize --size` at the current size repairs an instance whose `lima.yaml` lags its disk.
 
 Memory and vCPU changes rewrite the `cpus`/`memory` fields in the instance's `lima.yaml`, which Lima re-reads on `limactl start`. The edit is written atomically, then coop starts the instance to validate and apply the new spec — if `limactl` rejects it (e.g. a spec larger than the host), the previous `lima.yaml` is restored. Without `--start` the instance is stopped again after the validating boot. The `lima.yaml` is authoritative: the global `[vm]` `cpus`/`memory` settings only seed *new* instances.
 

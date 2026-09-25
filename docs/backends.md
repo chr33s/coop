@@ -67,17 +67,27 @@ Neither Lima nor host Docker is needed. Docker still runs *inside* the guest.
 
 ### Installing the runtime
 
-The fork is a git submodule; build it into Apple's installer package with a version coop accepts (`<upstream base>+coop.<commit>`):
+The fork is a git submodule. `scripts/build-apple-container-runtime.sh [PREFIX]` builds it in release mode with a version coop accepts (`<upstream base>+coop.<commit>`, plus `-dirty` for uncommitted changes) and unpacks Apple's installer payload into `PREFIX` (default `~/.local/opt/coop-apple-container`) as your user, without `sudo`. Point coop at it:
 
-```bash
-git submodule update --init vendor/container
-v="1.4.1+coop.$(git -C vendor/container rev-parse --short=7 HEAD)"
-make -C vendor/container BUILD_CONFIGURATION=release RELEASE_VERSION="$v" build installer-pkg
+```toml
+[apple_container]
+binary = "/Users/you/.local/opt/coop-apple-container/bin/container"
 ```
 
-The package is `vendor/container/bin/release/container-installer-unsigned.pkg` and installs to `/usr/local`, the first location coop searches. Only one Apple Container service can run at a time: stop any other installation's service (for Homebrew, `/opt/homebrew/bin/container system stop`) before installing, then `sudo installer -pkg <pkg> -target /` and `/usr/local/bin/container system start`. A Homebrew `container` earlier on `PATH` still shadows the fork for your own shell commands; coop always uses `/usr/local/bin/container` or `[apple_container] binary`.
+Only one Apple Container service can run at a time. Stop any other installation's service first (for Homebrew, `/opt/homebrew/bin/container system stop`), then run `<PREFIX>/bin/container system start`. The service's plugins come from the same prefix. Containers from the other installation keep their data but do not run while the fork's service is up.
+
+For a system-wide install instead, build the package with `make -C vendor/container BUILD_CONFIGURATION=release RELEASE_VERSION="1.4.1+coop.$(git -C vendor/container rev-parse --short=7 HEAD)" build installer-pkg` and install `vendor/container/bin/release/container-installer-unsigned.pkg` with `sudo installer -pkg <pkg> -target /`. It installs to `/usr/local`, the first location coop searches when `binary` is unset.
 
 `container --version` reports the fork commit in the version and `commit:` fields, and coop records that line with each image and instance.
+
+### Supported combinations
+
+| Runtime | macOS | Hardware | Evidence |
+|---|---|---|---|
+| `vendor/container` at `707eb44` (`1.4.1+coop.707eb44`) | 27.0 | Apple Silicon | Fork machine tests, coop end-to-end and security checks (below) |
+| Stock Apple Container 1.4.1 | any | Apple Silicon | Refused with `APPLE_RUNTIME_UNQUALIFIED` (`tests/apple-container-contract.sh`) |
+
+Other runtime builds and macOS releases are unqualified until the same checks pass on them.
 
 ### Configuration
 

@@ -865,8 +865,10 @@ fn default_apple_boot_timeout() -> TimeoutSecs {
     TimeoutSecs(120)
 }
 
+/// The runtime stops one machine at a time (each waits up to 10 s for a
+/// clean shutdown), so a stop queued behind others needs headroom.
 fn default_apple_stop_timeout() -> TimeoutSecs {
-    TimeoutSecs(30)
+    TimeoutSecs(60)
 }
 
 fn default_apple_build_timeout() -> TimeoutSecs {

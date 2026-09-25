@@ -163,5 +163,5 @@
 # operation_timeout_seconds = 60 # network create/delete, machine set, image delete
 # create_timeout_seconds = 600   # machine create (unpacks the image)
 # boot_timeout_seconds = 120     # boot until SSH is ready
-# stop_timeout_seconds = 30      # stop confirmation
+# stop_timeout_seconds = 60      # stop confirmation (the runtime stops machines one at a time)
 # build_timeout_seconds = 3600   # image build (`setup --builder-timeout` overrides)

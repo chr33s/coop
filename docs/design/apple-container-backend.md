@@ -172,7 +172,7 @@ Reuse existing Coop CPU, memory, image, guest-user, profile, and workspace setti
 # binary = "/absolute/path/to/container"
 probe_timeout_seconds = 10
 boot_timeout_seconds = 120
-stop_timeout_seconds = 30
+stop_timeout_seconds = 60
 ```
 
 Timeout values above are proposed defaults, not measured performance. Validate positive bounded values. Image builds need a separate, substantially longer cancellation-aware deadline; do not apply the boot timeout to package installation.

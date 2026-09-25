@@ -6,8 +6,9 @@
 
 # Keep the formatter off vendored/build trees so a bare `taplo format` (no file
 # args) only touches this repo's own TOML. revm-kani is a gitignored vendored
-# checkout used for the kani proofs; target is build output.
-exclude = ["revm-kani/**", "target/**"]
+# checkout used for the kani proofs; vendor/container is the Apple Container
+# runtime submodule, formatted by its own upstream; target is build output.
+exclude = ["revm-kani/**", "target/**", "vendor/**"]
 
 [formatting]
 indent_string = "  "

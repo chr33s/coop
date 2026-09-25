@@ -1962,6 +1962,18 @@ impl CoopConfig {
         Ok(cfg)
     }
 
+    /// Root of this build's persistent state (images, instances, the VM key,
+    /// stored secrets). Currently `data_dir` itself; kept separate so a
+    /// backend can nest its state without changing `data_dir`'s meaning.
+    pub fn state_root(&self) -> PathBuf {
+        self.data_dir.to_path_buf()
+    }
+
+    /// The directory `uninstall --purge` may remove wholesale.
+    pub fn owned_data_dir(&self) -> PathBuf {
+        self.data_dir.to_path_buf()
+    }
+
     /// Expand a leading `~` in the marketplace entries that are paths.
     ///
     /// Scalar path fields (`data_dir`, `firecracker_bin`,
@@ -2108,7 +2120,7 @@ impl CoopConfig {
 
     /// Directory containing all named images.
     pub fn images_dir(&self) -> PathBuf {
-        self.data_dir.join("images")
+        self.state_root().join("images")
     }
 
     /// Directory for a specific named image.
@@ -2184,18 +2196,18 @@ impl CoopConfig {
 
     /// Path to the SSH private key for guest access
     pub fn ssh_key_path(&self) -> PathBuf {
-        self.data_dir.join("vm_key")
+        self.state_root().join("vm_key")
     }
 
     /// Directory containing all instances
     pub fn instances_dir(&self) -> PathBuf {
-        self.data_dir.join("instances")
+        self.state_root().join("instances")
     }
 
     /// Path to per-project devcontainer discovery preferences.
     #[mutants::skip] // equivalent: default-path getter; no caller asserts the returned PathBuf
     pub fn devcontainer_preferences_path(&self) -> PathBuf {
-        self.data_dir.join("devcontainer_preferences.json")
+        self.state_root().join("devcontainer_preferences.json")
     }
 
     /// List all existing instances, sorted by index.
@@ -2786,6 +2798,15 @@ mod tests {
     use proptest::prelude::*;
     use tempfile::TempDir;
 
+    /// The state root a config with `data_dir = dir` uses in this build.
+    fn state_root_of(dir: &Path) -> PathBuf {
+        CoopConfig {
+            data_dir: ConfigPath::new(dir),
+            ..CoopConfig::default()
+        }
+        .state_root()
+    }
+
     fn test_config(tmp: &TempDir) -> CoopConfig {
         CoopConfig {
             data_dir: ConfigPath::new(tmp.path()),
@@ -2840,7 +2861,7 @@ mod tests {
         let inst = Instance {
             name: InstanceName::new(name).unwrap(),
             index,
-            dir: dir.join("instances").join(name),
+            dir: state_root_of(dir).join("instances").join(name),
             image: ImageName::new(DEFAULT_IMAGE).unwrap(),
         };
         inst.save().unwrap();
@@ -3217,7 +3238,7 @@ mod tests {
         make_instance(tmp.path(), "zero", idx(0));
 
         // Remove index 0
-        fs::remove_dir_all(tmp.path().join("instances/zero")).unwrap();
+        fs::remove_dir_all(cfg.instances_dir().join("zero")).unwrap();
 
         // Next should fill gap at 0 since highest (252) is at ceiling
         let inst = cfg
@@ -3413,7 +3434,7 @@ mod tests {
         // `wanted` instance living under a differently-named directory.
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
-        let instances = tmp.path().join("instances");
+        let instances = state_root_of(tmp.path()).join("instances");
 
         let stale = Instance {
             name: iname("decoy"),
@@ -4597,7 +4618,8 @@ skip = ["not-a-slug"]
             (cfg.instances_dir(), "/my/data/instances"),
             (cfg.images_dir(), "/my/data/images"),
         ] {
-            assert_eq!(got, PathBuf::from(want));
+            let rel = want.strip_prefix("/my/data/").unwrap();
+            assert_eq!(got, cfg.state_root().join(rel));
         }
 
         // Default-value getters compose the same filenames under the
@@ -4617,6 +4639,17 @@ skip = ["not-a-slug"]
             dir.ends_with(".coop"),
             "expected path ending with .coop, got: {dir:?}"
         );
+    }
+
+    #[test]
+    fn state_root_is_data_dir() {
+        let cfg = CoopConfig {
+            data_dir: ConfigPath::new("/d"),
+            ..CoopConfig::default()
+        };
+        assert_eq!(cfg.state_root(), PathBuf::from("/d"));
+        assert_eq!(cfg.owned_data_dir(), PathBuf::from("/d"));
+        assert_eq!(cfg.instances_dir(), PathBuf::from("/d/instances"));
     }
 
     // ── Config validation ─────────────────────────────────────
@@ -4867,7 +4900,7 @@ skip = ["not-a-slug"]
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         fs::create_dir(&data_dir).unwrap();
-        let image_dir = data_dir.join("images").join(DEFAULT_IMAGE);
+        let image_dir = state_root_of(&data_dir).join("images").join(DEFAULT_IMAGE);
         fs::create_dir_all(&image_dir).unwrap();
         fs::write(image_dir.join("rootfs-template.ext4"), b"").unwrap();
 
@@ -4888,7 +4921,7 @@ skip = ["not-a-slug"]
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         fs::create_dir(&data_dir).unwrap();
-        let image_dir = data_dir.join("images").join(DEFAULT_IMAGE);
+        let image_dir = state_root_of(&data_dir).join("images").join(DEFAULT_IMAGE);
         fs::create_dir_all(&image_dir).unwrap();
         fs::write(image_dir.join("rootfs-template.ext4"), b"").unwrap();
         let kernel = data_dir.join("vmlinux");
@@ -5076,22 +5109,23 @@ skip = ["not-a-slug"]
             ..CoopConfig::default()
         };
         let foo = ImageName::new("foo").unwrap();
-        assert_eq!(cfg.image_dir(&foo), PathBuf::from("/data/images/foo"));
+        let root = cfg.state_root();
+        assert_eq!(cfg.image_dir(&foo), root.join("images/foo"));
         assert_eq!(
             cfg.template_path_for(&foo),
-            PathBuf::from("/data/images/foo/rootfs-template.ext4")
+            root.join("images/foo/rootfs-template.ext4")
         );
         assert_eq!(
             cfg.template_config_path_for(&foo),
-            PathBuf::from("/data/images/foo/template-config.json")
+            root.join("images/foo/template-config.json")
         );
         assert_eq!(
             cfg.lima_base_path(&foo),
-            PathBuf::from("/data/images/foo/lima-base.img")
+            root.join("images/foo/lima-base.img")
         );
         assert_eq!(
             cfg.lima_template_path(&foo),
-            PathBuf::from("/data/images/foo/lima-template.yaml")
+            root.join("images/foo/lima-template.yaml")
         );
     }
 
@@ -5192,7 +5226,7 @@ skip = ["not-a-slug"]
         make_instance(tmp.path(), "good", idx(0));
 
         // Create a dir with no instance.json (crashed mid-create)
-        let orphan = tmp.path().join("instances").join("orphan");
+        let orphan = state_root_of(tmp.path()).join("instances").join("orphan");
         fs::create_dir_all(&orphan).unwrap();
 
         let instances = cfg.list_instances().unwrap();
@@ -5208,7 +5242,7 @@ skip = ["not-a-slug"]
         make_instance(tmp.path(), "good", idx(0));
 
         // Create a dir with garbage JSON (truncated write)
-        let broken = tmp.path().join("instances").join("broken");
+        let broken = state_root_of(tmp.path()).join("instances").join("broken");
         fs::create_dir_all(&broken).unwrap();
         fs::write(broken.join("instance.json"), r#"{"name": "bro"#).unwrap();
 
@@ -5225,7 +5259,7 @@ skip = ["not-a-slug"]
         make_instance(tmp.path(), "good", idx(0));
 
         // Create a dir with empty file (truncated before any content)
-        let empty = tmp.path().join("instances").join("empty");
+        let empty = state_root_of(tmp.path()).join("instances").join("empty");
         fs::create_dir_all(&empty).unwrap();
         fs::write(empty.join("instance.json"), "").unwrap();
 
@@ -5240,7 +5274,7 @@ skip = ["not-a-slug"]
         let cfg = test_config(&tmp);
 
         // Create a corrupted instance dir occupying no valid index
-        let broken = tmp.path().join("instances").join("broken");
+        let broken = state_root_of(tmp.path()).join("instances").join("broken");
         fs::create_dir_all(&broken).unwrap();
         fs::write(broken.join("instance.json"), "not json").unwrap();
 

@@ -627,6 +627,7 @@ pub fn ssh_target(cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {
         port,
         user: SshUser::new(guest_user.as_str())?,
         key_path: cfg.ssh_key_path(),
+        host_keys: crate::backend::HostKeyPolicy::Unverified,
     })
 }
 
@@ -982,6 +983,7 @@ fn builder_ssh_target(cfg: &CoopConfig, guest_user: &GuestUser) -> Result<SshTar
         port,
         user: SshUser::new(guest_user.as_str())?,
         key_path: cfg.ssh_key_path(),
+        host_keys: crate::backend::HostKeyPolicy::Unverified,
     })
 }
 
@@ -1658,6 +1660,7 @@ fn wait_for_lima_ssh(
         port: std::num::NonZeroU16::new(port).context("Lima assigned SSH port 0")?,
         user: SshUser::new(guest_user.as_str())?,
         key_path: cfg.ssh_key_path(),
+        host_keys: crate::backend::HostKeyPolicy::Unverified,
     };
     let mut delay = Duration::from_millis(500);
 

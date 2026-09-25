@@ -290,6 +290,40 @@ impl AsRef<str> for SshUser {
     }
 }
 
+/// How the host authenticates a guest's SSH host key.
+///
+/// Each backend picks one policy when it builds an [`SshTarget`], and every
+/// transport (ssh, scp, rsync, multiplexed probes, the editor `~/.ssh/config`
+/// block) derives its options from that single choice, so a transport cannot
+/// silently downgrade checking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostKeyPolicy {
+    /// No host-key verification. Firecracker and Lima reach their guest over a
+    /// per-instance TAP device or a hostagent-owned loopback forward that no
+    /// other guest can occupy, so there is nothing to pin against.
+    Unverified,
+}
+
+impl HostKeyPolicy {
+    /// `ssh -o` option values (without the `-o`) for this policy, in order.
+    fn ssh_options(&self) -> Vec<String> {
+        match self {
+            Self::Unverified => vec![
+                "StrictHostKeyChecking=no".into(),
+                "UserKnownHostsFile=/dev/null".into(),
+            ],
+        }
+    }
+
+    /// `~/.ssh/config` directive lines (`Key Value`) for this policy.
+    pub fn ssh_config_lines(&self) -> Vec<String> {
+        self.ssh_options()
+            .into_iter()
+            .map(|opt| opt.replacen('=', " ", 1))
+            .collect()
+    }
+}
+
 /// SSH connection details for reaching a guest VM.
 #[derive(Debug, Clone)]
 pub struct SshTarget {
@@ -297,6 +331,7 @@ pub struct SshTarget {
     pub port: NonZeroU16,
     pub user: SshUser,
     pub key_path: PathBuf,
+    pub host_keys: HostKeyPolicy,
 }
 
 // ── SSH session ───────────────────────────────────────────────
@@ -353,7 +388,7 @@ impl SshTarget {
     /// the remote command, so a silent hour-long install is never at risk —
     /// only a guest whose sshd cannot answer for 90s.
     fn transport_opts(&self) -> Vec<String> {
-        vec![
+        let mut opts: Vec<String> = vec![
             "-o".into(),
             "BatchMode=yes".into(),
             "-o".into(),
@@ -362,17 +397,19 @@ impl SshTarget {
             "ServerAliveInterval=30".into(),
             "-o".into(),
             "ServerAliveCountMax=3".into(),
-            "-o".into(),
-            "StrictHostKeyChecking=no".into(),
-            "-o".into(),
-            "UserKnownHostsFile=/dev/null".into(),
+        ];
+        for opt in self.host_keys.ssh_options() {
+            opts.extend(["-o".into(), opt]);
+        }
+        opts.extend([
             "-o".into(),
             "IdentitiesOnly=yes".into(),
             "-o".into(),
             "LogLevel=ERROR".into(),
             "-i".into(),
             self.key_path.display().to_string(),
-        ]
+        ]);
+        opts
     }
 
     /// SSH options for commands.
@@ -770,12 +807,114 @@ pub fn boot_preflight(cfg: &CoopConfig) -> Result<()> {
     cfg.validate().map(drop)
 }
 
+// ── Backend capabilities ──────────────────────────────────────
+
+/// Something a backend may or may not support. Handlers check the one they
+/// need with [`BackendCapabilities::require`] before any side effect (stopping
+/// a VM, writing image metadata, looking up a disk path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capability {
+    /// Host directories are shared live (virtiofs) instead of copied.
+    LiveMounts,
+    /// Grow an instance disk (`coop resize --disk`) or size it explicitly at
+    /// creation (`coop up --disk`).
+    DiskResize,
+    /// Save or replace an instance filesystem (`coop commit` / `coop restore`).
+    DiskSnapshots,
+    /// Change memory and vCPUs of a stopped instance.
+    MachineResources,
+}
+
+impl Capability {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::LiveMounts => "live host-directory mounts",
+            Self::DiskResize => "explicit disk sizing and resizing",
+            Self::DiskSnapshots => "filesystem commit/restore snapshots",
+            Self::MachineResources => "changing memory or vCPUs",
+        }
+    }
+}
+
+/// How a guest reaches a server bound to the host's loopback interface
+/// (a local model endpoint).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalEndpointRoute {
+    /// The guest routes to the host at this address, so loopback endpoint
+    /// URLs are rewritten to it (Firecracker's TAP gateway, Lima's
+    /// `host.lima.internal`).
+    HostAddress(String),
+}
+
+/// How one local-model endpoint is reached from inside the guest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalEndpointPlan {
+    /// URL written into the guest agent's configuration.
+    pub guest_url: url::Url,
+}
+
+/// Resolve how the guest reaches `host_url` over `route`: loopback URLs are
+/// rewritten to the host address the route names; others pass through.
+pub fn plan_local_endpoint(
+    route: &LocalEndpointRoute,
+    host_url: &url::Url,
+) -> Result<LocalEndpointPlan> {
+    match route {
+        LocalEndpointRoute::HostAddress(addr) => Ok(LocalEndpointPlan {
+            guest_url: crate::network::rewrite_host_url(host_url, addr)?,
+        }),
+    }
+}
+
+/// What a backend supports, reported by [`VmBackend::capabilities`].
+///
+/// Capability reporting, not runtime backend selection: the backend is still
+/// fixed at compile time by [`PlatformBackend`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendCapabilities(&'static [Capability]);
+
+impl BackendCapabilities {
+    pub const fn new(supported: &'static [Capability]) -> Self {
+        Self(supported)
+    }
+
+    pub fn has(self, cap: Capability) -> bool {
+        self.0.contains(&cap)
+    }
+
+    /// Fail with a typed unsupported-capability error unless `cap` is present.
+    pub fn require(self, backend: &impl std::fmt::Display, cap: Capability) -> Result<()> {
+        if self.has(cap) {
+            return Ok(());
+        }
+        Err(UnsupportedCapability {
+            backend: backend.to_string(),
+            capability: cap,
+        }
+        .into())
+    }
+}
+
+/// A requested operation the active backend does not implement. Raised before
+/// any state-changing work.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "CAPABILITY_UNSUPPORTED: the {backend} backend does not support {}; nothing was changed",
+    capability.describe()
+)]
+pub struct UnsupportedCapability {
+    pub backend: String,
+    pub capability: Capability,
+}
+
 /// VM backend for managing guest lifecycle.
 ///
 /// Two impls: `FirecrackerBackend` (Linux) and `LimaBackend` (macOS).
 /// The `PlatformBackend` type alias selects the correct one at compile
 /// time via `#[cfg]`.
 pub trait VmBackend: std::fmt::Display {
+    /// What this backend supports; see [`BackendCapabilities`].
+    fn capabilities(&self) -> BackendCapabilities;
     fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()>;
     fn create_and_start(
         &self,
@@ -876,15 +1015,16 @@ pub trait VmBackend: std::fmt::Display {
     -> Result<()>;
     fn ssh_target(&self, cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget>;
     fn disk_path(&self, inst: &Instance) -> Result<PathBuf>;
-    /// The address the guest uses to reach a server running on the host,
-    /// for rewriting local-model endpoints (see
-    /// [`crate::network::rewrite_host_url`]). Firecracker guests route
+    /// How the guest reaches a server running on the host, for local-model
+    /// endpoints (see [`plan_local_endpoint`]). Firecracker guests route
     /// through the TAP gateway (`network.host_ip`); Lima injects
     /// `host.lima.internal`.
-    fn guest_host_address(&self, network: &NetworkConfig) -> String;
+    fn local_endpoint_route(&self, network: &NetworkConfig) -> LocalEndpointRoute;
     /// Whether mounts use live filesystem sharing (Lima/virtiofs)
     /// vs one-time sync (Firecracker/rsync).
-    fn mounts_are_live(&self) -> bool;
+    fn mounts_are_live(&self) -> bool {
+        self.capabilities().has(Capability::LiveMounts)
+    }
     /// Whether `image` has its backend-specific build artifacts on disk.
     ///
     /// On Firecracker this means the template rootfs (`rootfs-template.ext4`).
@@ -904,6 +1044,13 @@ impl FirecrackerBackend {
     pub fn new() -> Self {
         Self
     }
+
+    /// Construct for a loaded config. This backend has no config-dependent
+    /// state; the constructor exists so every `PlatformBackend` is built the
+    /// same way.
+    pub fn for_config(_cfg: &CoopConfig) -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -915,6 +1062,14 @@ impl std::fmt::Display for FirecrackerBackend {
 
 #[cfg(not(target_os = "macos"))]
 impl VmBackend for FirecrackerBackend {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::new(&[
+            Capability::DiskResize,
+            Capability::DiskSnapshots,
+            Capability::MachineResources,
+        ])
+    }
+
     fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
         boot_preflight(cfg)?;
         crate::setup::run(cfg, opts)
@@ -1109,6 +1264,7 @@ impl VmBackend for FirecrackerBackend {
             port: cfg.ssh_port,
             user: SshUser::new(guest_user.as_str())?,
             key_path: cfg.ssh_key_path(),
+            host_keys: crate::backend::HostKeyPolicy::Unverified,
         })
     }
 
@@ -1116,13 +1272,9 @@ impl VmBackend for FirecrackerBackend {
         Ok(inst.rootfs_path())
     }
 
-    fn guest_host_address(&self, network: &NetworkConfig) -> String {
+    fn local_endpoint_route(&self, network: &NetworkConfig) -> LocalEndpointRoute {
         // The guest's default gateway is the bridge's host IP.
-        network.host_ip.to_string()
-    }
-
-    fn mounts_are_live(&self) -> bool {
-        false
+        LocalEndpointRoute::HostAddress(network.host_ip.to_string())
     }
 
     fn image_is_built(&self, cfg: &CoopConfig, image: &ImageName) -> bool {
@@ -1140,6 +1292,13 @@ impl LimaBackend {
     pub fn new() -> Self {
         Self
     }
+
+    /// Construct for a loaded config. This backend has no config-dependent
+    /// state; the constructor exists so every `PlatformBackend` is built the
+    /// same way.
+    pub fn for_config(_cfg: &CoopConfig) -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1151,6 +1310,15 @@ impl std::fmt::Display for LimaBackend {
 
 #[cfg(target_os = "macos")]
 impl VmBackend for LimaBackend {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::new(&[
+            Capability::LiveMounts,
+            Capability::DiskResize,
+            Capability::DiskSnapshots,
+            Capability::MachineResources,
+        ])
+    }
+
     fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
         boot_preflight(cfg)?;
         crate::lima::setup(cfg, opts)
@@ -1299,13 +1467,9 @@ impl VmBackend for LimaBackend {
         crate::lima::disk_path(inst)
     }
 
-    fn guest_host_address(&self, _network: &NetworkConfig) -> String {
+    fn local_endpoint_route(&self, _network: &NetworkConfig) -> LocalEndpointRoute {
         // Lima injects this hostname into the guest, resolving to the host.
-        crate::lima::HOST_GATEWAY.to_string()
-    }
-
-    fn mounts_are_live(&self) -> bool {
-        true
+        LocalEndpointRoute::HostAddress(crate::lima::HOST_GATEWAY.to_string())
     }
 
     fn image_is_built(&self, cfg: &CoopConfig, image: &ImageName) -> bool {
@@ -1494,15 +1658,15 @@ pub fn run_post_start(session: &SshSession, command: &str) {
 
 /// Bootstrap configured guest agents in the guest declaratively.
 ///
-/// `guest_host` is the backend's guest-visible host address (from
-/// [`VmBackend::guest_host_address`]), used to rewrite any local-model
-/// endpoint so the guest can reach a server running on the host.
+/// `route` is how the guest reaches the host (from
+/// [`VmBackend::local_endpoint_route`]), used to make any local-model endpoint
+/// reachable from inside the guest.
 pub fn bootstrap_agents(
     session: &SshSession,
     cfg: &CoopConfig,
     inst: &crate::config::Instance,
     mode: BootMode,
-    guest_host: &str,
+    route: &LocalEndpointRoute,
 ) -> Result<()> {
     // GitHub auth is guest-global state. Refresh it once before either
     // agent bootstrap if a token is available.
@@ -1511,8 +1675,8 @@ pub fn bootstrap_agents(
         setup_github_auth(session)?;
     }
 
-    bootstrap_claude(session, cfg, inst, mode, guest_host)?;
-    bootstrap_codex(session, cfg, inst, mode, guest_host)?;
+    bootstrap_claude(session, cfg, inst, mode, route)?;
+    bootstrap_codex(session, cfg, inst, mode, route)?;
 
     Ok(())
 }
@@ -1535,7 +1699,7 @@ fn bootstrap_claude(
     cfg: &CoopConfig,
     inst: &crate::config::Instance,
     mode: BootMode,
-    guest_host: &str,
+    route: &LocalEndpointRoute,
 ) -> Result<()> {
     let claude = &cfg.claude;
     let claude_bin = persisted_guest_user(cfg, &inst.image).claude_bin();
@@ -1578,7 +1742,7 @@ fn bootstrap_claude(
     // credential-holding process after a failed boot. A clean bootstrap leaves
     // it running for the VM's lifetime. Mirrors `bootstrap_codex`.
     let result = (|| -> Result<()> {
-        let local_env = claude_local_env(&model_state, cfg, guest_host, proxy.as_ref())?;
+        let local_env = claude_local_env(&model_state, cfg, route, proxy.as_ref())?;
         write_managed_claude_settings(&session.target, &local_env)?;
         // Apply disables before extensions become visible, including partially
         // copied bundles if a transfer fails and leaves the VM running.
@@ -1631,7 +1795,7 @@ fn bootstrap_codex(
     cfg: &CoopConfig,
     inst: &crate::config::Instance,
     mode: BootMode,
-    guest_host: &str,
+    route: &LocalEndpointRoute,
 ) -> Result<()> {
     let mut model_state = ModelState::load_or_default(inst)?;
     ensure_codex_remote_auth_consistent(cfg, inst, &model_state)?;
@@ -1647,7 +1811,7 @@ fn bootstrap_codex(
     let result = (|| -> Result<()> {
         let codex = &cfg.codex;
         let source_dir = resolve_config_source_dir(&codex.config_dir, ".codex", "codex.config_dir");
-        let local = codex_provider_table(&model_state, cfg, guest_host, proxy.as_ref())?;
+        let local = codex_provider_table(&model_state, cfg, route, proxy.as_ref())?;
         // coop_local is the provider id for both the local-model block and the
         // proxy block. Remember once coop has materialized it so a later
         // switch-off (to cloud, or after removing the config) reliably rewrites a
@@ -2656,13 +2820,13 @@ fn claude_json_with_onboarding_complete(current: Option<&str>) -> Result<String>
 fn claude_local_env(
     state: &ModelState,
     cfg: &CoopConfig,
-    guest_host: &str,
+    route: &LocalEndpointRoute,
     proxy: Option<&crate::proxy::ProxyHandle>,
 ) -> Result<BTreeMap<String, String>> {
     // Local mode takes precedence over proxy mode: both rewrite the base URL,
     // and a VM switched to local should route at the user's model server.
     if let Some(ep) = local_endpoint(state, state.resolved_claude(&cfg.claude)) {
-        let base_url = crate::network::rewrite_host_url(ep.host_url(), guest_host)?;
+        let base_url = plan_local_endpoint(route, ep.host_url())?.guest_url;
         return Ok(crate::model_state::claude_env_block(
             base_url.as_str(),
             ep.model(),
@@ -2748,11 +2912,11 @@ fn start_agent_proxy(
 fn codex_provider_table(
     state: &ModelState,
     cfg: &CoopConfig,
-    guest_host: &str,
+    route: &LocalEndpointRoute,
     proxy: Option<&crate::proxy::ProxyHandle>,
 ) -> Result<Option<toml::Table>> {
     if let Some(ep) = local_endpoint(state, state.resolved_codex(&cfg.codex)) {
-        let base_url = crate::network::rewrite_host_url(ep.host_url(), guest_host)?;
+        let base_url = plan_local_endpoint(route, ep.host_url())?.guest_url;
         return Ok(Some(crate::model_state::codex_local_config(
             base_url.as_str(),
             ep.model(),
@@ -3598,6 +3762,33 @@ fn gh_auth_token() -> Option<String> {
 mod tests {
     use super::*;
 
+    fn test_route() -> LocalEndpointRoute {
+        LocalEndpointRoute::HostAddress("172.16.0.1".into())
+    }
+
+    fn url(s: &str) -> url::Url {
+        url::Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn plan_host_address_rewrites_loopback_without_tunnel() {
+        let plan = plan_local_endpoint(&test_route(), &url("http://localhost:11434/v1")).unwrap();
+        assert_eq!(plan.guest_url.as_str(), "http://172.16.0.1:11434/v1");
+    }
+
+    #[test]
+    fn capabilities_require_rejects_missing_capability() {
+        let caps = BackendCapabilities::new(&[Capability::MachineResources]);
+        let err = caps
+            .require(&"example", Capability::DiskResize)
+            .unwrap_err();
+        assert!(err.downcast_ref::<UnsupportedCapability>().is_some());
+        assert!(err.to_string().contains("CAPABILITY_UNSUPPORTED"));
+        let full = BackendCapabilities::new(&[Capability::DiskSnapshots]);
+        assert!(full.require(&"lima", Capability::DiskSnapshots).is_ok());
+        assert!(!full.has(Capability::LiveMounts));
+    }
+
     const SAMPLE_OUTPUT: &str = "\
 0.12 0.08 0.03 1/42 1234
 MemTotal:        2048000 kB
@@ -3614,6 +3805,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             port: NonZeroU16::new(22).unwrap(),
             user: SshUser::new("ubuntu").unwrap(),
             key_path: PathBuf::from("/tmp/test-key"),
+            host_keys: crate::backend::HostKeyPolicy::Unverified,
         }
     }
 
@@ -3690,7 +3882,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             base_url: "http://172.16.0.1:8788".to_string(),
             capability_token: crate::config::Secret::new("cap-token".to_string()),
         };
-        let env = claude_local_env(&state, &cfg, "172.16.0.1", Some(&proxy)).unwrap();
+        let env = claude_local_env(&state, &cfg, &test_route(), Some(&proxy)).unwrap();
         assert_eq!(env["ANTHROPIC_BASE_URL"], "http://172.16.0.1:8788");
         assert_eq!(env["ANTHROPIC_AUTH_TOKEN"], "cap-token");
         // Proxy mode is transparent — no model pinning (unlike local mode).
@@ -3716,7 +3908,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             capability_token: crate::config::Secret::new("cap-token".to_string()),
         };
         // Even with a proxy handle present, local mode wins.
-        let env = claude_local_env(&state, &cfg, "172.16.0.1", Some(&proxy)).unwrap();
+        let env = claude_local_env(&state, &cfg, &test_route(), Some(&proxy)).unwrap();
         assert_eq!(env["ANTHROPIC_MODEL"], "qwen");
         assert!(env["ANTHROPIC_BASE_URL"].starts_with("http://172.16.0.1:11434"));
     }
@@ -3726,7 +3918,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         let env = claude_local_env(
             &ModelState::default(),
             &CoopConfig::default(),
-            "172.16.0.1",
+            &test_route(),
             None,
         )
         .unwrap();
@@ -3744,7 +3936,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             base_url: "http://127.0.0.1:9788".to_string(),
             capability_token: crate::config::Secret::new("cap-token".to_string()),
         };
-        let table = codex_provider_table(&state, &cfg, "172.16.0.1", Some(&proxy))
+        let table = codex_provider_table(&state, &cfg, &test_route(), Some(&proxy))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -3781,7 +3973,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             capability_token: crate::config::Secret::new("cap-token".to_string()),
         };
         // Even with a proxy handle present, local mode wins (mirrors Claude).
-        let table = codex_provider_table(&state, &cfg, "172.16.0.1", Some(&proxy))
+        let table = codex_provider_table(&state, &cfg, &test_route(), Some(&proxy))
             .unwrap()
             .unwrap();
         assert_eq!(table["model"].as_str().unwrap(), "qwen");
@@ -3801,7 +3993,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         let table = codex_provider_table(
             &ModelState::default(),
             &CoopConfig::default(),
-            "172.16.0.1",
+            &test_route(),
             None,
         )
         .unwrap();

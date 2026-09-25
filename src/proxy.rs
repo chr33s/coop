@@ -21,7 +21,7 @@
 //! credential upstream.
 
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
@@ -562,12 +562,7 @@ fn locate_proxy_binary() -> Result<PathBuf> {
 /// Mint a 256-bit capability token from the OS CSPRNG, hex-encoded. Worthless
 /// off the host, so exfiltration by a compromised guest gains nothing.
 fn mint_capability_token() -> Result<String> {
-    let mut buf = [0u8; 32];
-    let mut urandom = File::open("/dev/urandom").context("Failed to open /dev/urandom")?;
-    urandom
-        .read_exact(&mut buf)
-        .context("Failed to read from /dev/urandom")?;
-    Ok(hex::encode(buf))
+    crate::fs_util::random_hex(32)
 }
 
 /// The stdin startup blob for `coop-proxy`, matching its `ProxyConfig` shape.
@@ -793,6 +788,7 @@ mod tests {
             port: std::num::NonZeroU16::new(port).unwrap(),
             user: crate::backend::SshUser::new("coop").unwrap(),
             key_path: tmp.path().join("unused-key"),
+            host_keys: crate::backend::HostKeyPolicy::Unverified,
         };
         let result = spawn_reverse_forward(&inst, "test", &target, 8788);
         let accepted = peer.join().unwrap().unwrap();
@@ -822,6 +818,7 @@ mod tests {
             port: std::num::NonZeroU16::new(2222).unwrap(),
             user: crate::backend::SshUser::new("root").unwrap(),
             key_path: fixture.join("client"),
+            host_keys: crate::backend::HostKeyPolicy::Unverified,
         };
         let master_pid = || -> i32 {
             fs::read_to_string(fixture.join("master.pid"))

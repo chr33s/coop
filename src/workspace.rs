@@ -1063,7 +1063,12 @@ fn ssh_config_path() -> Result<PathBuf> {
 }
 
 fn ssh_config_block(target: &SshTarget, inst: &Instance) -> String {
+    use std::fmt::Write as _;
     let host = ssh_config_host(inst);
+    let mut host_keys = String::new();
+    for line in target.host_keys.ssh_config_lines() {
+        let _ = writeln!(host_keys, "    {line}");
+    }
     format!(
         "{MARKER_PREFIX} {host}\n\
          Host {host}\n\
@@ -1072,8 +1077,7 @@ fn ssh_config_block(target: &SshTarget, inst: &Instance) -> String {
          \x20   User {}\n\
          \x20   IdentityFile {}\n\
          \x20   IdentitiesOnly yes\n\
-         \x20   StrictHostKeyChecking no\n\
-         \x20   UserKnownHostsFile /dev/null\n\
+         {host_keys}\
          \x20   LogLevel ERROR\n\
          {MARKER_END}",
         target.host,
@@ -2107,6 +2111,7 @@ Host coop-other\n\
             port: std::num::NonZeroU16::new(2222).unwrap(),
             user: SshUser::new("ubuntu").expect("valid user"),
             key_path: PathBuf::from("/tmp/key"),
+            host_keys: crate::backend::HostKeyPolicy::Unverified,
         }
     }
 

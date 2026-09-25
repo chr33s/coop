@@ -13,7 +13,7 @@ use anyhow::{Result, bail};
 use crate::backend::VmBackend as _;
 use crate::config::{LocalModel, Secret};
 use crate::model_state::{ModelMode, ModelState};
-use crate::{backend, config, network, prompt};
+use crate::{backend, config, prompt};
 
 pub(crate) fn cmd_model(
     be: &backend::PlatformBackend,
@@ -36,7 +36,7 @@ fn render_status(
     inst: &config::Instance,
 ) -> Result<()> {
     let state = ModelState::load_or_default(inst)?;
-    let guest_host = be.guest_host_address(&cfg.network);
+    let route = be.local_endpoint_route(&cfg.network);
     let out = &mut std::io::stdout();
     writeln!(out, "Instance: {}", inst.name)?;
     writeln!(out, "Mode:     {}", state.mode.as_str())?;
@@ -45,14 +45,14 @@ fn render_status(
         "Claude",
         state.mode,
         state.resolved_claude(&cfg.claude),
-        &guest_host,
+        &route,
     )?;
     write_tool_line(
         out,
         "Codex",
         state.mode,
         state.resolved_codex(&cfg.codex),
-        &guest_host,
+        &route,
     )?;
     Ok(())
 }
@@ -62,11 +62,11 @@ fn write_tool_line(
     label: &str,
     mode: ModelMode,
     endpoint: Option<&LocalModel>,
-    guest_host: &str,
+    route: &backend::LocalEndpointRoute,
 ) -> Result<()> {
     match (mode, endpoint) {
         (ModelMode::Local, Some(ep)) => {
-            let url = network::rewrite_host_url(ep.host_url(), guest_host)?;
+            let url = backend::plan_local_endpoint(route, ep.host_url())?.guest_url;
             writeln!(out, "{label:<9} local — {} @ {}", ep.model(), url)?;
         }
         (ModelMode::Local, None) => {
@@ -245,14 +245,8 @@ fn apply_to_running(
     let repo = backend::detect_instance_repo(running.instance());
     let (inst, target) = running.into_parts();
     let session = super::prepare_session_from_target(cfg, Some(&inst), target, repo.as_ref())?;
-    let guest_host = be.guest_host_address(&cfg.network);
-    backend::bootstrap_agents(
-        &session,
-        cfg,
-        &inst,
-        backend::BootMode::Restart,
-        &guest_host,
-    )?;
+    let route = be.local_endpoint_route(&cfg.network);
+    backend::bootstrap_agents(&session, cfg, &inst, backend::BootMode::Restart, &route)?;
     Ok(true)
 }
 

@@ -1046,7 +1046,7 @@ pub fn run() -> Result<()> {
                 config::CoopConfig::default()
             }
         };
-        let be: backend::PlatformBackend = backend::PlatformBackend::new();
+        let be = backend::PlatformBackend::for_config(&cfg);
         return cmd_uninstall(
             &be,
             &cfg,
@@ -1069,7 +1069,7 @@ pub fn run() -> Result<()> {
     cli.command.apply_github_override(&mut cfg);
     update::maybe_print_notify(&cfg.updates);
     update::maybe_run_background_check(&cfg.updates);
-    let be: backend::PlatformBackend = backend::PlatformBackend::new();
+    let be = backend::PlatformBackend::for_config(&cfg);
     tracing::debug!("Using backend: {be}");
 
     let raw_args: Vec<String> = std::env::args().collect();

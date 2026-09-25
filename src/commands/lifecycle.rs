@@ -1204,6 +1204,13 @@ fn start_instance(
     inst: &config::Instance,
     opts: &StartOpts<'_>,
 ) -> Result<()> {
+    // An explicit disk size is a request, not a default: reject it before any
+    // VM cost on a backend that cannot honour it rather than dropping it.
+    if opts.disk.is_some() {
+        be.capabilities()
+            .require(be, backend::Capability::DiskResize)?;
+    }
+
     // Derive the GitHub repo slug as early as possible so the auto-prompt
     // can fire before any VM cost is incurred, and so pat-mode token
     // forwarding works at bootstrap time.
@@ -1622,8 +1629,8 @@ fn bootstrap_and_post_start(
     if opts.no_agents {
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
     } else {
-        let guest_host = be.guest_host_address(&cfg.network);
-        backend::bootstrap_agents(&session, cfg, inst, mode, &guest_host)?;
+        let route = be.local_endpoint_route(&cfg.network);
+        backend::bootstrap_agents(&session, cfg, inst, mode, &route)?;
     }
     if let Some(cmd) = post_start {
         // Agent bootstrap may have just minted the per-instance capability
@@ -1959,6 +1966,17 @@ pub(crate) fn cmd_resize(
     // `VmMemory::parse_cli`, so `opts.mem` is already provably bootable
     // here; no half-applied instance can result from a bad value. (The CLI
     // ArgGroup guarantees at least one of size/mem/vcpus is present.)
+    // Checked before the stopped-state probe so an unsupported request has no
+    // side effects and never reaches `disk_path`.
+    if opts.disk.is_some() {
+        be.capabilities()
+            .require(be, backend::Capability::DiskResize)?;
+    }
+    if opts.mem.is_some() || opts.vcpus.is_some() {
+        be.capabilities()
+            .require(be, backend::Capability::MachineResources)?;
+    }
+
     let inst = cfg.resolve_instance(opts.name)?;
     let stopped = be.as_stopped(inst)?;
 
@@ -1992,6 +2010,8 @@ pub(crate) fn cmd_commit(
     image: &config::ImageName,
     force: bool,
 ) -> Result<()> {
+    be.capabilities()
+        .require(be, backend::Capability::DiskSnapshots)?;
     let inst = cfg.resolve_instance(name)?;
     let source_image = inst.image.clone();
 
@@ -2088,6 +2108,10 @@ pub(crate) fn cmd_restore(
     cfg: &mut config::CoopConfig,
     opts: &RestoreOpts<'_>,
 ) -> Result<()> {
+    // Both modes replace the disk; reject before the reprovision prompt,
+    // the stop, or any metadata write.
+    be.capabilities()
+        .require(be, backend::Capability::DiskSnapshots)?;
     let image = match &opts.mode {
         RestoreMode::Reprovision(reprovision) => {
             return reprovision_instance(be, cfg, opts.name, reprovision);
@@ -2760,6 +2784,7 @@ mod tests {
             port: NonZeroU16::new(22).expect("non-zero"),
             user: super::backend::SshUser::new("ubuntu").expect("valid user"),
             key_path: tmp.path().join("id_test"),
+            host_keys: crate::backend::HostKeyPolicy::Unverified,
         };
 
         let session =
@@ -2816,6 +2841,7 @@ mod tests {
             port: NonZeroU16::new(22).expect("non-zero"),
             user: super::backend::SshUser::new("ubuntu").expect("valid user"),
             key_path: tmp.path().join("id_test"),
+            host_keys: crate::backend::HostKeyPolicy::Unverified,
         };
 
         let session =
@@ -2864,6 +2890,7 @@ mod tests {
             port: NonZeroU16::new(22).expect("non-zero"),
             user: super::backend::SshUser::new("ubuntu").expect("valid user"),
             key_path: tmp.path().join("id_test"),
+            host_keys: crate::backend::HostKeyPolicy::Unverified,
         };
 
         let session =
@@ -2906,6 +2933,7 @@ mod tests {
             port: NonZeroU16::new(22).expect("non-zero"),
             user: super::backend::SshUser::new("ubuntu").expect("valid user"),
             key_path: tmp.path().join("id_test"),
+            host_keys: crate::backend::HostKeyPolicy::Unverified,
         };
 
         // The conflict makes Codex unusable, not the VM: a shell/exec/claude
@@ -2953,6 +2981,7 @@ mod tests {
             port: NonZeroU16::new(22).expect("non-zero"),
             user: super::backend::SshUser::new("ubuntu").expect("valid user"),
             key_path: tmp.path().join("id_test"),
+            host_keys: crate::backend::HostKeyPolicy::Unverified,
         };
 
         let session = super::prepare_session_from_target(&cfg, Some(&inst), target, None)
@@ -2983,6 +3012,7 @@ mod tests {
             port: NonZeroU16::new(22).expect("non-zero"),
             user: super::backend::SshUser::new("ubuntu").expect("valid user"),
             key_path: tmp.path().join("id_test"),
+            host_keys: crate::backend::HostKeyPolicy::Unverified,
         };
 
         let session =

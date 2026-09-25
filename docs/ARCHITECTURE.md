@@ -6,6 +6,8 @@ start, shell, stop, destroy, status, logs — behind two platform backends:
 
 - **Linux** — Firecracker microVMs on KVM.
 - **macOS** — Lima VMs on Apple Virtualization.framework (`limactl`).
+- **macOS, opt-in** — Apple Container machines (`container machine`), with
+  the `apple-container` Cargo feature. See [`backends.md`](backends.md).
 
 This document maps the modules, the two-backend design, the data flow from host
 to guest, and the architectural invariants. For the security view of the same
@@ -22,6 +24,7 @@ coop/
 │   ├── backend.rs          # VmBackend trait, PlatformBackend alias, shared guest ops
 │   ├── vm.rs               # Firecracker process management (typestate machine)
 │   ├── lima.rs             # macOS/Lima backend implementation
+│   ├── apple_container/    # opt-in macOS Apple Container backend (feature `apple-container`)
 │   ├── setup.rs            # Firecracker host setup + golden-image builder
 │   ├── network.rs          # Firecracker TAP/bridge/NAT networking
 │   ├── config.rs           # config model + loading (the type-safe core)
@@ -78,10 +81,16 @@ through it. Two implementations exist:
 - `FirecrackerBackend` — `#[cfg(not(target_os = "macos"))]`; delegates to
   `setup`, `vm::FirecrackerVm`, and `network`.
 - `LimaBackend` — `#[cfg(target_os = "macos")]`; delegates to `lima`.
+- `AppleContainerBackend` — `#[cfg(all(target_os = "macos", feature =
+  "apple-container"))]`; `src/apple_container/`. It replaces Lima as the macOS
+  `PlatformBackend` only when the feature is enabled.
 
 **Backend selection is compile-time, not runtime.** `backend::PlatformBackend`
-is a type alias resolved by `#[cfg]` — `LimaBackend` on macOS, `FirecrackerBackend`
-elsewhere. There is no runtime backend enum and no dispatch cost. (Note: the
+is a type alias resolved by `#[cfg]` — `LimaBackend` on macOS (or
+`AppleContainerBackend` with the `apple-container` feature), `FirecrackerBackend`
+elsewhere. What a backend can do is reported by `VmBackend::capabilities()`
+(`BackendCapabilities`); handlers call `require(..)` before any side effect of
+an operation the backend lacks. There is no runtime backend enum and no dispatch cost. (Note: the
 `Backend` enum in `secret_store.rs` is unrelated — it names *secret-storage*
 backends.)
 
@@ -93,7 +102,7 @@ code, it must hold for **both** backends. Known intentional divergences:
 
 | Aspect | Firecracker | Lima |
 |--------|-------------|------|
-| `guest_host_address` | TAP gateway (`network.host_ip`) | `host.lima.internal` |
+| `local_endpoint_route` | TAP gateway (`network.host_ip`) | `host.lima.internal` |
 | `mounts_are_live` | `false` (one-time rsync/tar sync) | `true` (virtiofs) |
 | `ssh_target` | built from `guest_ip` + `ssh_port` | queried from `limactl` (per-boot forwarded port) |
 | workspace/mounts | rsync or tar-pipe over SSH | live mounts |

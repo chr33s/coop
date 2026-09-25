@@ -153,3 +153,15 @@
 # [updates]
 # mode = "notify"                # off | notify (default: notify)
 # check_interval_hours = 24      # minimum age before background re-check
+
+# Apple Container backend — read only by builds made with
+# `--features apple-container` (macOS). See docs/backends.md.
+# [apple_container]
+# binary = "/absolute/path/to/container"  # default: /usr/local/bin/container,
+#                                         # then /opt/homebrew/bin/container
+# probe_timeout_seconds = 10     # version/help/inspect/list (1–86400)
+# operation_timeout_seconds = 60 # network create/delete, machine set, image delete
+# create_timeout_seconds = 600   # machine create (unpacks the image)
+# boot_timeout_seconds = 120     # boot until SSH is ready
+# stop_timeout_seconds = 30      # stop confirmation
+# build_timeout_seconds = 3600   # image build (`setup --builder-timeout` overrides)

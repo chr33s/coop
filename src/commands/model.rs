@@ -66,8 +66,18 @@ fn write_tool_line(
 ) -> Result<()> {
     match (mode, endpoint) {
         (ModelMode::Local, Some(ep)) => {
-            let url = backend::plan_local_endpoint(route, ep.host_url())?.guest_url;
-            writeln!(out, "{label:<9} local — {} @ {}", ep.model(), url)?;
+            let plan = backend::plan_local_endpoint(route, ep.host_url())?;
+            let via = if plan.tunnel.is_some() {
+                " (via SSH reverse tunnel)"
+            } else {
+                ""
+            };
+            writeln!(
+                out,
+                "{label:<9} local — {} @ {}{via}",
+                ep.model(),
+                plan.guest_url
+            )?;
         }
         (ModelMode::Local, None) => {
             writeln!(out, "{label:<9} cloud (no local endpoint configured)")?;

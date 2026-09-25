@@ -1370,7 +1370,7 @@ fn provision_first_boot(
                 workspace::sync_mounts(&target, inst, &opts.mounts, opts.exclude_git)?;
             }
             tracing::warn!(
-                "Firecracker mounts use one-time sync, not live filesystem sharing. \
+                "{be} mounts use one-time sync, not live filesystem sharing. \
                  Use `coop push` / `coop pull` to sync changes."
             );
         }

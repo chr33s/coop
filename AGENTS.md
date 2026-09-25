@@ -53,7 +53,8 @@ Runtime: Rust `1.94.0` (see `rust-toolchain.toml`), edition 2024.
 ```bash
 cargo build --workspace
 cargo fmt -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --all-targets --features apple-container -- -D warnings  # macOS only
 cargo test --workspace
 cargo deny --workspace check
 taplo format --check

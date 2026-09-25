@@ -169,6 +169,17 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   or copies it off the host.
 - Flag any change that extends the no-host-key-checking options to a
   **non-guest** host.
+- The host-key policy is one field, `SshTarget::host_keys`
+  (`backend.rs:HostKeyPolicy`), so every transport and the editor block derive
+  from the same choice. Firecracker and Lima use `Unverified` (above). The
+  opt-in Apple Container backend uses `Pinned`: its guest address is on a
+  runtime-managed network and can be reassigned, so the Ed25519 host key is
+  read once over the runtime's native control channel (`machine run --root`
+  addressed to the owned machine, never `ssh-keyscan`), written to a per-instance
+  `known_hosts`, and enforced with `StrictHostKeyChecking=yes`,
+  `HostKeyAlias=<machine>.coop-apple`, `UpdateHostKeys=no`, `ForwardAgent=no`.
+  A missing or changed key is a hard error. Flag any path that re-enrolls
+  automatically or builds a pinned target with the unverified options.
 
 ## Network
 
@@ -301,6 +312,62 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   These match the design's "Cross-platform hardening" note: the Firecracker
   (Linux) story is the stronger one; Lima (macOS) is closable to near-parity
   with Seatbelt, with the stated caveats.
+
+## Apple Container backend (opt-in `apple-container` feature)
+
+The same VM boundary applies. The runtime adds host surfaces that Lima and
+Firecracker do not have, so the backend (`src/apple_container/`) fails closed
+around them:
+
+- **Runtime qualification.** Stock Apple Container attaches every machine to
+  one shared network and forwards the host `SSH_AUTH_SOCK` into it.
+  `security::qualify` requires the runtime to advertise per-machine
+  `--network` and `--no-ssh-agent`, and `verify_machine_config` requires
+  `machine inspect` to report them. Without both, nothing boots. No config key
+  or flag relaxes this; adding one is a finding.
+- **Isolation gate.** Before first boot, on every restart, and before every
+  SSH target is handed out, `security::verify_effective` checks the *current*
+  backing container. It must have exactly the instance's dedicated network,
+  SSH-agent forwarding off, no published ports or sockets, and only the
+  runtime's own bootstrap mounts: `/sbin.machine` read-only and the
+  `/etc/.machine.initialized` marker, each sourced from
+  `…/machines/<machine-id>/` in the runtime's state (so a host directory
+  mounted at an allowed destination still fails). The writable marker is a runtime-owned
+  guest→host file, and coop never reads it. The proof (`SecurityReady`) is
+  process-local and never persisted.
+- **Separate networks are not proof of isolation.** Guest-to-guest
+  unreachability over IPv4/IPv6, including address, route, and neighbour
+  manipulation, still has to be demonstrated on real hardware with the
+  qualified runtime. Guest firewall rules do not count, because the guest has
+  root.
+- **Runtime subprocesses** get a cleared environment. Only `HOME`, `USER`,
+  `LOGNAME`, `TMPDIR`, locale, and a fixed `PATH` are passed (`cli.rs`), so
+  `SSH_AUTH_SOCK`, provider and GitHub tokens, `DYLD_*`, and `CONTAINER_*`
+  never reach the runtime. `EnvForward` is for SSH sessions only. Output is
+  size-bounded and deadline-bound. A timeout means the outcome is uncertain,
+  not that the operation failed. Only builds, machine creation, and boots
+  honour Ctrl-C; stop/delete/cleanup never do, so an interrupt cannot leave a
+  booted machine behind.
+- **Local-model tunnels** (`proxy::sync_model_tunnels`) are reconciled on
+  every bootstrap. A tunnel the current model config no longer needs is
+  closed, so switching local mode off really removes the guest's path to the
+  host server.
+- **Runtime binary** comes from config or fixed install paths, never from
+  `PATH`. It must be host-owned and not writable by others, and it must not be
+  project-local.
+- **Guest-controlled text** that coop displays (host-key comments,
+  runtime/guest error text, boot-log excerpts, and `coop logs` in both
+  snapshot and `--follow` mode) has its control characters replaced first.
+- **Local-model tunnel PIDs** are only trusted or signalled while `ps` still
+  reports them as an `ssh` process, so a PID reused after a reboot is never
+  killed.
+- **Ownership.** Runtime objects are named `coop-<owner8>-<random16>`, and
+  none is deleted unless the local owner record and the instance record both
+  match. The `coop-` prefix alone is never enough.
+- **Image build context** is a private temporary directory holding rendered
+  files and the VM-access **public** key only. There are no build args or
+  secrets. The OCI build itself runs in the runtime's builder, not on an owned
+  network.
 
 ## `coop update` trust chain
 

@@ -60,19 +60,25 @@ impl InstanceState {
 /// OS — only the host's backend can ever be selected, so only its token
 /// (`"firecracker"` on Linux, `"lima"` on macOS) is ever serialized.
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub(crate) enum BackendKind {
     #[cfg(not(target_os = "macos"))]
     Firecracker,
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(feature = "apple-container")))]
     Lima,
+    #[cfg(all(target_os = "macos", feature = "apple-container"))]
+    AppleContainer,
 }
 
 impl BackendKind {
-    /// The backend kind for the current platform. `PlatformBackend` is a
-    /// compile-time type alias, so this is fixed per target OS.
+    /// The backend kind for this build. `PlatformBackend` is a compile-time
+    /// type alias, so this is fixed per target OS and feature set.
     pub(crate) fn of(_be: &backend::PlatformBackend) -> Self {
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "apple-container"))]
+        {
+            Self::AppleContainer
+        }
+        #[cfg(all(target_os = "macos", not(feature = "apple-container")))]
         {
             Self::Lima
         }
@@ -187,7 +193,9 @@ mod tests {
     /// The backend token for the host — the only variant that exists in
     /// this build.
     fn platform_backend_token() -> &'static str {
-        if cfg!(target_os = "macos") {
+        if cfg!(all(target_os = "macos", feature = "apple-container")) {
+            "apple-container"
+        } else if cfg!(target_os = "macos") {
             "lima"
         } else {
             "firecracker"

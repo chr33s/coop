@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### New features
+
+- **Opt-in Apple Container backend (macOS)** — building with
+  `--features apple-container` replaces Lima with Apple's `container machine`
+  runtime. Each instance gets a dedicated network, no host-home mount, no host
+  SSH-agent forwarding, and a pinned SSH host key; workspaces are copied.
+  Disk sizing and commit/restore are rejected before any change. It needs an
+  Apple Container build with a per-machine network and SSH-agent switch that
+  stock 1.4.1 lacks, and refuses to start guests without it. Its state lives
+  in `~/.coop-apple`, and `coop update` is disabled for this build. See
+  [`docs/backends.md`](docs/backends.md).
+
 ### Fixes
 
 - **`coop stop` no longer reports success when it could not check the
@@ -14,6 +26,12 @@
   instead of the whole listing failing.
 - **rsync transfers work when the VM key path contains a space** — SSH options
   containing whitespace are now quoted in rsync's `-e` command.
+
+### Internal
+
+- **CI no longer runs clippy with `--all-features`**; the macOS-only
+  `apple-container` feature is linted and tested in its own macOS job, and
+  Linux checks that enabling it fails to compile.
 
 ## v0.6.0
 

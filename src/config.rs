@@ -762,7 +762,126 @@ pub struct CoopConfig {
     /// Self-update behaviour
     #[serde(default)]
     pub updates: crate::update::UpdateConfig,
+
+    /// Apple Container backend settings. Parsed by every build so one
+    /// `config.toml` stays portable; only the `apple-container` build reads it.
+    #[serde(default)]
+    pub apple_container: AppleContainerConfig,
 }
+
+/// A timeout in whole seconds, bounded to `1..=MAX_TIMEOUT_SECS` at parse
+/// time so a zero or runaway deadline is unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct TimeoutSecs(u32);
+
+/// Upper bound for [`TimeoutSecs`]: one day, enough for an image build over
+/// a slow link.
+pub const MAX_TIMEOUT_SECS: u32 = 86_400;
+
+impl TimeoutSecs {
+    pub fn new(secs: u32) -> Result<Self> {
+        if secs == 0 || secs > MAX_TIMEOUT_SECS {
+            bail!("timeout must be between 1 and {MAX_TIMEOUT_SECS} seconds, got {secs}");
+        }
+        Ok(Self(secs))
+    }
+
+    pub fn duration(self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for TimeoutSecs {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(u32::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// `[apple_container]` — settings for the Apple Container backend.
+///
+/// Deliberately small: there is no knob to mount the host home, forward the
+/// host SSH agent, share a network between instances, or skip the runtime
+/// qualification gate. Those are fixed policy, not configuration.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppleContainerConfig {
+    /// Absolute path to a qualified `container` runtime binary. When unset,
+    /// the backend searches a fixed list of host-owned install locations,
+    /// never `PATH` entries inside the project directory.
+    #[serde(default)]
+    pub binary: Option<ConfigPath>,
+    /// Deadline for read-only runtime probes (version, help, inspect).
+    #[serde(default = "default_apple_probe_timeout")]
+    pub probe_timeout_seconds: TimeoutSecs,
+    /// Deadline for other state-changing runtime calls: network create and
+    /// delete, `machine set`, image delete, and fixed root commands.
+    #[serde(default = "default_apple_operation_timeout")]
+    pub operation_timeout_seconds: TimeoutSecs,
+    /// Deadline for `machine create`, which unpacks the image into a new
+    /// machine disk.
+    #[serde(default = "default_apple_create_timeout")]
+    pub create_timeout_seconds: TimeoutSecs,
+    /// Deadline for a machine to boot and report a guest address.
+    #[serde(default = "default_apple_boot_timeout")]
+    pub boot_timeout_seconds: TimeoutSecs,
+    /// Deadline for a machine to confirm it stopped.
+    #[serde(default = "default_apple_stop_timeout")]
+    pub stop_timeout_seconds: TimeoutSecs,
+    /// Deadline for building the machine image. Package installation is slow,
+    /// so this is separate from (and much longer than) the boot deadline.
+    /// `coop setup --builder-timeout` overrides it for one run.
+    #[serde(default = "default_apple_build_timeout")]
+    pub build_timeout_seconds: TimeoutSecs,
+}
+
+impl Default for AppleContainerConfig {
+    fn default() -> Self {
+        Self {
+            binary: None,
+            probe_timeout_seconds: default_apple_probe_timeout(),
+            operation_timeout_seconds: default_apple_operation_timeout(),
+            create_timeout_seconds: default_apple_create_timeout(),
+            boot_timeout_seconds: default_apple_boot_timeout(),
+            stop_timeout_seconds: default_apple_stop_timeout(),
+            build_timeout_seconds: default_apple_build_timeout(),
+        }
+    }
+}
+
+fn default_apple_probe_timeout() -> TimeoutSecs {
+    TimeoutSecs(10)
+}
+
+fn default_apple_operation_timeout() -> TimeoutSecs {
+    TimeoutSecs(60)
+}
+
+fn default_apple_create_timeout() -> TimeoutSecs {
+    TimeoutSecs(600)
+}
+
+fn default_apple_boot_timeout() -> TimeoutSecs {
+    TimeoutSecs(120)
+}
+
+fn default_apple_stop_timeout() -> TimeoutSecs {
+    TimeoutSecs(30)
+}
+
+fn default_apple_build_timeout() -> TimeoutSecs {
+    TimeoutSecs(3600)
+}
+
+/// Subdirectory of the configured `data_dir` that this build's backend owns,
+/// if any: the Apple Container build keeps everything under
+/// `backends/apple-container-v1`; the default backends use `data_dir` itself.
+/// See [`CoopConfig::state_root`].
+const BACKEND_ROOT: Option<&str> = if cfg!(feature = "apple-container") {
+    Some("backends/apple-container-v1")
+} else {
+    None
+};
 
 /// User-defined profile in `config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1962,16 +2081,27 @@ impl CoopConfig {
         Ok(cfg)
     }
 
-    /// Root of this build's persistent state (images, instances, the VM key,
-    /// stored secrets). Currently `data_dir` itself; kept separate so a
-    /// backend can nest its state without changing `data_dir`'s meaning.
+    /// Root of this build's persistent state: `data_dir` itself for the
+    /// default backends, `data_dir/backends/apple-container-v1` for the
+    /// Apple Container build. Images, instances, the VM key, and stored
+    /// secrets all live beneath it; `data_dir` keeps its configured meaning.
     pub fn state_root(&self) -> PathBuf {
-        self.data_dir.to_path_buf()
+        BACKEND_ROOT.map_or_else(
+            || self.data_dir.to_path_buf(),
+            |sub| self.data_dir.join(sub),
+        )
     }
 
-    /// The directory `uninstall --purge` may remove wholesale.
+    /// The directory `uninstall --purge` may remove wholesale: `data_dir`
+    /// when this build owns it outright (the default backends, or the Apple
+    /// build's own `~/.coop-apple`), otherwise only [`Self::state_root`], so a
+    /// `data_dir` shared with another build is never wiped.
     pub fn owned_data_dir(&self) -> PathBuf {
-        self.data_dir.to_path_buf()
+        if BACKEND_ROOT.is_none() || self.data_dir == default_data_dir() {
+            self.data_dir.to_path_buf()
+        } else {
+            self.state_root()
+        }
     }
 
     /// Expand a leading `~` in the marketplace entries that are paths.
@@ -2391,6 +2521,7 @@ impl Default for CoopConfig {
             post_start: None,
             forward_ports: Vec::new(),
             updates: crate::update::UpdateConfig::default(),
+            apple_container: AppleContainerConfig::default(),
         }
     }
 }
@@ -2663,11 +2794,20 @@ fn is_firecracker_process(pid: u32) -> bool {
 
 // ── Defaults ──────────────────────────────────────────────────
 
+/// `~/.coop`, or `~/.coop-apple` for the `apple-container` build. The feature
+/// build gets its own application directory so an older default build's
+/// `uninstall --purge` (which removes its whole `data_dir`) cannot reach
+/// Apple Container state.
 fn default_data_dir() -> ConfigPath {
+    let dir = if cfg!(feature = "apple-container") {
+        ".coop-apple"
+    } else {
+        ".coop"
+    };
     ConfigPath::new(
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join(".coop"),
+            .join(dir),
     )
 }
 
@@ -4635,21 +4775,61 @@ skip = ["not-a-slug"]
     #[test]
     fn default_data_dir_is_under_home() {
         let dir = default_data_dir();
+        let expected = if cfg!(feature = "apple-container") {
+            ".coop-apple"
+        } else {
+            ".coop"
+        };
         assert!(
-            dir.ends_with(".coop"),
-            "expected path ending with .coop, got: {dir:?}"
+            dir.ends_with(expected),
+            "expected path ending with {expected}, got: {dir:?}"
         );
     }
 
     #[test]
-    fn state_root_is_data_dir() {
-        let cfg = CoopConfig {
-            data_dir: ConfigPath::new("/d"),
-            ..CoopConfig::default()
+    fn timeout_secs_rejects_zero_and_runaway() {
+        assert!(TimeoutSecs::new(0).is_err());
+        assert!(TimeoutSecs::new(MAX_TIMEOUT_SECS + 1).is_err());
+        assert_eq!(
+            TimeoutSecs::new(5).unwrap().duration(),
+            std::time::Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn apple_container_section_parses_and_rejects_unknown_keys() {
+        let cfg: CoopConfig = toml::from_str(
+            "[apple_container]\nbinary = \"/opt/container/bin/container\"\nboot_timeout_seconds = 60\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.apple_container.boot_timeout_seconds, TimeoutSecs(60));
+        assert_eq!(cfg.apple_container.probe_timeout_seconds, TimeoutSecs(10));
+        assert!(
+            toml::from_str::<CoopConfig>("[apple_container]\nallow_insecure = true\n").is_err()
+        );
+        assert!(
+            toml::from_str::<CoopConfig>("[apple_container]\nstop_timeout_seconds = 0\n").is_err()
+        );
+    }
+
+    #[test]
+    fn state_root_nests_only_for_the_apple_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, format!("data_dir = {:?}\n", tmp.path().join("d"))).unwrap();
+        let cfg = CoopConfig::load(&path).unwrap();
+        assert_eq!(&*cfg.data_dir, tmp.path().join("d").as_path());
+        let root = if cfg!(feature = "apple-container") {
+            tmp.path().join("d/backends/apple-container-v1")
+        } else {
+            tmp.path().join("d")
         };
-        assert_eq!(cfg.state_root(), PathBuf::from("/d"));
-        assert_eq!(cfg.owned_data_dir(), PathBuf::from("/d"));
-        assert_eq!(cfg.instances_dir(), PathBuf::from("/d/instances"));
+        assert_eq!(cfg.state_root(), root);
+        assert_eq!(cfg.instances_dir(), root.join("instances"));
+        assert_eq!(cfg.ssh_key_path(), root.join("vm_key"));
+        // A data_dir shared with another build is never wiped wholesale.
+        assert_eq!(cfg.owned_data_dir(), root);
+        assert_eq!(CoopConfig::default().owned_data_dir(), *default_data_dir());
     }
 
     // ── Config validation ─────────────────────────────────────

@@ -106,6 +106,32 @@ Linux CI and release preflight run this gate explicitly; ordinary unit tests
 mark it ignored, and macOS preflight reports it as unrun. This host test does
 not replace the Firecracker and Lima VM integration gates.
 
+## Apple Container backend (macOS, opt-in)
+
+The `apple-container` feature builds only on macOS. Its unit tests replace the
+`container` CLI with a scripted runtime, so they run without Apple Container
+installed:
+
+```bash
+cargo clippy --all-targets --features apple-container -- -D warnings
+cargo test --features apple-container
+```
+
+Parser fixtures live in `tests/fixtures/apple-container/`. That directory's
+README records which files were captured from a real runtime and which were
+derived from the pinned 1.4.1 source.
+
+`tests/apple-container-contract.sh` runs a feature build against the installed
+runtime. It checks that a stock runtime (no machine network / SSH-agent
+extension) refuses `coop setup` with `APPLE_RUNTIME_UNQUALIFIED`, writes no
+state, and leaves runtime machines and networks unchanged, and that
+`coop update` is refused. It only probes the runtime and uses a throwaway data
+directory.
+
+The real-hardware acceptance suite needs a qualified runtime, and none exists
+yet: isolation, host-exposure canaries, restart, recovery, and endurance
+(spec T-07 to T-29) are all still to do.
+
 ## Mutation testing
 
 Mutation testing finds unit tests that pass even when the code is broken — real

@@ -38,6 +38,13 @@ exclude_globs = [
   "src/vm.rs",
   # Thin binary shim: `fn main() { coop::run() }`. All logic is in the lib.
   "src/main.rs",
+  # Apple Container backend (`apple-container` feature): the VmBackend impl
+  # and runtime orchestration drive the `container` CLI and SSH. Its tests use
+  # a scripted runtime, but they only compile with the feature on, and the
+  # default mutation sweep builds without it. The pure parsers and gates
+  # (protocol.rs, security.rs, state.rs, ssh.rs, image.rs) stay in scope for
+  # a `--features apple-container` sweep.
+  "src/apple_container/mod.rs",
   # Interactive y/N + free-form line prompts (confirm / confirm_default_yes /
   # read_line). Every function short-circuits to Ok(false)/Ok(None) off a TTY
   # and otherwise reads stdin; the trailing match on the reply is only
@@ -150,6 +157,21 @@ exclude_re = [
   "\\btool_on_path\\b",
   "\\bstore_keychain\\b",
   "find-generic-password",
+
+  # apple_container/cli.rs — process spawning, deadline polling, and log IO
+  # for the real `container` binary. read_bounded, apply_sanitized_env, and
+  # sanitize_for_display stay in scope.
+  "RealExec::",
+  "\\bwait_with_deadline\\b",
+  "\\bjoin_reader\\b",
+  "\\blog_tail\\b",
+  # proxy.rs — local-model reverse tunnels: SSH process spawn and PID-file /
+  # signal IO. model_tunnel_spec and recorded_model_tunnels stay in scope.
+  "\\bsync_model_tunnels\\b",
+  "\\bspawn_reverse_forward_to\\b",
+  "\\bmodel_tunnel_is_current\\b",
+  "\\bmodel_tunnel_pid\\b",
+  "\\bstop_model_tunnels?\\b",
 
   # fs_util.rs — flock syscall wrapper; callers always target existing dirs.
   "\\block_sibling\\b",

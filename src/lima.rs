@@ -1408,7 +1408,7 @@ provision:
     )
 }
 
-fn compose_provision_script(
+pub(crate) fn compose_provision_script(
     ssh_pubkey: &str,
     profiles: &[ProfileDef],
     oci_features: &[ResolvedFeature],

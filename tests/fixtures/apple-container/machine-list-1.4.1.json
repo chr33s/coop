@@ -1,0 +1,18 @@
+[
+  {
+    "cpus" : 4,
+    "createdDate" : "2026-09-25T10:00:00Z",
+    "default" : false,
+    "id" : "coop-0a1b2c3d-00112233445566ff",
+    "ipAddress" : "192.168.64.3",
+    "memory" : 4294967296,
+    "status" : "running"
+  },
+  {
+    "cpus" : 8,
+    "default" : true,
+    "id" : "users-own-machine",
+    "memory" : 8589934592,
+    "status" : "stopped"
+  }
+]

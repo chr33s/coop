@@ -302,6 +302,22 @@ pub enum HostKeyPolicy {
     /// per-instance TAP device or a hostagent-owned loopback forward that no
     /// other guest can occupy, so there is nothing to pin against.
     Unverified,
+    /// Verify against a per-instance known-hosts file enrolled from a trusted
+    /// channel, looked up under a stable alias rather than the (reassignable)
+    /// address.
+    #[cfg_attr(
+        all(not(feature = "apple-container"), not(test)),
+        expect(dead_code, reason = "constructed only by the apple-container backend")
+    )]
+    Pinned(PinnedHostKey),
+}
+
+/// A per-instance host-key pin: the known-hosts file holding the enrolled key
+/// and the alias it is recorded under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedHostKey {
+    pub known_hosts: PathBuf,
+    pub alias: Hostname,
 }
 
 impl HostKeyPolicy {
@@ -312,15 +328,41 @@ impl HostKeyPolicy {
                 "StrictHostKeyChecking=no".into(),
                 "UserKnownHostsFile=/dev/null".into(),
             ],
+            Self::Pinned(pin) => vec![
+                "StrictHostKeyChecking=yes".into(),
+                // OpenSSH splits this option's value on whitespace into a
+                // list of files; quoting keeps a path with a space whole in
+                // `-o`, rsync `-e`, and `~/.ssh/config` alike.
+                format!(
+                    "UserKnownHostsFile={}",
+                    quote_ssh_value(&pin.known_hosts.display().to_string())
+                ),
+                "GlobalKnownHostsFile=/dev/null".into(),
+                format!("HostKeyAlias={}", pin.alias),
+                "UpdateHostKeys=no".into(),
+                "ForwardAgent=no".into(),
+            ],
         }
     }
 
     /// `~/.ssh/config` directive lines (`Key Value`) for this policy.
+    /// Values are already quoted where needed by [`quote_ssh_value`].
     pub fn ssh_config_lines(&self) -> Vec<String> {
         self.ssh_options()
             .into_iter()
             .map(|opt| opt.replacen('=', " ", 1))
             .collect()
+    }
+}
+
+/// Double-quote an SSH option value that contains whitespace. Values with a
+/// quote character or a control character are rejected where pinned targets
+/// are built (`apple_container::ssh::pinned_target`), so no escaping is needed.
+fn quote_ssh_value(value: &str) -> String {
+    if value.chars().any(char::is_whitespace) {
+        format!("\"{value}\"")
+    } else {
+        value.to_string()
     }
 }
 
@@ -362,8 +404,14 @@ impl SshTarget {
         // Hash host:port to keep the filename short and predictable.
         // 8 hex chars (32 bits) is enough to avoid collisions across
         // the handful of concurrent instances this tool manages.
+        // A pinned target also hashes its alias: the address of a pinned
+        // backend can be reassigned to another instance, and a master opened
+        // for one instance must never be reused for another.
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(&(&self.host, self.port), &mut hasher);
+        if let HostKeyPolicy::Pinned(pin) = &self.host_keys {
+            std::hash::Hash::hash(&pin.alias, &mut hasher);
+        }
         let hash = std::hash::Hasher::finish(&hasher);
         // Truncation to 32 bits is intentional — we only need enough
         // uniqueness to distinguish a handful of concurrent instances.
@@ -856,26 +904,149 @@ pub enum LocalEndpointRoute {
     /// URLs are rewritten to it (Firecracker's TAP gateway, Lima's
     /// `host.lima.internal`).
     HostAddress(String),
+    /// The guest has no route to the host; each loopback endpoint is carried
+    /// over a per-instance `ssh -R` tunnel onto the guest's own loopback.
+    #[cfg_attr(
+        all(not(feature = "apple-container"), not(test)),
+        expect(dead_code, reason = "constructed only by the apple-container backend")
+    )]
+    ReverseTunnel,
 }
+
+/// A reverse tunnel carrying a host-loopback server into the guest:
+/// `ssh -R 127.0.0.1:<guest_port>:<host_addr>:<host_port>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReverseTunnel {
+    /// Guest-loopback listener port; always unprivileged, so the non-root
+    /// guest user's sshd can bind it.
+    pub guest_port: u16,
+    /// Host loopback address the endpoint URL named.
+    pub host_addr: std::net::Ipv4Addr,
+    pub host_port: u16,
+}
+
+/// Offset applied to a privileged endpoint port (< 1024) to get its
+/// guest listener port: `https://localhost` (443) listens on guest 40443.
+const PRIVILEGED_PORT_OFFSET: u16 = 40_000;
 
 /// How one local-model endpoint is reached from inside the guest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalEndpointPlan {
     /// URL written into the guest agent's configuration.
     pub guest_url: url::Url,
+    /// The per-instance reverse tunnel the URL depends on, when the route
+    /// needs one.
+    pub tunnel: Option<ReverseTunnel>,
 }
 
-/// Resolve how the guest reaches `host_url` over `route`: loopback URLs are
-/// rewritten to the host address the route names; others pass through.
+/// Resolve how the guest reaches `host_url` over `route`.
+///
+/// Non-loopback URLs pass through unchanged on every route. Over a reverse
+/// tunnel the guest listener is on `127.0.0.1`, and the tunnel forwards to the
+/// exact host loopback address and port the URL names. `localhost` and
+/// `127.0.0.1` URLs keep their host (and with it any TLS server name); other
+/// IPv4 loopback addresses are rewritten to `127.0.0.1` only for plain HTTP,
+/// since rewriting an HTTPS host would change the name verified against the
+/// certificate. A privileged port moves to an unprivileged guest port (the
+/// URL's port changes; its host does not). IPv6 loopback endpoints are
+/// rejected: the tunnel listens on IPv4 only.
 pub fn plan_local_endpoint(
     route: &LocalEndpointRoute,
     host_url: &url::Url,
 ) -> Result<LocalEndpointPlan> {
-    match route {
-        LocalEndpointRoute::HostAddress(addr) => Ok(LocalEndpointPlan {
-            guest_url: crate::network::rewrite_host_url(host_url, addr)?,
-        }),
+    let host = match route {
+        LocalEndpointRoute::HostAddress(addr) => {
+            return Ok(LocalEndpointPlan {
+                guest_url: crate::network::rewrite_host_url(host_url, addr)?,
+                tunnel: None,
+            });
+        }
+        LocalEndpointRoute::ReverseTunnel => host_url.host(),
+    };
+    let (host_addr, needs_rewrite) = match host {
+        Some(url::Host::Domain(d)) if d.eq_ignore_ascii_case("localhost") => {
+            (std::net::Ipv4Addr::LOCALHOST, false)
+        }
+        Some(url::Host::Ipv4(ip)) if ip == std::net::Ipv4Addr::LOCALHOST => (ip, false),
+        Some(url::Host::Ipv4(ip)) if ip.is_loopback() => (ip, true),
+        Some(url::Host::Ipv6(ip)) if ip.is_loopback() => bail!(
+            "Local model endpoint {host_url} uses IPv6 loopback, which this backend \
+             cannot tunnel into the guest; use http://127.0.0.1:<port> instead"
+        ),
+        _ => {
+            return Ok(LocalEndpointPlan {
+                guest_url: host_url.clone(),
+                tunnel: None,
+            });
+        }
+    };
+    let host_port = host_url
+        .port_or_known_default()
+        .with_context(|| format!("Local model endpoint {host_url} has no port"))?;
+    let guest_port = if host_port < 1024 {
+        host_port + PRIVILEGED_PORT_OFFSET
+    } else {
+        host_port
+    };
+    let mut guest_url = host_url.clone();
+    if needs_rewrite {
+        if host_url.scheme() != "http" {
+            bail!(
+                "Local model endpoint {host_url} would need its host rewritten to \
+                 127.0.0.1, which changes the TLS server name; use \
+                 https://localhost:{host_port} or https://127.0.0.1:{host_port} instead"
+            );
+        }
+        guest_url
+            .set_host(Some("127.0.0.1"))
+            .context("Failed to rewrite local model endpoint host")?;
     }
+    if guest_port != host_port {
+        guest_url
+            .set_port(Some(guest_port))
+            .map_err(|()| anyhow::anyhow!("Failed to set guest port on {host_url}"))?;
+    }
+    Ok(LocalEndpointPlan {
+        guest_url,
+        tunnel: Some(ReverseTunnel {
+            guest_port,
+            host_addr,
+            host_port,
+        }),
+    })
+}
+
+/// Every reverse tunnel this instance's current model configuration needs,
+/// across both agents, keyed by guest port. Two endpoints that need the same
+/// guest port must also share the host destination.
+fn local_endpoint_tunnels(
+    state: &ModelState,
+    cfg: &CoopConfig,
+    route: &LocalEndpointRoute,
+) -> Result<BTreeMap<u16, ReverseTunnel>> {
+    let mut tunnels = BTreeMap::new();
+    let endpoints = [
+        local_endpoint(state, state.resolved_claude(&cfg.claude)),
+        local_endpoint(state, state.resolved_codex(&cfg.codex)),
+    ];
+    for ep in endpoints.into_iter().flatten() {
+        let Some(tunnel) = plan_local_endpoint(route, ep.host_url())?.tunnel else {
+            continue;
+        };
+        match tunnels.insert(tunnel.guest_port, tunnel) {
+            Some(other) if other != tunnel => bail!(
+                "Local model endpoints {}:{} and {}:{} both need guest port {}; \
+                 use distinct ports",
+                other.host_addr,
+                other.host_port,
+                tunnel.host_addr,
+                tunnel.host_port,
+                tunnel.guest_port
+            ),
+            _ => {}
+        }
+    }
+    Ok(tunnels)
 }
 
 /// What a backend supports, reported by [`VmBackend::capabilities`].
@@ -921,9 +1092,9 @@ pub struct UnsupportedCapability {
 
 /// VM backend for managing guest lifecycle.
 ///
-/// Two impls: `FirecrackerBackend` (Linux) and `LimaBackend` (macOS).
-/// The `PlatformBackend` type alias selects the correct one at compile
-/// time via `#[cfg]`.
+/// Impls: `FirecrackerBackend` (Linux), `LimaBackend` (macOS), and
+/// `AppleContainerBackend` (macOS, `apple-container` feature). The
+/// `PlatformBackend` type alias selects one at compile time via `#[cfg]`.
 pub trait VmBackend: std::fmt::Display {
     /// What this backend supports; see [`BackendCapabilities`].
     fn capabilities(&self) -> BackendCapabilities;
@@ -1040,7 +1211,7 @@ pub trait VmBackend: std::fmt::Display {
     /// How the guest reaches a server running on the host, for local-model
     /// endpoints (see [`plan_local_endpoint`]). Firecracker guests route
     /// through the TAP gateway (`network.host_ip`); Lima injects
-    /// `host.lima.internal`.
+    /// `host.lima.internal`; Apple Container guests get a reverse tunnel.
     fn local_endpoint_route(&self, network: &NetworkConfig) -> LocalEndpointRoute;
     /// Whether mounts use live filesystem sharing (Lima/virtiofs)
     /// vs one-time sync (Firecracker/rsync).
@@ -1310,6 +1481,10 @@ impl VmBackend for FirecrackerBackend {
 pub struct LimaBackend;
 
 #[cfg(target_os = "macos")]
+#[cfg_attr(
+    feature = "apple-container",
+    expect(dead_code, reason = "apple-container replaces Lima as PlatformBackend")
+)]
 impl LimaBackend {
     pub fn new() -> Self {
         Self
@@ -1501,7 +1676,10 @@ impl VmBackend for LimaBackend {
 
 // ── Platform type alias ───────────────────────────────────────
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "apple-container"))]
+pub type PlatformBackend = crate::apple_container::AppleContainerBackend;
+
+#[cfg(all(target_os = "macos", not(feature = "apple-container")))]
 pub type PlatformBackend = LimaBackend;
 
 #[cfg(not(target_os = "macos"))]
@@ -1696,6 +1874,13 @@ pub fn bootstrap_agents(
         tracing::info!("Configuring GitHub auth in guest");
         setup_github_auth(session)?;
     }
+
+    // Reconcile local-model tunnels once for both agents, before either
+    // publishes a URL that depends on one: open what the current config
+    // needs, keep what is already live, and close what it no longer needs
+    // (local mode switched off, or an endpoint moved).
+    let tunnels = local_endpoint_tunnels(&ModelState::load_or_default(inst)?, cfg, route)?;
+    crate::proxy::sync_model_tunnels(inst, &session.target, &tunnels)?;
 
     bootstrap_claude(session, cfg, inst, mode, route)?;
     bootstrap_codex(session, cfg, inst, mode, route)?;
@@ -3796,30 +3981,164 @@ mod tests {
     fn plan_host_address_rewrites_loopback_without_tunnel() {
         let plan = plan_local_endpoint(&test_route(), &url("http://localhost:11434/v1")).unwrap();
         assert_eq!(plan.guest_url.as_str(), "http://172.16.0.1:11434/v1");
+        assert_eq!(plan.tunnel, None);
+    }
+
+    fn tunnel(guest_port: u16, host: [u8; 4], host_port: u16) -> ReverseTunnel {
+        ReverseTunnel {
+            guest_port,
+            host_addr: host.into(),
+            host_port,
+        }
     }
 
     #[test]
-    fn rsync_command_keeps_a_key_path_with_a_space_whole() {
+    fn plan_reverse_tunnel_keeps_localhost_and_tunnels_port() {
+        let route = LocalEndpointRoute::ReverseTunnel;
+        for u in ["http://localhost:11434/v1", "https://127.0.0.1:8443/api"] {
+            let plan = plan_local_endpoint(&route, &url(u)).unwrap();
+            assert_eq!(plan.guest_url.as_str(), u);
+        }
+        let plan = plan_local_endpoint(&route, &url("http://localhost:11434/v1")).unwrap();
+        assert_eq!(plan.tunnel, Some(tunnel(11434, [127, 0, 0, 1], 11434)));
+    }
+
+    #[test]
+    fn plan_reverse_tunnel_moves_privileged_ports() {
+        let route = LocalEndpointRoute::ReverseTunnel;
+        let plan = plan_local_endpoint(&route, &url("https://localhost/v1")).unwrap();
+        // Host (and so the TLS name) is kept; only the port moves.
+        assert_eq!(plan.guest_url.as_str(), "https://localhost:40443/v1");
+        assert_eq!(plan.tunnel, Some(tunnel(40443, [127, 0, 0, 1], 443)));
+    }
+
+    #[test]
+    fn plan_reverse_tunnel_forwards_to_the_named_loopback_address() {
+        let route = LocalEndpointRoute::ReverseTunnel;
+        let plan = plan_local_endpoint(&route, &url("http://127.0.0.2:8000/x?y=1")).unwrap();
+        assert_eq!(plan.guest_url.as_str(), "http://127.0.0.1:8000/x?y=1");
+        assert_eq!(plan.tunnel, Some(tunnel(8000, [127, 0, 0, 2], 8000)));
+        assert!(plan_local_endpoint(&route, &url("https://127.0.0.2:8000/")).is_err());
+    }
+
+    #[test]
+    fn plan_reverse_tunnel_rejects_ipv6_loopback_and_passes_remote_through() {
+        let route = LocalEndpointRoute::ReverseTunnel;
+        assert!(plan_local_endpoint(&route, &url("http://[::1]:8000/")).is_err());
+        let plan = plan_local_endpoint(&route, &url("https://models.example.com/v1")).unwrap();
+        assert_eq!(plan.guest_url.as_str(), "https://models.example.com/v1");
+        assert_eq!(plan.tunnel, None);
+    }
+
+    fn local_state(claude: &str, codex: &str) -> ModelState {
+        let ep = |u: &str| crate::config::LocalModel::new(url(u), "m".to_string(), None).unwrap();
+        ModelState {
+            mode: crate::model_state::ModelMode::Local,
+            claude_endpoint: Some(ep(claude)),
+            codex_endpoint: Some(ep(codex)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn endpoint_tunnels_are_shared_across_agents_and_conflicts_rejected() {
+        let cfg = CoopConfig::default();
+        let route = LocalEndpointRoute::ReverseTunnel;
+        let shared = local_state("http://localhost:11434", "http://127.0.0.1:11434/v1/");
+        let tunnels = local_endpoint_tunnels(&shared, &cfg, &route).unwrap();
+        assert_eq!(tunnels.len(), 1, "one tunnel serves both agents");
+
+        let clash = local_state("http://127.0.0.1:8000", "http://127.0.0.2:8000/v1/");
+        assert!(local_endpoint_tunnels(&clash, &cfg, &route).is_err());
+
+        let remote = ModelState::default();
+        assert!(
+            local_endpoint_tunnels(&remote, &cfg, &route)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            local_endpoint_tunnels(&shared, &cfg, &test_route())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn pinned_policy_emits_strict_options_once() {
+        let pinned = HostKeyPolicy::Pinned(PinnedHostKey {
+            known_hosts: PathBuf::from("/state/known_hosts"),
+            alias: Hostname::new("coop-abc").unwrap(),
+        });
+        let target = SshTarget {
+            host: Hostname::new("192.168.64.5").unwrap(),
+            port: NonZeroU16::new(22).unwrap(),
+            user: SshUser::new("coop").unwrap(),
+            key_path: PathBuf::from("/k"),
+            host_keys: pinned.clone(),
+        };
+        let opts = target.ssh_opts();
+        let joined = opts.join(" ");
+        assert!(joined.contains("StrictHostKeyChecking=yes"));
+        assert!(joined.contains("UserKnownHostsFile=/state/known_hosts"));
+        assert!(joined.contains("HostKeyAlias=coop-abc"));
+        assert!(joined.contains("ForwardAgent=no"));
+        assert!(!joined.contains("StrictHostKeyChecking=no"));
+        assert!(!joined.contains("/dev/null") || joined.contains("GlobalKnownHostsFile=/dev/null"));
+        assert!(!joined.contains("UserKnownHostsFile=/dev/null"));
+        assert!(target.rsync_ssh_cmd().contains("StrictHostKeyChecking=yes"));
+        assert!(
+            target
+                .scp_opts()
+                .join(" ")
+                .contains("HostKeyAlias=coop-abc")
+        );
+
+        let unpinned = SshTarget {
+            host_keys: HostKeyPolicy::Unverified,
+            ..target.clone()
+        };
+        assert_ne!(target.control_path(), unpinned.control_path());
+        assert_eq!(
+            pinned.ssh_config_lines()[0],
+            "StrictHostKeyChecking yes".to_string()
+        );
+    }
+
+    #[test]
+    fn pinned_known_hosts_path_with_space_stays_one_value() {
         let target = SshTarget {
             host: Hostname::new("192.168.64.5").unwrap(),
             port: NonZeroU16::new(22).unwrap(),
             user: SshUser::new("coop").unwrap(),
             key_path: PathBuf::from("/Users/me/Application Support/vm_key"),
-            host_keys: HostKeyPolicy::Unverified,
+            host_keys: HostKeyPolicy::Pinned(PinnedHostKey {
+                known_hosts: PathBuf::from("/Users/me/Application Support/known_hosts"),
+                alias: Hostname::new("coop-abc").unwrap(),
+            }),
         };
+        assert!(
+            target.ssh_opts().contains(
+                &"UserKnownHostsFile=\"/Users/me/Application Support/known_hosts\"".into()
+            )
+        );
         let rsync = target.rsync_ssh_cmd();
         assert!(
-            rsync.contains("'/Users/me/Application Support/vm_key'"),
-            "{rsync}"
+            rsync.contains("'UserKnownHostsFile=\"/Users/me/Application Support/known_hosts\"'")
         );
-        assert!(rsync.contains(" StrictHostKeyChecking=no "), "{rsync}");
+        assert!(rsync.contains("'/Users/me/Application Support/vm_key'"));
+        assert!(
+            target.host_keys.ssh_config_lines().contains(
+                &"UserKnownHostsFile \"/Users/me/Application Support/known_hosts\"".into()
+            )
+        );
     }
 
     #[test]
     fn capabilities_require_rejects_missing_capability() {
         let caps = BackendCapabilities::new(&[Capability::MachineResources]);
         let err = caps
-            .require(&"example", Capability::DiskResize)
+            .require(&"apple-container", Capability::DiskResize)
             .unwrap_err();
         assert!(err.downcast_ref::<UnsupportedCapability>().is_some());
         assert!(err.to_string().contains("CAPABILITY_UNSUPPORTED"));

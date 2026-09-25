@@ -5,6 +5,8 @@
 //! way lets fuzz targets and integration tests depend on `coop` directly
 //! (e.g. `coop::config::CoopConfig`) instead of `#[path]`-including modules.
 
+#[cfg(all(target_os = "macos", feature = "apple-container"))]
+mod apple_container;
 mod backend;
 mod cmd;
 mod commands;
@@ -31,6 +33,11 @@ mod proxy_state;
 mod remote_command;
 mod secret_store;
 mod sha256_hash;
+#[cfg(all(feature = "apple-container", not(target_os = "macos")))]
+compile_error!(
+    "the `apple-container` feature selects the Apple Container backend, which exists only on \
+     macOS; build without it on this target (Linux uses Firecracker)"
+);
 // Lima is an interactive CLI workflow — stderr output is intentional user communication.
 #[cfg_attr(not(target_os = "macos"), expect(dead_code, reason = "Lima-only"))]
 #[expect(

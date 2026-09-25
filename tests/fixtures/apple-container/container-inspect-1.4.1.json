@@ -1,0 +1,56 @@
+[
+  {
+    "configuration" : {
+      "capAdd" : [ "ALL" ],
+      "id" : "a1b2c3d4-e5f6",
+      "image" : {
+        "descriptor" : {
+          "digest" : "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "mediaType" : "application/vnd.oci.image.index.v1+json",
+          "size" : 1024
+        },
+        "reference" : "local/coop-0a1b2c3d:0011223344556677"
+      },
+      "mounts" : [
+        {
+          "destination" : "/sbin.machine",
+          "options" : [ "ro" ],
+          "source" : "/Users/synthetic/Library/Application Support/com.apple.container/machines/coop-0a1b2c3d-00112233445566ff/sbin.machine",
+          "type" : { "virtiofs" : { } }
+        },
+        {
+          "destination" : "/etc/.machine.initialized",
+          "options" : [ "rw" ],
+          "source" : "/Users/synthetic/Library/Application Support/com.apple.container/machines/coop-0a1b2c3d-00112233445566ff/machine.initialized",
+          "type" : { "virtiofs" : { } }
+        },
+        {
+          "destination" : "/Users/synthetic",
+          "options" : [ "rw" ],
+          "source" : "/Users/synthetic",
+          "type" : { "virtiofs" : { } }
+        }
+      ],
+      "networks" : [
+        {
+          "network" : "default",
+          "options" : { "hostname" : "coop-0a1b2c3d-00112233445566ff.machine." }
+        }
+      ],
+      "publishedPorts" : [ ],
+      "publishedSockets" : [ ],
+      "ssh" : true
+    },
+    "status" : {
+      "networks" : [
+        {
+          "hostname" : "coop-0a1b2c3d-00112233445566ff.machine.",
+          "ipv4Address" : "192.168.64.3/24",
+          "ipv4Gateway" : "192.168.64.1",
+          "network" : "default"
+        }
+      ],
+      "state" : "running"
+    }
+  }
+]

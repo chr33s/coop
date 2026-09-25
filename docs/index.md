@@ -22,7 +22,7 @@ short navigational entrypoint; durable detail lives here.
 - [`getting-started.md`](getting-started.md) — install and first VM.
 - [`commands.md`](commands.md) — every `coop` subcommand.
 - [`configuration.md`](configuration.md) — `config.toml` reference.
-- [`backends.md`](backends.md) — Lima (macOS) and Firecracker (Linux) setup.
+- [`backends.md`](backends.md) — Lima (macOS), Firecracker (Linux), and the opt-in Apple Container (macOS) backend.
 - [`images-and-profiles.md`](images-and-profiles.md),
   [`workspaces.md`](workspaces.md), [`multi-instance.md`](multi-instance.md),
   [`devcontainer.md`](devcontainer.md), [`editor.md`](editor.md),

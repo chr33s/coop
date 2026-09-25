@@ -57,7 +57,8 @@ Runtime: Rust `1.94.0` (see `rust-toolchain.toml`), edition 2024.
 ```bash
 cargo build                                                    # debug build
 cargo fmt -- --check                                           # format check
-cargo clippy --all-targets --all-features -- -D warnings       # lints (zero-warnings)
+cargo clippy --all-targets -- -D warnings                      # lints (zero-warnings)
+cargo clippy --all-targets --features apple-container -- -D warnings  # macOS: Apple backend
 cargo test                                                     # unit tests (lib)
 cargo deny check                                               # advisories/licenses/bans
 taplo format --check                                           # TOML formatting

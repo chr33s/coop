@@ -633,6 +633,18 @@ pub fn open_editor(
     Ok(())
 }
 
+/// What the printed alias guarantees about the guest's host key.
+fn host_key_note(policy: &crate::backend::HostKeyPolicy) -> &'static str {
+    match policy {
+        crate::backend::HostKeyPolicy::Unverified => {
+            "These connections skip host-key verification (the VM's keys are ephemeral)."
+        }
+        crate::backend::HostKeyPolicy::Pinned(_) => {
+            "These connections verify the VM's pinned host key; a changed key is refused."
+        }
+    }
+}
+
 /// Install (or refresh) the `coop-<name>` SSH alias and print it.
 ///
 /// Writes the `Host coop-<name>` block to `~/.ssh/config` idempotently,
@@ -650,6 +662,7 @@ pub fn write_ssh_config(running: &RunningInstance) -> Result<()> {
 
     let host = ssh_config_host(inst);
     let block = ssh_config_block(target, inst);
+    let host_key_note = host_key_note(&target.host_keys);
     writeln!(
         std::io::stderr(),
         "\nSSH alias '{host}' is ready:\n\n{block}\n\n\
@@ -657,8 +670,7 @@ pub fn write_ssh_config(running: &RunningInstance) -> Result<()> {
          \x20   ssh {host}\n\
          \x20   scp ./file {host}:/workspace/\n\
          \x20   rsync -az ./dir/ {host}:/workspace/dir/\n\n\
-         These connections skip host-key verification \
-         (the VM's keys are ephemeral)."
+         {host_key_note}"
     )
     .context("Failed to write SSH config info")?;
 
@@ -1391,7 +1403,21 @@ mod tests {
     use super::*;
 
     use crate::config::{ImageName, InstanceIndex, InstanceName};
+
     use proptest::prelude::*;
+
+    #[test]
+    fn host_key_note_matches_the_policy() {
+        use crate::backend::{HostKeyPolicy, Hostname, PinnedHostKey};
+        assert!(host_key_note(&HostKeyPolicy::Unverified).contains("skip host-key verification"));
+        let pinned = HostKeyPolicy::Pinned(PinnedHostKey {
+            known_hosts: std::path::PathBuf::from("/state/known_hosts"),
+            alias: Hostname::new("coop-abc").unwrap(),
+        });
+        let note = host_key_note(&pinned);
+        assert!(note.contains("pinned host key"), "{note}");
+        assert!(!note.contains("skip"), "{note}");
+    }
 
     /// Rewrite default-build marker and alias literals into this build's
     /// namespace (identity for the default build).

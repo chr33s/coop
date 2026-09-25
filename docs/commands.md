@@ -686,10 +686,13 @@ a restart. On macOS/Lima the forwarded SSH port changes on each start; the
 refresh keeps the alias current without you re-running the command. On
 Linux/Firecracker the host and port are stable, so the refresh is a no-op.
 
-The block sets `StrictHostKeyChecking no` and `UserKnownHostsFile /dev/null`,
-so `ssh coop-*` connections skip host-key verification. This is intentional —
-these VMs regenerate their host keys, so pinning them would only produce
-spurious mismatch warnings.
+On Lima and Firecracker the block sets `StrictHostKeyChecking no` and
+`UserKnownHostsFile /dev/null`, so `ssh coop-*` connections skip host-key
+verification. This is intentional — these VMs regenerate their host keys, so
+pinning them would only produce spurious mismatch warnings. The Apple Container
+backend instead pins each guest's host key: its `coop-apple-*` block sets
+`StrictHostKeyChecking yes` with the instance's own `known_hosts`, plus
+`ForwardAgent no` and `IdentityAgent none`, and a changed key is refused.
 
 Use `ssh-config` for ad-hoc copies of arbitrary paths. To sync the tracked
 workspace directory in bulk, use [`push`](#push) / [`pull`](#pull) instead.

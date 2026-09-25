@@ -341,6 +341,9 @@ impl HostKeyPolicy {
                 format!("HostKeyAlias={}", pin.alias),
                 "UpdateHostKeys=no".into(),
                 "ForwardAgent=no".into(),
+                // Authentication uses coop's key file only; never consult the
+                // host agent for a guest-facing connection.
+                "IdentityAgent=none".into(),
             ],
         }
     }
@@ -4089,6 +4092,7 @@ mod tests {
         assert!(joined.contains("UserKnownHostsFile=/state/known_hosts"));
         assert!(joined.contains("HostKeyAlias=coop-abc"));
         assert!(joined.contains("ForwardAgent=no"));
+        assert!(joined.contains("IdentityAgent=none"));
         assert!(!joined.contains("StrictHostKeyChecking=no"));
         assert!(!joined.contains("/dev/null") || joined.contains("GlobalKnownHostsFile=/dev/null"));
         assert!(!joined.contains("UserKnownHostsFile=/dev/null"));

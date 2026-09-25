@@ -177,7 +177,9 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   read once over the runtime's native control channel (`machine run --root`
   addressed to the owned machine, never `ssh-keyscan`), written to a per-instance
   `known_hosts`, and enforced with `StrictHostKeyChecking=yes`,
-  `HostKeyAlias=<machine>.coop-apple`, `UpdateHostKeys=no`, `ForwardAgent=no`.
+  `HostKeyAlias=<machine>.coop-apple`, `UpdateHostKeys=no`, `ForwardAgent=no`,
+  and `IdentityAgent=none`, so coop's guest-facing SSH authenticates with its
+  own key file and never consults the host agent.
   A missing or changed key is a hard error. Flag any path that re-enrolls
   automatically or builds a pinned target with the unverified options.
 

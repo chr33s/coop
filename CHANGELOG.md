@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Fixes
+
+- **`coop stop` no longer reports success when it could not check the
+  instance** — a failed liveness probe used to be treated as "not running", so
+  `coop stop` printed "stopped" while the VM kept running. It now returns the
+  probe error (after tearing down the credential proxy) unless the backend can
+  stop the machine without a guest connection.
+- **`coop status` lists every instance even when one cannot be probed** — that
+  instance is shown as `unknown` (JSON `"state": "unknown"`) with a warning,
+  instead of the whole listing failing.
+- **rsync transfers work when the VM key path contains a space** — SSH options
+  containing whitespace are now quoted in rsync's `-e` command.
+
 ## v0.6.0
 
 ### Upgrading from v0.5.4

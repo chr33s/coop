@@ -1778,7 +1778,25 @@ pub(crate) fn cmd_stop(
     // Probe live state once. The `RunningInstance` proof flows into
     // `be.stop`, so the type system witnesses that we only ask the
     // backend to stop something that was actually running.
-    if let Ok(Some(running)) = be.as_running(cfg, inst.clone()) {
+    // A failed probe is not "not running": reporting the instance stopped
+    // while it may still be up would leave its agent running unnoticed.
+    // Backends that can stop a machine without a guest connection get one
+    // more chance via `stop_unproven`; the credential proxy is torn down
+    // either way.
+    let probe = match be.as_running(cfg, inst.clone()) {
+        Ok(probe) => probe,
+        Err(probe_err) => {
+            crate::proxy::stop(inst);
+            return be.stop_unproven(cfg, inst).map_err(|stop_err| {
+                probe_err.context(format!(
+                    "Could not determine whether instance '{}' is running, and it could \
+                     not be stopped without that ({stop_err:#})",
+                    inst.name
+                ))
+            });
+        }
+    };
+    if let Some(running) = probe {
         // Tear down forwards before shutting down the VM so the
         // control master can exit cleanly while SSH is still
         // reachable.
@@ -1878,12 +1896,35 @@ fn instance_status<'a>(
         ),
         None => (json::InstanceState::Stopped, None),
     };
-    Ok(json::InstanceStatus {
+    Ok(status_record(be, inst, state, usage))
+}
+
+fn status_record<'a>(
+    be: &backend::PlatformBackend,
+    inst: &'a config::Instance,
+    state: json::InstanceState,
+    usage: Option<backend::ResourceUsage>,
+) -> json::InstanceStatus<'a> {
+    json::InstanceStatus {
         name: &inst.name,
         state,
         image: &inst.image,
         backend: json::BackendKind::of(be),
         usage,
+    }
+}
+
+/// [`instance_status`] for a listing: one instance whose state cannot be
+/// probed is reported `unknown` (with a warning) instead of failing the
+/// whole listing.
+fn listed_instance_status<'a>(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    inst: &'a config::Instance,
+) -> json::InstanceStatus<'a> {
+    instance_status(be, cfg, inst).unwrap_or_else(|e| {
+        tracing::warn!("Could not determine the state of '{}': {e:#}", inst.name);
+        status_record(be, inst, json::InstanceState::Unknown, None)
     })
 }
 
@@ -1910,10 +1951,10 @@ pub(crate) fn cmd_status(
     } else {
         let instances = cfg.list_instances()?;
         if json_out {
-            let statuses = instances
+            let statuses: Vec<_> = instances
                 .iter()
-                .map(|inst| instance_status(be, cfg, inst))
-                .collect::<Result<Vec<_>>>()?;
+                .map(|inst| listed_instance_status(be, cfg, inst))
+                .collect();
             return json::render_json(&statuses);
         }
         if instances.is_empty() {
@@ -1922,15 +1963,13 @@ pub(crate) fn cmd_status(
             return Ok(());
         }
         for inst in &instances {
-            let (state, usage_str) = match be.as_running(cfg, inst.clone())? {
-                Some(running) => {
-                    let usage = backend::query_resource_usage(running.target())
-                        .map(|u| format!("  {}", u.summary()))
-                        .unwrap_or_default();
-                    ("running", usage)
-                }
-                None => ("stopped", String::new()),
-            };
+            let status = listed_instance_status(be, cfg, inst);
+            let state = status.state.label();
+            let usage_str = status
+                .usage
+                .as_ref()
+                .map(|u| format!("  {}", u.summary()))
+                .unwrap_or_default();
             writeln!(
                 std::io::stdout(),
                 "{:<16} {:<10} {:<10} {}{usage_str}",
@@ -2245,7 +2284,7 @@ fn reprovision_instance(
     // `proxy::stop` (the guest's copy of the capability token dies with the
     // disk; the first-boot bootstrap reissues it).
     //
-    // It swallows a failed `as_running` probe, which is fine here: the
+    // A failed `as_running` probe aborts here, before anything is changed; the
     // `as_stopped` proof below is what actually gates the disk swap.
     cmd_stop(be, cfg, &inst)?;
 

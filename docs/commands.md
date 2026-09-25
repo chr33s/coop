@@ -431,7 +431,7 @@ Alias: `ls`.
 
 ### `status`
 
-Print instance status. Without a name, lists every instance with its state, image, backend, and resource usage (for running instances). With a name, prints detailed status for that instance.
+Print instance status. Without a name, lists every instance with its state, image, backend, and resource usage (for running instances). An instance whose state cannot be probed is listed as `unknown` with a warning, rather than failing the whole listing. With a name, prints detailed status for that instance.
 
 ```
 coop status [NAME]

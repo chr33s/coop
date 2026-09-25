@@ -24,12 +24,15 @@ pub(crate) fn render_json<T: Serialize>(value: &T) -> anyhow::Result<()> {
 }
 
 /// Instance run state — the closed set the human path prints as
-/// `"running"` / `"stopped"`.
+/// `"running"` / `"stopped"`, or `"unknown"` in a listing when the backend
+/// could not probe one instance.
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum InstanceState {
     Running,
     Stopped,
+    /// The backend could not determine the state (listings only).
+    Unknown,
 }
 
 impl InstanceState {
@@ -47,6 +50,7 @@ impl InstanceState {
         match self {
             Self::Running => "running",
             Self::Stopped => "stopped",
+            Self::Unknown => "unknown",
         }
     }
 }

@@ -584,10 +584,22 @@ impl SshTarget {
     /// SSH command string for rsync's -e flag.
     ///
     /// Derived from [`Self::ssh_opts`] so a transfer inherits the same bounds
-    /// as any other guest command. rsync splits this string on whitespace, so
-    /// it stays unquoted — a key path containing spaces has never worked here.
+    /// as any other guest command.
     pub fn rsync_ssh_cmd(&self) -> String {
-        format!("ssh {}", self.ssh_opts().join(" "))
+        // rsync splits `-e` on whitespace but honours quotes, so an option
+        // containing whitespace is single-quoted to reach ssh intact.
+        let opts: Vec<String> = self
+            .ssh_opts()
+            .into_iter()
+            .map(|o| {
+                if o.chars().any(char::is_whitespace) {
+                    format!("'{o}'")
+                } else {
+                    o
+                }
+            })
+            .collect();
+        format!("ssh {}", opts.join(" "))
     }
 
     /// Run a command on the guest via SSH and capture stdout.
@@ -928,6 +940,16 @@ pub trait VmBackend: std::fmt::Display {
     /// so the type system witnesses that the precondition held when
     /// the call was made.
     fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<()>;
+    /// Stop `inst` when [`Self::as_running`] failed, so no
+    /// [`RunningInstance`] proof exists. Only a backend that can confirm the
+    /// stop from its own control plane — no guest connection — overrides
+    /// this; the default refuses, leaving the probe error to the caller.
+    fn stop_unproven(&self, _cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+        bail!(
+            "the {self} backend cannot stop '{}' without a working liveness probe",
+            inst.name
+        )
+    }
     fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()>;
     fn destroy_shared(&self, cfg: &CoopConfig);
     fn destroy_image(&self, cfg: &CoopConfig, image: &ImageName) -> Result<()>;
@@ -3774,6 +3796,23 @@ mod tests {
     fn plan_host_address_rewrites_loopback_without_tunnel() {
         let plan = plan_local_endpoint(&test_route(), &url("http://localhost:11434/v1")).unwrap();
         assert_eq!(plan.guest_url.as_str(), "http://172.16.0.1:11434/v1");
+    }
+
+    #[test]
+    fn rsync_command_keeps_a_key_path_with_a_space_whole() {
+        let target = SshTarget {
+            host: Hostname::new("192.168.64.5").unwrap(),
+            port: NonZeroU16::new(22).unwrap(),
+            user: SshUser::new("coop").unwrap(),
+            key_path: PathBuf::from("/Users/me/Application Support/vm_key"),
+            host_keys: HostKeyPolicy::Unverified,
+        };
+        let rsync = target.rsync_ssh_cmd();
+        assert!(
+            rsync.contains("'/Users/me/Application Support/vm_key'"),
+            "{rsync}"
+        );
+        assert!(rsync.contains(" StrictHostKeyChecking=no "), "{rsync}");
     }
 
     #[test]

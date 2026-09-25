@@ -338,10 +338,13 @@ around them:
   guest→host file, and coop never reads it. The proof (`SecurityReady`) is
   process-local and never persisted.
 - **Separate networks are not proof of isolation.** Guest-to-guest
-  unreachability over IPv4/IPv6, including address, route, and neighbour
-  manipulation, still has to be demonstrated on real hardware with the
-  qualified runtime. Guest firewall rules do not count, because the guest has
-  root.
+  unreachability has to be demonstrated for each qualified runtime on real
+  hardware; the fork's `testSeparateNetworksAreIsolated` does so for TCP,
+  ICMP, and unicast UDP over IPv4/IPv6 and IPv4 broadcast, each with a
+  same-network positive control, plus route, address, and
+  address-impersonation attempts from another network (`docs/backends.md`,
+  "Validation status" records which fork commit holds each check).
+  Guest firewall rules do not count, because the guest has root.
 - **Runtime subprocesses** get a cleared environment. Only `HOME`, `USER`,
   `LOGNAME`, `TMPDIR`, locale, and a fixed `PATH` are passed (`cli.rs`), so
   `SSH_AUTH_SOCK`, provider and GitHub tokens, `DYLD_*`, and `CONTAINER_*`
@@ -350,6 +353,11 @@ around them:
   not that the operation failed. Only builds, machine creation, and boots
   honour Ctrl-C; stop/delete/cleanup never do, so an interrupt cannot leave a
   booted machine behind.
+- **Guest commands over `machine run`.** The runtime joins the words after
+  `--` and hands them to the guest shell, so `machine_run_args` sends one
+  string with every word escaped exactly once by `RemoteCommand`. Only fixed
+  commands and coop-chosen paths go through it; guest-controlled text never
+  does.
 - **Local-model tunnels** (`proxy::sync_model_tunnels`) are reconciled on
   every bootstrap. A tunnel the current model config no longer needs is
   closed, so switching local mode off really removes the guest's path to the

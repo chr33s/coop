@@ -3,7 +3,7 @@
 **Document ID:** COOP-APPLE-001  
 **Version:** 0.1.0  
 **Date:** 2026-09-25  
-**Status:** Proposed; implementation and macOS validation have not been performed for this document  
+**Status:** Implemented; qualified on `1.4.1+coop.707eb44` / macOS 27 (§17.3). Firecracker default-backend regression pending  
 **Target repository:** `trailofbits/coop`  
 **Coop source baseline:** `338228c44977ed4c408ae7c83d79f2e03f60693c`  
 **Apple source baseline:** `apple/container` tag `1.4.1`  
@@ -591,9 +591,9 @@ These are dependency-ordered deliverables, not calendar estimates. Mark completi
 **Deliverables:** Pin source revisions; capture real 1.4.1 machine create/run/inspect/list/log/resource behavior; document JSON fixtures, name constraints, units, timeout/error behavior, and required extension fields.
 
 - [ ] Build and test the unchanged Coop baseline on macOS and Linux.
-- [ ] Run a restricted, credential-free stock-runtime prototype on real Apple Silicon.
-- [ ] Confirm home disabled, native fixed-command execution, image requirements, and restart identity behavior.
-- [ ] Capture the expected production refusal on the unmodified runtime.
+- [x] Run a restricted, credential-free stock-runtime prototype on real Apple Silicon.
+- [x] Confirm home disabled, native fixed-command execution, image requirements, and restart identity behavior.
+- [x] Capture the expected production refusal on the unmodified runtime.
 
 **Exit:** Fixtures are checked in and baseline assumptions are reproducible. Historical issue comments are not accepted as test evidence.
 
@@ -602,10 +602,10 @@ These are dependency-ordered deliverables, not calendar estimates. Mark completi
 **Dependencies:** WP-0.  
 **Deliverables:** Reviewed runtime patch, exact build identity, serialization/API tests, dedicated-network and agent-disable support.
 
-- [ ] Implement all Section 7 extension points without changing unrelated default behavior.
-- [ ] Validate persistence after machine restart and service restart.
-- [ ] Demonstrate cross-network IPv4/IPv6 and route/neighbor negative tests.
-- [ ] Demonstrate absence of host-agent exposure even with inherited/service-side agent state.
+- [x] Implement all Section 7 extension points without changing unrelated default behavior.
+- [x] Validate persistence after machine restart and service restart.
+- [x] Demonstrate cross-network IPv4/IPv6 and route/neighbor negative tests.
+- [x] Demonstrate absence of host-agent exposure even with inherited/service-side agent state.
 
 **Exit:** Security qualification succeeds. Otherwise retain an explicitly blocked shipping gate; do not downgrade it to a warning.
 
@@ -614,10 +614,10 @@ These are dependency-ordered deliverables, not calendar estimates. Mark completi
 **Dependencies:** WP-0; may proceed while WP-1 is under review.  
 **Deliverables:** Cargo selection, CLI adapter, parsers, capability errors, backend data namespace, typed manifests/journals, ownership-safe cleanup.
 
-- [ ] Default macOS/Linux builds remain unchanged.
-- [ ] Feature build advertises Apple backend and rejects unsupported targets.
-- [ ] Unit tests cover malformed output, command injection, timeout ambiguity, backend mismatch, and resource collisions.
-- [ ] Unsupported operations fail before side effects.
+- [x] Default macOS/Linux builds remain unchanged.
+- [x] Feature build advertises Apple backend and rejects unsupported targets.
+- [x] Unit tests cover malformed output, command injection, timeout ambiguity, backend mismatch, and resource collisions.
+- [x] Unsupported operations fail before side effects.
 
 **Exit:** Mock-runtime lifecycle and failure paths pass; stock-runtime production guard remains enforced.
 
@@ -626,10 +626,10 @@ These are dependency-ordered deliverables, not calendar estimates. Mark completi
 **Dependencies:** WP-1 and WP-2 for real-runtime secure tests.  
 **Deliverables:** OCI builder, image manifests, configured guest account, secure creation/restart, host-key enrollment, stop/destroy, resource changes.
 
-- [ ] Required binaries/services verified in a disposable machine.
-- [ ] Distinct first-boot machine IDs/host keys; stable keys on restart.
-- [ ] Security checks precede credentials/workspace transfer.
-- [ ] Crash-injected lifecycle operations recover without data loss or foreign-resource deletion.
+- [x] Required binaries/services verified in a disposable machine.
+- [x] Distinct first-boot machine IDs/host keys; stable keys on restart.
+- [x] Security checks precede credentials/workspace transfer.
+- [x] Crash-injected lifecycle operations recover without data loss or foreign-resource deletion.
 
 **Exit:** Core acceptance tests T-01 through T-15 below pass on the qualified runtime.
 
@@ -638,10 +638,10 @@ These are dependency-ordered deliverables, not calendar estimates. Mark completi
 **Dependencies:** WP-3.  
 **Deliverables:** Workspaces, agents, proxy, editor SSH, local-model endpoint plans, status/logs, profile/quickstart compatibility, updater protection.
 
-- [ ] No whole-home mount or unrestricted agent-config copy is introduced.
-- [ ] Proxy credentials remain host-side in proxy mode; port listeners remain loopback-only.
-- [ ] Copy/pull and devcontainer cases preserve existing trust boundaries.
-- [ ] Feature build cannot update itself into a different backend.
+- [x] No whole-home mount or unrestricted agent-config copy is introduced.
+- [x] Proxy credentials remain host-side in proxy mode; port listeners remain loopback-only.
+- [x] Copy/pull and devcontainer cases preserve existing trust boundaries.
+- [x] Feature build cannot update itself into a different backend.
 
 **Exit:** Full functional suite passes with synthetic credentials and controlled endpoints; optional live-provider tests require separate authorization.
 
@@ -651,9 +651,9 @@ These are dependency-ordered deliverables, not calendar estimates. Mark completi
 **Deliverables:** Security review, real-hardware CI, source/build provenance, support matrix, operational docs, rollback evidence, benchmark report.
 
 - [ ] Run the complete acceptance suite and all default-backend regression checks.
-- [ ] Run at least 30 consecutive lifecycle cycles and a concurrent multi-instance scenario; investigate every leaked resource or unexpected result.
-- [ ] Re-run security checks after service restart and simulated failure.
-- [ ] Publish exact supported runtime/macOS combinations and unresolved non-goals.
+- [x] Run at least 30 consecutive lifecycle cycles and a concurrent multi-instance scenario; investigate every leaked resource or unexpected result.
+- [x] Re-run security checks after service restart and simulated failure.
+- [x] Publish exact supported runtime/macOS combinations and unresolved non-goals.
 
 **Exit:** All release gates in Section 17 are met. A skeleton, prototype, or patched-runtime proposal alone is not a release.
 
@@ -732,12 +732,12 @@ It MUST NOT replace guest Docker with unrestricted remote access to the host Con
 
 The following are all mandatory:
 
-- [ ] The exact runtime build supports and enforces dedicated machine networks and disabled SSH-agent forwarding.
+- [x] The exact runtime build supports and enforces dedicated machine networks and disabled SSH-agent forwarding.
 - [ ] Real-hardware isolation, host-exposure, SSH pin, failure-recovery, and default-backend regression tests pass.
-- [ ] Credentials and project data cannot cross before secure readiness.
-- [ ] Explicitly unsupported capabilities fail without side effects and are documented.
-- [ ] Image provenance, backend-owned state, feature-preserving installation, and rollback are documented.
-- [ ] No code relies on undocumented Apple disk paths, a Docker-compatible API, or unqualified future CLI behavior.
+- [x] Credentials and project data cannot cross before secure readiness.
+- [x] Explicitly unsupported capabilities fail without side effects and are documented.
+- [x] Image provenance, backend-owned state, feature-preserving installation, and rollback are documented.
+- [x] No code relies on undocumented Apple disk paths, a Docker-compatible API, or unqualified future CLI behavior.
 
 ### 17.2 Items requiring implementation-time evidence
 
@@ -752,6 +752,10 @@ The following are all mandatory:
 | Performance | Measure without weakening security. | Published results with hardware, OS, runtime, workload, and cache state. |
 
 These items are validation work, not evidence that testing has already occurred. The implementation must preserve the blocked state when evidence is missing rather than infer success from the architecture.
+
+### 17.3 Qualification evidence (2026-09-25)
+
+Runtime `1.4.1+coop.707eb44` (fork `vendor/container`), macOS 27.0, Apple Silicon. Results are recorded in `docs/backends.md` ("Supported combinations", "Validation status"): fork machine and cross-network isolation tests, coop end-to-end lifecycle, credential/proxy/host-exposure checks with synthetic credentials, service restart, SIGKILL at every journaled stage, and 30 sequential plus concurrent lifecycles without leaks. The stock-runtime contract (`tests/apple-container-contract.sh`) passes against Homebrew 1.4.1. The default Lima backend's integration suite passes on macOS except three `ssh <alias>` checks, which fail because the run used a scratch `HOME` that OpenSSH ignores when locating `~/.ssh/config`; the same alias connects with `ssh -F <scratch config>`. Still open: the Firecracker integration suite on Linux, which requires a remote Linux/KVM host.
 
 ## 18. Source registry
 

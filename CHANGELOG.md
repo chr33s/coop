@@ -21,6 +21,8 @@
   it. The backend now treats a `machine inspect` record that reports
   `sshAgentForwarding` without `network` as a machine on the runtime's
   built-in network (and refuses it), instead of as an unqualified runtime.
+  `scripts/build-apple-container-runtime.sh` builds it into a directory you
+  own, without `sudo`.
 
 ### Fixes
 
@@ -34,6 +36,28 @@
   instead of the whole listing failing.
 - **rsync transfers work when the VM key path contains a space** — SSH options
   containing whitespace are now quoted in rsync's `-e` command.
+- **`coop list` shows `unknown` for an instance whose state cannot be read** —
+  on the Apple Container backend an unfinished operation or a failed probe was
+  listed as `stopped`. The unfinished-operation error now names the single
+  command that recovers it (`start` for a resize, `destroy` otherwise).
+- **Apple Container: `setup` and guest commands work on the runtime fork** —
+  the image installs `lsb-release` for the Docker repository step, the image
+  digest is read from `configuration.descriptor`, and `machine run` commands
+  are sent as one shell-quoted string, which the runtime passes to the guest
+  shell.
+- **Apple Container: guest SSH never contacts the host agent** — pinned
+  connections set `IdentityAgent=none`, and `coop ssh-config` no longer claims
+  that pinned aliases skip host-key verification.
+- **Lima: an instance starts again after `coop resize --size`** — Lima 2.x
+  refuses to boot ("disk shrinking is not supported") when `lima.yaml` records
+  a smaller disk than the file on disk. Growing the disk now updates `disk:`
+  in `lima.yaml` too.
+- **Apple Container: `stop_timeout_seconds` defaults to 60** — the runtime
+  stops one machine at a time, so a stop queued behind concurrent stops could
+  exceed the old 30 s default and be reported as uncertain.
+- **`coop images` does not report `0.0 GiB` for Apple Container images** — their
+  content lives in the runtime's image store, so the size is `n/a` (JSON
+  `"size_bytes": null`).
 
 ### Internal
 

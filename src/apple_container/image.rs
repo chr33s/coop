@@ -24,8 +24,10 @@ use crate::config::{CoopConfig, ImageName};
 use crate::devcontainer_oci::ResolvedFeature;
 use crate::guest::{GuestUser, ProfileDef};
 
-/// Base image for every coop machine image.
-pub(crate) const BASE_IMAGE: &str = "docker.io/library/ubuntu:24.04";
+/// Base image for every coop machine image (and the maintenance image),
+/// pinned by its multi-arch index digest so a rebuild cannot silently pick
+/// up a different base.
+pub(crate) const BASE_IMAGE: &str = "docker.io/library/ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3";
 /// The only guest platform version 1 supports.
 pub(crate) const PLATFORM: &str = "linux/arm64";
 /// Where the build context is copied inside the image during the build. Not
@@ -54,7 +56,6 @@ pub(crate) struct ImageManifest {
     pub(crate) base_image: String,
     pub(crate) platform: String,
     pub(crate) guest_user: GuestUser,
-    pub(crate) pubkey_fingerprint: String,
     pub(crate) created: String,
 }
 
@@ -183,7 +184,7 @@ impl BuildContext {
 /// Version of [`maintenance_dockerfile`]. `coop setup` reinstalls the
 /// maintenance image when the runtime reports another; bump it with any
 /// change to the recipe.
-pub(crate) const MAINTENANCE_VERSION: &str = "1";
+pub(crate) const MAINTENANCE_VERSION: &str = "2";
 
 /// The maintenance image: a shell and e2fsprogs, nothing else. The runtime
 /// boots it (networkless, from a disposable clone) to grow a disk or strip
@@ -239,10 +240,21 @@ fn write_mode(path: &Path, content: &str, mode: u32) -> Result<()> {
 /// manifest or an existing instance points at.
 pub(crate) fn image_ref(owner: &Owner, manifest_id: &str, build_id: &str) -> String {
     format!(
-        "local/coop-{}:{}-{build_id}",
-        owner.id.short(),
+        "{}{}-{build_id}",
+        owned_repo(owner),
         &manifest_id[..16.min(manifest_id.len())]
     )
+}
+
+/// Whether `reference` is an application-image tag [`image_ref`] made for
+/// `owner` (maintenance tags are not).
+pub(crate) fn is_owned_ref(owner: &Owner, reference: &str) -> bool {
+    reference.starts_with(&owned_repo(owner))
+}
+
+/// `local/coop-<owner8>:`, the repository prefix of every owned image tag.
+fn owned_repo(owner: &Owner) -> String {
+    format!("local/coop-{}:", owner.id.short())
 }
 
 fn dockerfile() -> String {
@@ -409,7 +421,6 @@ mod tests {
             base_image: "debian".into(),
             platform: "linux/arm64".into(),
             guest_user: GuestUser::default(),
-            pubkey_fingerprint: "SHA256:x".into(),
             created: "now".into(),
         }
     }
@@ -469,10 +480,16 @@ mod tests {
                 .try_into()
                 .unwrap(),
         };
-        assert_eq!(
-            image_ref(&owner, "00112233445566778899", "abcd"),
-            "local/coop-0a1b2c3d:0011223344556677-abcd"
-        );
+        let tag = image_ref(&owner, "00112233445566778899", "abcd");
+        assert_eq!(tag, "local/coop-0a1b2c3d:0011223344556677-abcd");
+        assert!(is_owned_ref(&owner, &tag));
+        for foreign in [
+            "local/coop-ffffffff:0011223344556677-abcd",
+            "local/coop-0a1b2c3dx:1",
+            "docker.io/library/ubuntu:24.04",
+        ] {
+            assert!(!is_owned_ref(&owner, foreign), "{foreign}");
+        }
     }
 
     /// Maintenance needs its own small image with the filesystem tools,
@@ -491,8 +508,11 @@ mod tests {
                 .unwrap(),
         };
         let tag = maintenance_ref(&owner, "ab");
-        assert_eq!(tag, "local/coop-0a1b2c3d-maintenance:1-ab");
-        assert!(!tag.starts_with("local/coop-0a1b2c3d:"));
+        assert_eq!(
+            tag,
+            format!("local/coop-0a1b2c3d-maintenance:{MAINTENANCE_VERSION}-ab")
+        );
+        assert!(!is_owned_ref(&owner, &tag));
         let dir = maintenance_context().unwrap();
         let names: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
         assert_eq!(names.len(), 1);

@@ -68,7 +68,7 @@ public enum Disks {
         return url
     }
 
-    static let initImagePrefix = "ghcr.io/apple/containerization/vminit"
+    public static let initImagePrefix = "ghcr.io/apple/containerization/vminit"
 
     public static func listDisks(root: SandboxRoot) -> [DiskSummary] {
         let names = (try? FileManager.default.contentsOfDirectory(atPath: root.disks.path)) ?? []

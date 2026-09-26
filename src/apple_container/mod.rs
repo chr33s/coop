@@ -157,7 +157,8 @@ pub struct AppleContainerBackend {
 
 impl AppleContainerBackend {
     /// Backend with default `[apple_container]` settings.
-    pub fn new() -> Self {
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
         Self::for_config(&CoopConfig::default())
     }
 
@@ -235,12 +236,6 @@ impl AppleContainerBackend {
         Ok(self.builder.get_or_init(|| Builder {
             exec: Box::new(RealExec::new(binary)),
         }))
-    }
-}
-
-impl Default for AppleContainerBackend {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -325,7 +320,45 @@ fn check_binary(path: &Path) -> Result<PathBuf> {
     if meta.mode() & 0o022 != 0 {
         bail!("{} is group- or world-writable", resolved.display());
     }
+    // Whoever can rename entries in a directory on the path can swap the
+    // binary, so every ancestor must be as trustworthy as the file.
+    for dir in resolved.ancestors().skip(1) {
+        let meta = std::fs::metadata(dir)
+            .with_context(|| format!("Failed to inspect {}", dir.display()))?;
+        if let Some(why) = untrusted_dir(meta.mode(), meta.uid(), meta.gid(), uid) {
+            bail!(
+                "{} is inside {}, which {why}",
+                resolved.display(),
+                dir.display()
+            );
+        }
+    }
     Ok(resolved)
+}
+
+/// Group ids whose members can already act as root through `sudo` on
+/// macOS (`wheel`, `admin`), so a directory writable by them grants nothing
+/// root does not. Homebrew's prefix is `admin`-group-writable.
+const ROOT_EQUIVALENT_GIDS: &[u32] = &[0, 80];
+
+/// Why a directory on a binary's path lets someone other than root or `me`
+/// replace entries in it, or `None` if it does not. A sticky directory only
+/// lets each user rename their own entries.
+fn untrusted_dir(mode: u32, owner: u32, group: u32, me: u32) -> Option<&'static str> {
+    const STICKY: u32 = 0o1000;
+    if owner != 0 && owner != me {
+        return Some("is owned by another user");
+    }
+    if mode & STICKY != 0 {
+        return None;
+    }
+    if mode & 0o002 != 0 {
+        return Some("is world-writable");
+    }
+    if mode & 0o020 != 0 && !ROOT_EQUIVALENT_GIDS.contains(&group) {
+        return Some("is group-writable");
+    }
+    None
 }
 
 /// `path` with its longest existing ancestor canonicalized, so it reads the
@@ -420,10 +453,9 @@ impl Runtime {
     fn expected<'a>(&'a self, sidecar: &'a MachineSidecar) -> Expected<'a> {
         Expected {
             sandbox: &sidecar.machine_id,
-            owner: sidecar.owner_id.as_str(),
+            owner: &sidecar.owner_id,
             runtime_root: &self.root,
-            cpus: sidecar.requested_cpus,
-            memory_bytes: sidecar.requested_memory_bytes,
+            resources: sidecar.resources(),
         }
     }
 
@@ -1022,12 +1054,6 @@ impl AppleContainerBackend {
             schema_version: state::SCHEMA_VERSION,
             backend: state::BACKEND_TAG.into(),
             owner_id: owner.id.clone(),
-            instance_id: machine
-                .as_str()
-                .rsplit('-')
-                .next()
-                .unwrap_or_default()
-                .to_string(),
             machine_id: machine.clone(),
             image_ref: manifest.image_ref.clone(),
             image_digest: manifest.digest.clone(),
@@ -1105,11 +1131,11 @@ impl AppleContainerBackend {
             )));
         }
         match &journal.op {
-            JournalOp::SetResources { operation, prior } => {
+            JournalOp::SetResources { operation, .. } => {
                 tracing::warn!(
                     "Reconciling an interrupted resource change of '{}' ({}): runtime reports {}",
                     inst.name,
-                    resource_change_outcome(operation.as_ref(), &rec.record, *prior),
+                    resource_change_outcome(operation, &rec.record),
                     rec.record.resources()
                 );
                 sidecar.requested_cpus = rec.record.cpus;
@@ -1120,14 +1146,9 @@ impl AppleContainerBackend {
                 prior_generation,
             } => {
                 // Only coop's own restore, identified by its operation id,
-                // authorizes a new host key. A journal converted from the
-                // layout before operation ids has only the generation; that
-                // is still coop's own journaled restore (see trust-model.md).
-                let replaced = rec.record.disk_generation > *prior_generation;
-                let applied = match operation {
-                    Some(op) => replaced && rec.record.committed(op),
-                    None => replaced,
-                };
+                // authorizes a new host key.
+                let applied = rec.record.disk_generation > *prior_generation
+                    && rec.record.committed(operation);
                 tracing::warn!(
                     "Reconciling an interrupted restore of '{}': {}",
                     inst.name,
@@ -1351,7 +1372,7 @@ impl AppleContainerBackend {
         let target = target(prior);
         let operation = OperationId::generate()?;
         let journaled = JournalOp::SetResources {
-            operation: Some(operation.clone()),
+            operation: operation.clone(),
             prior,
         };
         Journal::begin(inst, owner, journaled.clone(), machine.clone())?;
@@ -1380,15 +1401,10 @@ impl AppleContainerBackend {
 /// How an interrupted resource change ended, for the reconcile warning only:
 /// the sidecar takes the runtime's values either way.
 fn resource_change_outcome(
-    operation: Option<&OperationId>,
+    operation: &OperationId,
     record: &protocol::SandboxRecord,
-    prior: Resources,
 ) -> &'static str {
-    let applied = match operation {
-        Some(op) => record.committed(op),
-        None => record.resources() != prior,
-    };
-    if applied {
+    if record.committed(operation) {
         "the change applied"
     } else {
         "the change did not apply"
@@ -1425,7 +1441,12 @@ impl VmBackend for AppleContainerBackend {
         let pubkey = std::fs::read_to_string(&pubkey_path)
             .with_context(|| format!("Failed to read {}", pubkey_path.display()))?;
         let pubkey = pubkey.trim();
-        let pubkey_fingerprint = ssh::HostPublicKey::parse(pubkey)?.fingerprint();
+        let pubkey_fingerprint = ssh::ed25519_fingerprint(pubkey).map_err(|e| {
+            anyhow::anyhow!(
+                "VM access key {} {e}; delete it and rerun `coop setup` to regenerate it",
+                pubkey_path.display()
+            )
+        })?;
         let ctx = BuildContext::render(&BuildInputs {
             pubkey,
             profiles: &opts.profiles,
@@ -1489,7 +1510,6 @@ impl VmBackend for AppleContainerBackend {
             base_image: image::BASE_IMAGE.into(),
             platform: image::PLATFORM.into(),
             guest_user: opts.guest_user.clone(),
-            pubkey_fingerprint,
             created: crate::setup::utc_timestamp(),
         }
         .save(cfg, image)?;
@@ -1584,16 +1604,12 @@ impl VmBackend for AppleContainerBackend {
     }
 
     fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
-        if let Some((machine, network)) = state::legacy_machine(inst)? {
-            tracing::warn!(
-                "Instance '{}' was created by the retired `container machine` backend. Removing \
-                 its local state; its machine and network remain in the Apple Container runtime. \
-                 Delete them there with `container machine delete {machine}` and \
-                 `container network delete {network}`.",
-                inst.name
-            );
-            return remove_instance_dir(inst);
+        if !inst.dir.exists() {
+            return Ok(());
         }
+        // Held until the directory (lock file included) is gone, so no other
+        // mutation can change the records this reads.
+        let _lock = state::lock_instance(inst)?;
         let sidecar = MachineSidecar::try_load(inst)?;
         let journal = Journal::try_load(inst)?;
         let ids = match (&sidecar, &journal) {
@@ -1611,7 +1627,6 @@ impl VmBackend for AppleContainerBackend {
                 )));
             }
             let rt = self.runtime()?;
-            let _lock = state::lock_instance(inst)?;
             // The listing, not `inspect`: the runtime refuses to inspect a
             // sandbox whose staged disk update is unreadable, and destroying
             // one must still work.
@@ -1732,7 +1747,24 @@ impl VmBackend for AppleContainerBackend {
             rt.settings.create,
             MAX_JSON_OUTPUT,
         );
-        rt.checked(&req)?;
+        if let Err(e) = rt.checked(&req) {
+            // A grow that reports failure after publishing its update has
+            // still changed the disk; only the runtime's record can say, and
+            // a record that cannot be read leaves the outcome unknown.
+            match rt.inspect(machine) {
+                Ok(after) if !after.record.committed(&operation) => return Err(e),
+                Ok(_) => bail!(AppleError::OperationUncertain(format!(
+                    "growing sandbox {machine} reported failure ({e:#}), but the runtime \
+                     committed it; check `coop status {}`",
+                    inst.name
+                ))),
+                Err(inspect_err) => bail!(AppleError::OperationUncertain(format!(
+                    "growing sandbox {machine} reported failure ({e:#}) and its record could \
+                     not be read ({inspect_err:#}); check `coop status {}`",
+                    inst.name
+                ))),
+            }
+        }
         let after = rt.inspect(machine)?;
         if !after.record.committed(&operation) || after.record.disk_bytes != wanted {
             bail!(AppleError::OperationUncertain(format!(
@@ -1807,8 +1839,18 @@ impl VmBackend for AppleContainerBackend {
             rt.settings.create,
             MAX_JSON_OUTPUT,
         );
-        let out = rt.checked(&req)?;
-        let source = ImageManifest::load_lenient(cfg, &inst.image);
+        let out = match rt.checked(&req) {
+            Ok(out) => out,
+            Err(e) => {
+                // The runtime may have published the disk before failing;
+                // nothing refers to it, so do not leave it behind.
+                rt.delete_disk_best_effort(&disk);
+                return Err(e.context(format!(
+                    "committing '{}' failed; its disk was discarded and no image was saved",
+                    inst.name
+                )));
+            }
+        };
         let previous = ImageManifest::load_lenient(cfg, image);
         let saved = protocol::parse_disk(&out).and_then(|committed| {
             ImageManifest {
@@ -1824,7 +1866,6 @@ impl VmBackend for AppleContainerBackend {
                 base_image: image::BASE_IMAGE.into(),
                 platform: image::PLATFORM.into(),
                 guest_user: sidecar.guest_user.clone(),
-                pubkey_fingerprint: source.map(|m| m.pubkey_fingerprint).unwrap_or_default(),
                 created: crate::setup::utc_timestamp(),
             }
             .save(cfg, image)
@@ -1871,7 +1912,7 @@ impl VmBackend for AppleContainerBackend {
         }
         let operation = OperationId::generate()?;
         let journaled = JournalOp::RestoreDisk {
-            operation: Some(operation.clone()),
+            operation: operation.clone(),
             prior_generation: rec.record.disk_generation,
         };
         Journal::begin(inst, &owner, journaled.clone(), machine.clone())?;
@@ -1930,11 +1971,12 @@ impl VmBackend for AppleContainerBackend {
         let rec = self.runtime()?.inspect(&sidecar.machine_id)?;
         match rec.status {
             SandboxStatus::Running => Ok(true),
-            SandboxStatus::Stopped => Ok(false),
-            other => bail!(AppleError::OperationUncertain(format!(
+            // A crashed owner left no VM, and `start` accepts it.
+            SandboxStatus::Stopped | SandboxStatus::Crashed => Ok(false),
+            SandboxStatus::Booting => bail!(AppleError::OperationUncertain(format!(
                 "sandbox {} is {}",
                 sidecar.machine_id,
-                other.label()
+                rec.status.label()
             ))),
         }
     }
@@ -2050,15 +2092,14 @@ impl VmBackend for AppleContainerBackend {
                     std::fs::File::open(spool.path()).context("Failed to read log spool")?,
                 );
                 let mut stdout = std::io::stdout().lock();
-                for line in std::io::BufRead::split(reader, b'\n') {
-                    let line = line.context("Failed to read log spool")?;
+                cli::for_each_bounded_line(reader, cli::MAX_LOG_LINE, &mut |line| {
                     writeln!(
                         stdout,
                         "{}",
-                        cli::sanitize_for_display(&String::from_utf8_lossy(&line))
+                        cli::sanitize_for_display(&String::from_utf8_lossy(line))
                     )
-                    .context("Failed to write logs")?;
-                }
+                    .context("Failed to write logs")
+                })?;
             }
         }
         Ok(())
@@ -2321,11 +2362,7 @@ fn release_manifest(
     {
         rt.delete_disk_best_effort(&disk.name);
     }
-    if manifest
-        .image_ref
-        .starts_with(&format!("local/coop-{}:", owner.id.short()))
-        && !refs.contains(&manifest.image_ref)
-    {
+    if image::is_owned_ref(owner, &manifest.image_ref) && !refs.contains(&manifest.image_ref) {
         rt.delete_image_best_effort(&manifest.image_ref);
     }
 }
@@ -2345,10 +2382,12 @@ fn verify_image_in_sandbox(
     let (cpus, memory_mib) = (2u8, 2048u32);
     let expected = security::Expected {
         sandbox: &machine,
-        owner: owner.id.as_str(),
+        owner: &owner.id,
         runtime_root: &rt.root,
-        cpus: u32::from(cpus),
-        memory_bytes: mib_to_bytes(memory_mib),
+        resources: Resources {
+            cpus: u32::from(cpus),
+            memory_bytes: mib_to_bytes(memory_mib),
+        },
     };
     let result = (|| -> Result<()> {
         // The instance default disk size, so the unpacked base is cached for

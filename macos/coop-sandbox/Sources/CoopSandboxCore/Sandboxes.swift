@@ -49,10 +49,12 @@ public enum Sandboxes {
     }
 
     /// Whether some process holds the owner lock (an owner between launch
-    /// and writing live.json, or a wedged one).
+    /// and writing live.json, or a wedged one). Only a missing lock file
+    /// means no owner; a lock that cannot be probed counts as held, so a
+    /// sandbox is never taken for stopped on an error.
     static func ownerHoldsLock(_ paths: SandboxPaths) -> Bool {
         let fd = open(paths.lock.path, O_RDWR | O_CLOEXEC)
-        guard fd >= 0 else { return false }
+        guard fd >= 0 else { return errno != ENOENT }
         defer { close(fd) }
         if flock(fd, LOCK_EX | LOCK_NB) == 0 {
             flock(fd, LOCK_UN)
@@ -61,7 +63,22 @@ public enum Sandboxes {
         return true
     }
 
+    /// Why the owner lock cannot be probed, or nil when it can (or is
+    /// absent). Such a sandbox reads as held forever, so callers report this
+    /// cause instead of a status the lock never proved.
+    static func lockProbeFailure(_ paths: SandboxPaths) -> String? {
+        let fd = open(paths.lock.path, O_RDWR | O_CLOEXEC)
+        guard fd < 0 else {
+            close(fd)
+            return nil
+        }
+        let code = errno
+        guard code != ENOENT else { return nil }
+        return "cannot open its owner lock \(paths.lock.path): \(String(cString: strerror(code)))"
+    }
+
     public static func requireStopped(_ paths: SandboxPaths, _ id: SandboxID) throws {
+        if let why = lockProbeFailure(paths) { throw SandboxError("\(id) state is unknown: \(why)") }
         let s = status(paths)
         guard s == .stopped else { throw SandboxError("\(id) is \(s.rawValue); stop it first") }
     }
@@ -190,7 +207,7 @@ public enum Sandboxes {
                 label: paths.launchdLabel, executable: executable,
                 arguments: ["run", id.rawValue, "--root", root.root.path], log: paths.ownerLog)
             try Launchd.write(plist, to: paths.launchdPlist)
-            try? FileManager.default.removeItem(at: paths.ownerFailed)
+            try clearOwnerFailure(paths)
             try Launchd.bootstrap(plist: paths.launchdPlist, domain: domain)
         }
 
@@ -210,12 +227,26 @@ public enum Sandboxes {
         throw SandboxError("\(id) did not become ready within \(Int(wait))s; owner log:\n\(tail)")
     }
 
+    /// Remove the previous owner's failure marker, so `start` never reports
+    /// it as this start's error.
+    static func clearOwnerFailure(_ paths: SandboxPaths) throws {
+        guard unlink(paths.ownerFailed.path) == 0 || errno == ENOENT else {
+            throw SandboxError("remove \(paths.ownerFailed.path): errno \(errno)")
+        }
+    }
+
     /// Halt systemd cleanly, wait for the owner to exit, and unload its job.
     /// Idempotent: stopping a stopped sandbox succeeds. Not guarded: it
     /// changes no disk or record, and must work while an owner is starting.
     public static func stop(root: SandboxRoot, id: SandboxID, timeout: TimeInterval) async throws {
         let paths = root.sandbox(id)
         _ = try paths.loadRecord()
+        if let why = lockProbeFailure(paths) {
+            // An owner may still be running; unload its job before reporting
+            // that the stop cannot be confirmed.
+            Launchd.bootout(paths.launchdLabel)
+            throw SandboxError("\(id) stop cannot be confirmed: \(why)")
+        }
         if status(paths) == .running {
             _ = try? ControlSocket.call(paths.control, .init(op: .stop), timeout: timeout)
         }
@@ -329,15 +360,11 @@ public enum Sandboxes {
                 imageReference: record.imageReference, imageDigest: record.imageDigest, environment: record.environment,
                 diskBytes: record.diskBytes, committedFrom: id, createdAt: Date())
             return try await withDisk(root, name, .exclusive) {
+                try DiskCommit.settle(root, name)
                 if FileManager.default.fileExists(atPath: target.path), !replace {
                     throw SandboxError("disk \(name) exists")
                 }
-                // Disk first, then its metadata: a disk without metadata is
-                // unusable (and reconcile removes it), and the lock keeps
-                // clones from pairing it with the replaced disk's metadata.
-                try? FileManager.default.removeItem(at: metadataURL(root: root, name: name))
-                guard rename(tmp.path, target.path) == 0 else { throw SandboxError("rename: errno \(errno)") }
-                try JSONEncoder.pretty.encode(meta).write(to: metadataURL(root: root, name: name), options: .atomic)
+                try DiskCommit.publish(root, name, work: tmp, metadata: meta)
                 let (logical, allocated) = Disks.sizes(target)
                 return DiskSummary(name: name.rawValue, logicalBytes: logical, allocatedBytes: allocated)
             }
@@ -396,6 +423,7 @@ public enum Sandboxes {
         let lock = try OperationLock.shared(root)
         defer { withExtendedLifetime(lock) {} }
         try await withDisk(root, name, .exclusive) {
+            try DiskCommit.settle(root, name)
             try FileManager.default.removeItem(at: root.disk(name))
             try? FileManager.default.removeItem(at: metadataURL(root: root, name: name))
         }
@@ -405,8 +433,12 @@ public enum Sandboxes {
         root.disks.appendingPathComponent("\(name.rawValue).json")
     }
 
+    /// Caller holds `name`'s disk lock, shared or exclusive.
     static func loadDiskMetadata(root: SandboxRoot, name: SandboxID) throws -> DiskMetadata {
         guard FileManager.default.fileExists(atPath: root.disk(name).path) else { throw SandboxError("no disk named \(name)") }
+        if let pending = try DiskCommit.loadPending(root, name), try DiskCommit.isPublished(pending, root, name) {
+            return pending.metadata
+        }
         return try JSONDecoder.iso.decode(DiskMetadata.self, from: Data(contentsOf: metadataURL(root: root, name: name)))
     }
 
@@ -469,6 +501,25 @@ public enum Sandboxes {
             out.append(.init(id: "-", status: "busy", action: "sweep-skipped-operation-in-progress"))
             return out
         }
+        // Before the scratch sweep, which removes an unpublished commit's
+        // disk, and the orphan sweep, which would remove a published one.
+        var unresolvedCommits = Set<String>()
+        for name in (try? FileManager.default.contentsOfDirectory(atPath: root.disks.path).sorted()) ?? [] {
+            guard let disk = DiskCommit.diskName(pendingFile: name) else { continue }
+            do {
+                guard let lock = try FileLock.attempt(root.diskLock(disk), .exclusive) else {
+                    unresolvedCommits.insert(disk.rawValue)
+                    continue
+                }
+                defer { withExtendedLifetime(lock) {} }
+                if try DiskCommit.settle(root, disk) {
+                    out.append(.init(id: disk.rawValue, status: "committing", action: "settled-disk-commit"))
+                }
+            } catch {
+                unresolvedCommits.insert(disk.rawValue)
+                out.append(.init(id: disk.rawValue, status: "committing", action: "unresolved-disk-commit: \(error)"))
+            }
+        }
         let names = (try? FileManager.default.contentsOfDirectory(atPath: root.sandboxes.path)) ?? []
         for name in names.sorted() {
             let dir = root.sandboxes.appendingPathComponent(name)
@@ -502,6 +553,7 @@ public enum Sandboxes {
         for name in (try? FileManager.default.contentsOfDirectory(atPath: root.disks.path)) ?? []
         where name.hasSuffix(".ext4") && !name.hasPrefix(".") {
             let disk = root.disks.appendingPathComponent(name)
+            if unresolvedCommits.contains(String(name.dropLast(5))) { continue }
             if !FileManager.default.fileExists(atPath: disk.deletingPathExtension().appendingPathExtension("json").path) {
                 try? FileManager.default.removeItem(at: disk)
                 out.append(.init(id: name, status: "incomplete", action: "removed-uncommitted-disk"))

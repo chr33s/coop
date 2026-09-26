@@ -118,8 +118,14 @@ injection and same-sandbox locking); none of them boots a VM:
 ```bash
 cargo clippy --all-targets --features apple-container -- -D warnings
 cargo test --features apple-container
-swift test --package-path macos/coop-sandbox
+swift test --package-path macos/coop-sandbox --no-parallel
 ```
+
+The Swift tests run serially: several take, release, and re-probe `flock`
+locks, and in a parallel run about one in five runs sees a released lock as
+still held. Serial runs have not shown it. The cause is not yet identified
+(subprocesses started by other tests are the main suspect; switching them to
+`posix_spawn` did not remove it).
 
 Parser fixtures in `tests/fixtures/coop-sandbox/` are real `coop-sandbox`
 output; the directory's README says how they were captured.
@@ -139,10 +145,15 @@ what unit tests cannot:
   commit/restore (including a guest that disables its own `rm`), crash
   recovery with launchd respawn, and concurrent sandboxes;
 - the maintenance image (install, and survival after its store image is
-  deleted) and same-sandbox races (concurrent grows, start against grow).
+  deleted) and same-sandbox races (concurrent grows, start against grow);
+- `coop` itself end to end (the `coop` phase): `setup`, `up`, `status`,
+  `exec`, `stop`/`start`, `resize --mem/--vcpus/--size`, rollback of a
+  `resize --start` whose boot fails, `commit`, `restore` with host-key
+  re-pinning, `destroy`, and image deletion.
 
-It builds the runtime and a small test image (`tests/fixtures/apple-sandbox/`)
-and touches only its own temporary state root and image tag:
+It builds the runtime, a small test image (`tests/fixtures/apple-sandbox/`),
+and an `apple-container` build of coop, all under a temporary work directory,
+and removes its state root, sandboxes, and images on exit:
 
 ```bash
 ./tests/integration-apple-sandbox.sh                   # ~10 min

@@ -2072,7 +2072,8 @@ fn check_local_marketplaces(field: &str, entries: &[String], errors: &mut Vec<St
 }
 
 impl CoopConfig {
-    /// Default config path: `~/.coop/config.toml`.
+    /// Default config path: `~/.coop/config.toml` (`~/.coop-apple/config.toml`
+    /// in the `apple-container` build).
     pub fn default_path() -> PathBuf {
         default_data_dir().join("config.toml")
     }

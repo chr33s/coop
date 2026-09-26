@@ -8,6 +8,7 @@
 #[cfg(all(target_os = "macos", feature = "apple-container"))]
 mod apple_container;
 mod backend;
+mod base64;
 mod cmd;
 mod commands;
 mod completions;
@@ -608,7 +609,9 @@ enum Commands {
     /// Replace an instance's filesystem with an image's, in place
     ///
     /// Keeps the name, index, IP and workspace association; only the disk
-    /// changes.
+    /// changes. On the Apple sandbox backend the next start pins a new host
+    /// key, and the address can change if the sandbox's subnet was
+    /// quarantined.
     ///
     /// Needs a stopped instance, and leaves it stopped: the `coop commit` loop.
     ///
@@ -668,7 +671,7 @@ enum Commands {
         #[arg(long)]
         probe: bool,
     },
-    /// Generate a starter config file at ~/.coop/config.toml
+    /// Generate a starter config file at ~/.coop/config.toml (~/.coop-apple/config.toml in the apple-container build)
     Init,
     /// Replace the running coop binary with the latest GitHub release
     Update {

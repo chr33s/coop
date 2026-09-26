@@ -111,7 +111,7 @@ jobs:
       - name: coop-sandbox build and unit tests
         run: |
           swift --version
-          swift test --package-path macos/coop-sandbox --force-resolved-versions
+          swift test --package-path macos/coop-sandbox --force-resolved-versions --no-parallel
 
   deny:
     runs-on: ubuntu-latest

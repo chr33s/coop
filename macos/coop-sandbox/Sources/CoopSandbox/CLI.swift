@@ -14,6 +14,13 @@ struct CoopSandbox: AsyncParsableCommand {
             Logs.self, Delete.self, Reconcile.self,
         ]
     )
+
+    /// Everything this binary writes (records, disks, logs, the owner it
+    /// runs under launchd) is for this user alone.
+    static func main() async {
+        umask(0o077)
+        await Self.main(nil)
+    }
 }
 
 struct RootOptions: ParsableArguments {
@@ -41,7 +48,7 @@ struct Version: ParsableCommand {
 
 struct Init: AsyncParsableCommand {
     static let configuration = CommandConfiguration(abstract: "Create the state root: pinned kernel and init filesystem.")
-    static let initImage = "ghcr.io/apple/containerization/vminit:0.45.0"
+    static let initImage = "\(Disks.initImagePrefix):\(containerizationVersion)"
     static let initImageDigest = "sha256:aa6ab59d0938f7fadb54ac27e80959bdd2f1dafa8050011086d5f8ab1350fd6c"
 
     @OptionGroup var root: RootOptions

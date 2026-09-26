@@ -6,7 +6,7 @@ coop creates isolated VM environments for running Claude Code and Codex. It runs
 
 | Flag | Description |
 |------|-------------|
-| `--config <path>` | Path to config file (default: `~/.coop/config.toml`) |
+| `--config <path>` | Path to config file (default: `~/.coop/config.toml`, or `~/.coop-apple/config.toml` in the `apple-container` build) |
 | `-v`, `--verbose` | Increase log verbosity. Once for debug, twice for trace. |
 | `--version` | Print version and exit. |
 
@@ -144,7 +144,7 @@ mounting (or bails in a non-TTY); pass `--no-workspace` to skip the mount.
 
 ### `init`
 
-Generate a starter config file at `~/.coop/config.toml`.
+Generate a starter config file at `~/.coop/config.toml` (`~/.coop-apple/config.toml` in the `apple-container` build).
 
 ```
 coop init
@@ -449,7 +449,8 @@ coop status my-project
 
 With `--json`, a bare `coop status` emits a JSON array and `coop status NAME`
 emits a single object. Each carries the common fields — `name`, `state`
-(`running`/`stopped`), `image`, `backend` (`firecracker`/`lima`), and `usage`
+(`running`/`stopped`, or `unknown` in the bare-`status` array), `image`, `backend`
+(`firecracker`/`lima`/`apple-container`), and `usage`
 (raw MiB / load, or `null` when stopped or the query fails). The rich
 single-instance text report (guest IP, PID, SSH port, …) is text-only. JSON goes
 to stdout; tracing stays on stderr, so `coop status --json | jq` stays clean.
@@ -788,6 +789,8 @@ coop up . --image my-project-baseline --name fork
 ### `restore`
 
 Roll a stopped instance back to an image's filesystem in place. The instance keeps its name, index, IP, and workspace association — only the disk is replaced and its recorded image is updated. Run `coop start` afterwards to bring it back up.
+
+On the Apple sandbox backend, the restored disk has no SSH host keys, so the next `coop start` pins the key the guest generates. The address is not guaranteed either: a sandbox moves to a new subnet when its old one has been quarantined (see [backends.md](backends.md#stop-destroy-recovery)).
 
 This pairs with `commit` for a known-good checkpoint before a risky run:
 

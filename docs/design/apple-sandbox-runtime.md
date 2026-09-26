@@ -14,10 +14,10 @@
   PID 1, one network per container, and no host integration, they pass every
   isolation check. But no public surface sizes, grows, or resizes a container,
   or checkpoints one.
-- **The direct runtime closed every gap in under 1 kLOC of Swift.** That
-  covers explicit disk sizes, offline growth, CPU/memory changes, commit and
-  restore, and deterministic crash reconciliation. It forks nothing and uses
-  only public API.
+- **The direct runtime closes every gap in about 2.5k lines of Swift**
+  (`Sources/`). That covers explicit disk sizes, offline growth, CPU/memory
+  changes, commit and restore, and deterministic crash reconciliation. It
+  forks nothing and uses only public API.
 - **One accepted residual applies to every backend.** A root guest can reach
   host services listening on all interfaces through its NAT gateway.
 
@@ -97,6 +97,9 @@ Approved 2026-09-26:
   [`trust-model.md`](../trust-model.md).
 - The `vendor/container` fork, its build script, and its contract test are
   removed; `destroy` still clears instances the fork created.
-- The x86_64 Firecracker integration run is waived for this change: the
-  host was unavailable, and outside the `apple-container` build the change
-  adds only two optional `[apple_container]` config fields.
+- The x86_64 Firecracker integration run is waived for this change because
+  the host was unavailable. The change is not confined to the
+  `apple-container` build: it also modifies shared lifecycle, SSH, and proxy
+  code (`coop stop`, `list`/`status` probe errors, ssh/rsync quoting and
+  `HostKeyPolicy`, capability gates, proxy tunnels, the Lima disk resize), so
+  the waiver accepts that those paths are unverified on Firecracker.

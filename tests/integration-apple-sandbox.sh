@@ -11,12 +11,15 @@ set -uo pipefail
 #
 # Usage: tests/integration-apple-sandbox.sh [--only PHASE[,PHASE...]] [--keep]
 #   Phases: setup disks machine isolation exposure identity persistence
-#           resources growth snapshots recovery concurrency
+#           resources growth snapshots recovery concurrency coop
 #   CYCLES=5 stop/start cycles; CONCURRENT=4 sandboxes.
 #
 # Needs Apple Silicon, macOS 26+, Swift 6.2+, jq, and stock Apple `container`
 # with its service running (builds the test image, supplies the kernel). It
 # touches nothing but its own state root and image tag, both removed on exit.
+# The coop phase also builds `coop --features apple-container` (into the work
+# directory) and drives it end to end against a data directory there; the
+# images `coop setup` builds in the stock `container` store are deleted too.
 
 if [[ "$(uname -s)" != Darwin || "$(uname -m)" != arm64 ]]; then
     echo "SKIP: coop-sandbox needs an Apple Silicon Mac"
@@ -27,7 +30,7 @@ for candidate in /usr/local/bin/container /opt/homebrew/bin/container; do
     [[ -x "$candidate" ]] && { CONTAINER="$candidate"; break; }
 done
 [[ -n "$CONTAINER" ]] || { echo "SKIP: no Apple container CLI installed"; exit 0; }
-for tool in swift jq ssh ssh-keygen nc openssl; do
+for tool in swift cargo jq ssh ssh-keygen nc openssl; do
     command -v "$tool" >/dev/null || { echo "Missing prerequisite: $tool" >&2; exit 1; }
 done
 
@@ -145,6 +148,7 @@ cleanup() {
             done
         fi
         "$CONTAINER" image delete "$IMAGE" "$MAINTENANCE" >/dev/null 2>&1
+        coop_cleanup
         rm -rf "$WORK"
     else
         echo "Kept $WORK"
@@ -152,6 +156,39 @@ cleanup() {
     exit "$rc"
 }
 trap cleanup EXIT
+
+# ── coop end to end ──────────────────────────────────────────
+
+COOP="$WORK/target/debug/coop"
+CDATA="$WORK/coop-data"
+CSTATE="$CDATA/backends/apple-container-v1"
+CROOT="$CSTATE/runtime"
+CCFG="$WORK/coop.toml"
+# Same config with a short boot deadline, for a restart whose guest never
+# starts sshd.
+CCFG_FAIL="$WORK/coop-fail.toml"
+
+coop() { "$COOP" --config "$CCFG" "$@" </dev/null; }
+csbx() { "$SANDBOX" "$1" --root "$CROOT" "${@:2}"; }
+machine_id() { jq -r .machine_id "$CSTATE/instances/$1/apple-machine.json"; }
+record() { csbx inspect "$(machine_id "$1")" | jq -r ".record.$2"; }
+cstate() { coop status "$1" --json | jq -r .state; }
+
+coop_cleanup() {
+    [[ -d "$CROOT" && -x "$SANDBOX" ]] || return 0
+    local id owner short
+    for id in $(csbx list 2>/dev/null | jq -r '.[].id' 2>/dev/null); do
+        owner="$(csbx inspect "$id" 2>/dev/null | jq -r .record.owner)"
+        csbx stop "$id" >/dev/null 2>&1
+        csbx delete "$id" --owner "$owner" >/dev/null 2>&1
+    done
+    short="$(jq -r '.owner_id // empty' "$CSTATE/owner.json" 2>/dev/null | cut -c1-8)"
+    [[ -n "$short" ]] || return 0
+    local images
+    images="$("$CONTAINER" image list --quiet 2>/dev/null | grep "^local/coop-$short")"
+    # shellcheck disable=SC2086 # one image reference per word.
+    [[ -z "$images" ]] || "$CONTAINER" image delete $images >/dev/null 2>&1
+}
 
 # ── Pinned SSH (never the host agent or ~/.ssh) ─────────────
 
@@ -206,7 +243,7 @@ rm -f "$WORK/image.tar"
 # A maintenance image equivalent to the one coop builds
 # (image.rs maintenance_dockerfile): Ubuntu with e2fsprogs.
 mkdir -p "$WORK/maintenance"
-printf '%s\n' 'FROM docker.io/library/ubuntu:24.04' \
+printf '%s\n' 'FROM docker.io/library/ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3' \
     'RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends e2fsprogs && rm -rf /var/lib/apt/lists/*' \
     >"$WORK/maintenance/Dockerfile"
 if "$CONTAINER" build --platform linux/arm64 -t "$MAINTENANCE" "$WORK/maintenance" >"$WORK/maintenance.log" 2>&1 &&
@@ -563,6 +600,83 @@ if want concurrency; then
     done
     check "none reaches another" test "$leaks" = 0
     for n in "${names[@]}"; do sbx stop "$n"; sbx delete "$n" --owner "$RUN"; done
+fi
+
+if want coop; then
+    echo ""
+    echo "=== Phase: coop ==="
+    # Free the host for coop's own sandbox.
+    sbx stop "$A" >/dev/null 2>&1
+    sbx stop "$B" >/dev/null 2>&1
+    kernel="$(readlink -f "$HOME/Library/Application Support/com.apple.container/kernels/default.kernel-arm64")"
+    write_cfg() {
+        printf '%s\n' "data_dir = \"$CDATA\"" 'github = "off"' '' '[vm]' 'vcpu_count = 2' \
+            'mem_size_mib = 2048' 'template_size_gib = 8' '' '[apple_container]' \
+            "binary = \"$SANDBOX\"" "builder = \"$CONTAINER\"" "kernel = \"$kernel\"" "$@"
+    }
+    write_cfg >"$CCFG"
+    write_cfg 'boot_timeout_seconds = 15' >"$CCFG_FAIL"
+    mkdir -p "$WORK/project"
+    echo "$RUN" >"$WORK/project/marker"
+    if cargo build --quiet --features apple-container --target-dir "$WORK/target" >"$WORK/coop-build.log" 2>&1 &&
+        coop setup -y >"$WORK/coop-setup.log" 2>&1; then
+        pass "coop setup builds, verifies, and publishes the image"
+    else
+        fail "coop setup builds, verifies, and publishes the image" "see $WORK/coop-build.log, $WORK/coop-setup.log"
+        summary
+    fi
+    if coop up "$WORK/project" --name e2e --no-agents --no-github >"$WORK/coop-up.log" 2>&1; then
+        pass "coop up creates and boots an instance"
+    else
+        fail "coop up creates and boots an instance" "see $WORK/coop-up.log"
+        summary
+    fi
+    check "status reports running on the apple-container backend" \
+        test "$(coop status e2e --json | jq -r '"\(.state) \(.backend)"')" = "running apple-container"
+    check "the workspace is copied in" test "$(coop exec e2e -- cat /workspace/marker)" = "$RUN"
+    coop exec e2e -- sh -c 'echo before > ~/snap-before' >/dev/null
+    check "coop stop stops the sandbox" coop stop e2e
+    check "status reports stopped" test "$(cstate e2e)" = stopped
+    check "coop start boots it again" coop start e2e --no-agents --no-github
+    check "guest data survives stop/start" test "$(coop exec e2e -- sh -c 'cat ~/snap-before' 2>/dev/null)" = before
+
+    # sshd will not start on the next boot, so a restart after a resize fails.
+    coop exec e2e -- sudo systemctl mask ssh.service ssh.socket >/dev/null 2>&1
+    coop stop e2e >/dev/null 2>&1
+    check "resize --mem/--vcpus records the change" coop resize e2e --mem 3072 --vcpus 3
+    check "the runtime record holds the new memory" test "$(record e2e memoryBytes)" = $((3072 * 1024 * 1024))
+    check "a failed resize --start is refused" \
+        refuses "$COOP" --config "$CCFG_FAIL" resize e2e --mem 4096 --start
+    check "the failed restart leaves the sandbox stopped" test "$(csbx inspect "$(machine_id e2e)" | jq -r .status)" = stopped
+    check "the failed restart rolls the memory back" test "$(record e2e memoryBytes)" = $((3072 * 1024 * 1024))
+    check "no journal is left behind" test ! -e "$CSTATE/instances/e2e/operation.json"
+    # Repair sshd over the runtime's own channel, which needs no SSH.
+    mid="$(machine_id e2e)"
+    csbx start "$mid" >/dev/null
+    for _ in $(seq 100); do csbx exec "$mid" -- true >/dev/null 2>&1 && break; sleep 0.2; done
+    csbx exec "$mid" -- systemctl unmask ssh.service ssh.socket >/dev/null 2>&1
+    csbx stop "$mid" >/dev/null
+    check "resize --size grows the disk" coop resize e2e --size 12
+    check "start after the resizes succeeds" coop start e2e --no-agents --no-github
+    check "the guest sees the new vCPU count (+1 runtime vCPU)" test "$(coop exec e2e -- nproc)" = 4
+    size="$(coop exec e2e -- df -B1 --output=size / | tail -1 | xargs)"
+    check "the guest sees the grown disk" test "${size:-0}" -ge $((12 * 1024 * 1024 * 1024 * 95 / 100))
+
+    coop stop e2e >/dev/null 2>&1
+    check "coop commit saves an image" coop commit e2e --image e2e-snap
+    coop start e2e --no-agents --no-github >/dev/null 2>&1
+    coop exec e2e -- sh -c 'echo after > ~/snap-after' >/dev/null
+    coop stop e2e >/dev/null 2>&1
+    check "coop restore replaces the disk" coop restore e2e --image e2e-snap
+    check "start after restore re-pins the new host key" coop start e2e --no-agents --no-github
+    check "restore keeps data from before the commit" test "$(coop exec e2e -- sh -c 'cat ~/snap-before' 2>/dev/null)" = before
+    check "restore drops data written after the commit" \
+        test "$(coop exec e2e -- sh -c 'test -e ~/snap-after && echo present || echo absent')" = absent
+
+    check "coop destroy removes the instance" coop destroy e2e
+    check "the runtime has no sandbox left" test "$(csbx list | jq length)" = 0
+    check "the instance state is gone" test ! -e "$CSTATE/instances/e2e"
+    check "the committed image can be deleted" coop images --delete e2e-snap
 fi
 
 summary

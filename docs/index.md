@@ -5,7 +5,7 @@ short navigational entrypoint; durable detail lives here.
 
 ## For contributors (engineering)
 
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) — module map, the two-backend design,
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — module map, the backend design,
   host→guest data flow, architectural invariants.
 - [`trust-model.md`](trust-model.md) — trust boundaries, taint sources, secret
   handling, `coop update` verification. The authoritative security spec the

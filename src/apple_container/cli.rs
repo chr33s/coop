@@ -8,7 +8,7 @@
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::Read as _;
+use std::io::{BufRead, Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -23,6 +23,11 @@ pub(crate) const MAX_JSON_OUTPUT: usize = 1024 * 1024;
 pub(crate) const MAX_PUBKEY_OUTPUT: usize = 16 * 1024;
 /// Largest help/version text accepted during qualification.
 pub(crate) const MAX_TEXT_OUTPUT: usize = 256 * 1024;
+/// Longest guest console log line passed on; the rest of a longer line is
+/// dropped, so a guest cannot make the host buffer an unbounded line.
+pub(crate) const MAX_LOG_LINE: usize = 64 * 1024;
+/// Appended to a line cut at [`MAX_LOG_LINE`].
+const TRUNCATED_MARKER: &[u8] = b" [line truncated]";
 
 /// The only variables a runtime child inherits. `HOME`, `USER`, `LOGNAME`
 /// and `TMPDIR` let the CLI find its per-user launchd service and state;
@@ -109,19 +114,49 @@ impl Output {
     }
 }
 
-/// Replace control characters (other than newline/tab) so text echoed from
-/// the runtime or guest cannot drive the operator's terminal.
+/// Replace control characters (other than newline/tab) and invisible
+/// format characters so text echoed from the runtime or guest can neither
+/// drive the operator's terminal nor reorder or hide what it shows.
 pub(crate) fn sanitize_for_display(text: &str) -> String {
     text.trim()
         .chars()
         .map(|c| {
-            if c.is_control() && c != '\n' && c != '\t' {
+            if (c.is_control() && c != '\n' && c != '\t') || is_format_char(c) {
                 '?'
             } else {
                 c
             }
         })
         .collect()
+}
+
+/// Unicode `General_Category=Cf` (format) characters: bidi overrides and
+/// isolates, zero-width characters, the BOM, tag characters, and the like.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
 }
 
 /// Runs runtime commands. Object-safe so the backend can hold `Box<dyn Exec>`
@@ -248,7 +283,7 @@ impl Exec for RealExec {
         args: &[String],
         on_line: &mut dyn FnMut(&[u8]) -> Result<()>,
     ) -> Result<Output> {
-        use std::io::{BufRead as _, Write as _};
+        use std::io::Write as _;
         let mut cmd = self.command(args);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = cmd
@@ -257,30 +292,20 @@ impl Exec for RealExec {
         let stdout = child.stdout.take().context("runtime stdout unavailable")?;
         let stderr = child.stderr.take().context("runtime stderr unavailable")?;
         let err_forwarder = std::thread::spawn(move || {
-            for line in std::io::BufReader::new(stderr)
-                .split(b'\n')
-                .map_while(Result::ok)
-            {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "{}",
-                    sanitize_for_display(&String::from_utf8_lossy(&line))
-                );
-            }
+            let _ =
+                for_each_bounded_line(std::io::BufReader::new(stderr), MAX_LOG_LINE, &mut |line| {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "{}",
+                        sanitize_for_display(&String::from_utf8_lossy(line))
+                    );
+                    Ok(())
+                });
         });
-        let mut streamed = Ok(());
-        for line in std::io::BufReader::new(stdout).split(b'\n') {
-            match line
-                .context("Failed to read runtime output")
-                .and_then(|l| on_line(&l))
-            {
-                Ok(()) => {}
-                Err(e) => {
-                    let _ = child.kill();
-                    streamed = Err(e);
-                    break;
-                }
-            }
+        let streamed =
+            for_each_bounded_line(std::io::BufReader::new(stdout), MAX_LOG_LINE, on_line);
+        if streamed.is_err() {
+            let _ = child.kill();
         }
         let status = child.wait().context("Failed to wait for runtime command")?;
         let _ = err_forwarder.join();
@@ -352,17 +377,71 @@ fn join_reader(handle: ReaderHandle) -> Result<(Vec<u8>, bool)> {
     }
 }
 
+/// Pass each `\n`-terminated line of `reader` (without the newline) to
+/// `on_line`, holding at most `max` bytes of any one line: the rest of a
+/// longer line is dropped and [`TRUNCATED_MARKER`] appended. A final line
+/// without a newline is passed too. Stops at the first error.
+pub(crate) fn for_each_bounded_line(
+    mut reader: impl BufRead,
+    max: usize,
+    on_line: &mut dyn FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    let mut line = Vec::new();
+    let mut truncated = false;
+    let mut emit = |line: &mut Vec<u8>, truncated: &mut bool| {
+        if std::mem::take(truncated) {
+            line.extend_from_slice(TRUNCATED_MARKER);
+        }
+        let result = on_line(line);
+        line.clear();
+        result
+    };
+    loop {
+        let buf = match reader.fill_buf() {
+            Ok(buf) => buf,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e).context("Failed to read runtime output"),
+        };
+        if buf.is_empty() {
+            if !line.is_empty() || truncated {
+                emit(&mut line, &mut truncated)?;
+            }
+            return Ok(());
+        }
+        let newline = buf.iter().position(|&b| b == b'\n');
+        let chunk = &buf[..newline.unwrap_or(buf.len())];
+        let room = max.saturating_sub(line.len());
+        truncated |= chunk.len() > room;
+        line.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        let used = newline.map_or(buf.len(), |i| i + 1);
+        reader.consume(used);
+        if newline.is_some() {
+            emit(&mut line, &mut truncated)?;
+        }
+    }
+}
+
 /// Read at most the last `max` bytes of a log file, for failure diagnostics.
+/// Only those bytes are read, however large the file has grown.
 pub(crate) fn log_tail(path: &Path, max: usize) -> String {
     let Ok(mut file) = File::open(path) else {
         return String::new();
     };
-    let mut content = Vec::new();
-    if file.read_to_end(&mut content).is_err() {
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return String::new();
+    };
+    let max = u64::try_from(max).unwrap_or(u64::MAX);
+    if file
+        .seek(std::io::SeekFrom::Start(len.saturating_sub(max)))
+        .is_err()
+    {
         return String::new();
     }
-    let start = content.len().saturating_sub(max);
-    sanitize_for_display(&String::from_utf8_lossy(&content[start..]))
+    let mut content = Vec::new();
+    if file.take(max).read_to_end(&mut content).is_err() {
+        return String::new();
+    }
+    sanitize_for_display(&String::from_utf8_lossy(&content))
 }
 
 #[cfg(test)]
@@ -475,6 +554,98 @@ mod tests {
     #[test]
     fn sanitize_strips_terminal_controls() {
         assert_eq!(sanitize_for_display("ok\x1b[2Jdone\n"), "ok?[2Jdone");
+    }
+
+    /// Bidi overrides/isolates, zero-width characters, and the BOM could
+    /// reorder or hide text on the operator's terminal.
+    #[test]
+    fn sanitize_replaces_unicode_format_characters() {
+        for c in [
+            '\u{202A}',
+            '\u{202B}',
+            '\u{202C}',
+            '\u{202D}',
+            '\u{202E}',
+            '\u{2066}',
+            '\u{2067}',
+            '\u{2068}',
+            '\u{2069}',
+            '\u{200B}',
+            '\u{200C}',
+            '\u{200D}',
+            '\u{200E}',
+            '\u{200F}',
+            '\u{FEFF}',
+            '\u{E0041}',
+            '\u{00AD}',
+        ] {
+            assert_eq!(
+                sanitize_for_display(&format!("a{c}b")),
+                "a?b",
+                "U+{:04X}",
+                u32::from(c)
+            );
+        }
+        // Ordinary non-ASCII text, newlines, and tabs are kept.
+        assert_eq!(sanitize_for_display("é\tü\nπ"), "é\tü\nπ");
+        assert!(!is_format_char('\u{2029}') && !is_format_char('\u{2010}'));
+    }
+
+    fn bounded_lines(input: &[u8], max: usize) -> Vec<Vec<u8>> {
+        let mut lines = Vec::new();
+        // A tiny buffer exercises lines that span several reads.
+        let reader = std::io::BufReader::with_capacity(3, input);
+        for_each_bounded_line(reader, max, &mut |l| {
+            lines.push(l.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        lines
+    }
+
+    #[test]
+    fn bounded_lines_truncate_long_lines_and_keep_the_rest() {
+        let long = [b'x'; 20];
+        let mut input = b"ab\n".to_vec();
+        input.extend_from_slice(&long);
+        input.extend_from_slice(b"\nexact\n\ntail");
+        let mut cut = b"xxxxx".to_vec();
+        cut.extend_from_slice(TRUNCATED_MARKER);
+        assert_eq!(
+            bounded_lines(&input, 5),
+            [
+                b"ab".to_vec(),
+                cut,
+                b"exact".to_vec(),
+                Vec::new(),
+                b"tail".to_vec()
+            ]
+        );
+        assert!(bounded_lines(b"", 5).is_empty());
+    }
+
+    #[test]
+    fn bounded_lines_stop_at_the_first_callback_error() {
+        let mut seen = 0;
+        let err = for_each_bounded_line(&b"a\nb\nc\n"[..], 8, &mut |_| {
+            seen += 1;
+            bail!("stop")
+        })
+        .unwrap_err();
+        assert_eq!(format!("{err}"), "stop");
+        assert_eq!(seen, 1);
+    }
+
+    #[test]
+    fn log_tail_reads_only_the_last_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("build.log");
+        let mut content = "a".repeat(10_000);
+        content.push_str("\x1b[2Jend");
+        std::fs::write(&log, &content).unwrap();
+        assert_eq!(log_tail(&log, 8), "a?[2Jend");
+        assert_eq!(log_tail(&log, 1 << 20).len(), content.len());
+        assert_eq!(log_tail(&tmp.path().join("missing"), 8), "");
     }
 
     #[test]

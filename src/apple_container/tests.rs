@@ -137,7 +137,6 @@ fn write_sidecar(inst: &Instance, owner: &Owner) -> MachineSidecar {
         schema_version: state::SCHEMA_VERSION,
         backend: state::BACKEND_TAG.into(),
         owner_id: owner.id.clone(),
-        instance_id: "00112233445566ff".into(),
         machine_id: sandbox_name(owner),
         image_ref: "local/coop-exp:fx".into(),
         image_digest: "sha256:3c8ada4041838a362f1d3c0805e487beff8ef85383044efeb07844cdd7c1e0b3"
@@ -277,11 +276,11 @@ fn recovery_hint_names_the_command_for_each_operation() {
         memory_bytes: 1,
     };
     let set = JournalOp::SetResources {
-        operation: None,
+        operation: op("coop-a"),
         prior: resources,
     };
     let restore = JournalOp::RestoreDisk {
-        operation: None,
+        operation: op("coop-r"),
         prior_generation: 0,
     };
     assert!(set.recovery_hint(&name).contains("`coop start vm1`"));
@@ -306,6 +305,7 @@ fn recovery_hint_names_the_command_for_each_operation() {
 
 /// Listings report `unknown` (an error here) instead of `stopped` when
 /// the state cannot be read, is transitional, or an operation is unfinished.
+/// A crashed sandbox is definitively not running.
 #[test]
 fn probe_running_distinguishes_unknown_from_stopped() {
     let tmp = tempfile::tempdir().unwrap();
@@ -318,7 +318,8 @@ fn probe_running_distinguishes_unknown_from_stopped() {
         ("running", Some(true)),
         ("stopped", Some(false)),
         ("booting", None),
-        ("crashed", None),
+        // Not running, and `start` accepts it.
+        ("crashed", Some(false)),
     ] {
         let json = inspect_json(&cfg, &owner, status);
         let (be, _) = backend(
@@ -403,6 +404,34 @@ fn destroy_refuses_unowned_sandbox() {
     );
     let err = be.destroy_instance(&cfg, &inst).unwrap_err();
     assert!(matches!(kind(&err), AppleError::IdentityConflict(_)));
+    assert!(mutations(&calls).is_empty());
+    assert!(inst.dir.exists(), "metadata must survive a refused destroy");
+}
+
+/// The machine name's owner prefix is necessary but not sufficient: a
+/// record for another installation whose id shares the 8-character prefix
+/// is refused on the full owner id.
+#[test]
+fn destroy_checks_the_full_owner_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_cfg(tmp.path());
+    let owner = Owner::load_or_init(&cfg).unwrap();
+    let inst = test_inst(&cfg);
+    let mut sidecar = write_sidecar(&inst, &owner);
+    let twin = format!("{}{}", owner.id.short(), "f".repeat(24));
+    assert_ne!(twin, owner.id.as_str());
+    sidecar.owner_id = state::OwnerId::try_from(twin).unwrap();
+    assert!(sidecar.machine_id.belongs_to(&owner.id));
+    sidecar.save(&inst).unwrap();
+    let (be, calls) = backend(
+        &cfg,
+        Box::new(|args| version(args, true).unwrap_or_else(|| ok("[]"))),
+    );
+    let err = be.destroy_instance(&cfg, &inst).unwrap_err();
+    assert!(
+        matches!(kind(&err), AppleError::IdentityConflict(_)),
+        "{err:#}"
+    );
     assert!(mutations(&calls).is_empty());
     assert!(inst.dir.exists(), "metadata must survive a refused destroy");
 }
@@ -673,6 +702,54 @@ fn check_binary_accepts_only_private_executables() {
     assert!(check_binary(Path::new("/bin/sh")).is_ok());
 }
 
+/// A private binary inside a directory someone else can write is refused,
+/// unless the directory is sticky.
+#[test]
+fn check_binary_refuses_a_writable_ancestor() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().join("shared");
+    let dir = parent.join("bin");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("tool");
+    std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let set = |mode| std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(mode));
+
+    set(0o777).unwrap();
+    let err = check_binary(&bin).unwrap_err();
+    assert!(format!("{err:#}").contains("world-writable"), "{err:#}");
+    set(0o1777).unwrap();
+    assert!(check_binary(&bin).is_ok());
+    set(0o755).unwrap();
+    assert!(check_binary(&bin).is_ok());
+}
+
+#[test]
+fn untrusted_dir_rules() {
+    let me = 501;
+    let staff = 20;
+    for (mode, owner, group, want) in [
+        (0o755, 0, 0, None),
+        (0o755, me, staff, None),
+        (0o755, 502, staff, Some("is owned by another user")),
+        (0o1777, 502, 0, Some("is owned by another user")),
+        (0o777, 0, 0, Some("is world-writable")),
+        (0o1777, 0, 0, None),
+        (0o775, me, staff, Some("is group-writable")),
+        (0o1775, me, staff, None),
+        // Homebrew: user-owned, `admin`-group-writable.
+        (0o775, me, 80, None),
+        (0o775, 0, 0, None),
+    ] {
+        assert_eq!(
+            untrusted_dir(mode, owner, group, me),
+            want,
+            "{mode:o} {owner}:{group}"
+        );
+    }
+}
+
 #[test]
 fn missing_binary_names_the_tool_and_how_to_get_it() {
     for (tool, name, hint) in [
@@ -712,10 +789,9 @@ fn interrupted_resource_change_is_reconciled_from_runtime() {
     };
     // (journal op id, runtime's last operation, sidecar already written)
     for (journaled, committed, sidecar_written) in [
-        (Some("coop-a"), Some("coop-a"), false),
-        (Some("coop-a"), Some("coop-a"), true),
-        (Some("coop-a"), None, false),
-        (None, None, false),
+        ("coop-a", Some("coop-a"), false),
+        ("coop-a", Some("coop-a"), true),
+        ("coop-a", None, false),
     ] {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = test_cfg(tmp.path());
@@ -730,7 +806,7 @@ fn interrupted_resource_change_is_reconciled_from_runtime() {
             &inst,
             &owner,
             JournalOp::SetResources {
-                operation: journaled.map(op),
+                operation: op(journaled),
                 prior,
             },
             sandbox_name(&owner),
@@ -750,46 +826,51 @@ fn interrupted_resource_change_is_reconciled_from_runtime() {
         // Recovery is idempotent and never updates the runtime.
         AppleContainerBackend::recover_journal(rt, &cfg, &inst).unwrap();
         assert_eq!(MachineSidecar::load(&inst).unwrap().resources(), target);
-        assert!(mutations(&calls).is_empty(), "{journaled:?} {committed:?}");
+        assert!(mutations(&calls).is_empty(), "{journaled} {committed:?}");
     }
 
-    // A running sandbox is not reconciled.
-    let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_cfg(tmp.path());
-    let owner = Owner::load_or_init(&cfg).unwrap();
-    let inst = test_inst(&cfg);
-    write_sidecar(&inst, &owner);
-    Journal::begin(
-        &inst,
-        &owner,
-        JournalOp::SetResources {
-            operation: Some(op("coop-a")),
-            prior,
-        },
-        sandbox_name(&owner),
-    )
-    .unwrap();
-    let json = inspect_json(&cfg, &owner, "running");
-    let (be, _) = backend(
-        &cfg,
-        Box::new(move |args| version(args, true).unwrap_or_else(|| ok(&json))),
-    );
-    assert!(AppleContainerBackend::recover_journal(be.runtime().unwrap(), &cfg, &inst).is_err());
-    assert!(Journal::try_load(&inst).unwrap().is_some());
+    // A sandbox that is not confirmed stopped is not reconciled.
+    for status in ["running", "booting", "crashed"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(tmp.path());
+        let owner = Owner::load_or_init(&cfg).unwrap();
+        let inst = test_inst(&cfg);
+        write_sidecar(&inst, &owner);
+        Journal::begin(
+            &inst,
+            &owner,
+            JournalOp::SetResources {
+                operation: op("coop-a"),
+                prior,
+            },
+            sandbox_name(&owner),
+        )
+        .unwrap();
+        let json = inspect_json(&cfg, &owner, status);
+        let (be, calls) = backend(
+            &cfg,
+            Box::new(move |args| version(args, true).unwrap_or_else(|| ok(&json))),
+        );
+        let err =
+            AppleContainerBackend::recover_journal(be.runtime().unwrap(), &cfg, &inst).unwrap_err();
+        assert!(
+            matches!(kind(&err), AppleError::OperationUncertain(_)),
+            "{status}: {err:#}"
+        );
+        assert!(Journal::try_load(&inst).unwrap().is_some(), "{status}");
+        assert!(mutations(&calls).is_empty(), "{status}");
+    }
 }
 
 /// Only coop's own restore, correlated by its operation id, lets the
-/// next start pin a new host key; a higher generation alone does not
-/// (except for a journal written before operation ids).
+/// next start pin a new host key; a higher generation alone does not.
 #[test]
 fn interrupted_restore_reenrolls_only_for_coops_own_replacement() {
     for (journaled, generation, committed, reenroll) in [
-        (None, 3, None, false),
-        (None, 4, None, true),
-        (Some("coop-r"), 4, Some("coop-r"), true),
-        (Some("coop-r"), 4, Some("coop-other"), false),
-        (Some("coop-r"), 4, None, false),
-        (Some("coop-r"), 3, Some("coop-r"), false),
+        ("coop-r", 4, Some("coop-r"), true),
+        ("coop-r", 4, Some("coop-other"), false),
+        ("coop-r", 4, None, false),
+        ("coop-r", 3, Some("coop-r"), false),
     ] {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = test_cfg(tmp.path());
@@ -800,7 +881,7 @@ fn interrupted_restore_reenrolls_only_for_coops_own_replacement() {
             &inst,
             &owner,
             JournalOp::RestoreDisk {
-                operation: journaled.map(op),
+                operation: op(journaled),
                 prior_generation: 3,
             },
             sandbox_name(&owner),
@@ -818,7 +899,7 @@ fn interrupted_restore_reenrolls_only_for_coops_own_replacement() {
         let after = MachineSidecar::load(&inst).unwrap();
         assert_eq!(
             after.reenroll_host_key, reenroll,
-            "{journaled:?} {generation} {committed:?}"
+            "{journaled} {generation} {committed:?}"
         );
         // The restored image identity is taken only with the restore.
         let want = if reenroll {
@@ -848,7 +929,6 @@ fn restore_journals_the_generation_and_marks_reenrollment() {
         base_image: image::BASE_IMAGE.into(),
         platform: image::PLATFORM.into(),
         guest_user: crate::guest::GuestUser::default(),
-        pubkey_fingerprint: String::new(),
         created: "now".into(),
     }
     .save(&cfg, &image)
@@ -1109,6 +1189,116 @@ fn stop_unproven_stops_without_qualification_or_ssh() {
     assert_eq!(mutations(&calls), ["stop"]);
 }
 
+/// Stopping without proof still requires ownership of the record.
+#[test]
+fn stop_unproven_refuses_a_foreign_record() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_cfg(tmp.path());
+    let owner = Owner::load_or_init(&cfg).unwrap();
+    let inst = test_inst(&cfg);
+    let mut sidecar = write_sidecar(&inst, &owner);
+    sidecar.owner_id =
+        state::OwnerId::try_from("ffffffff00112233445566778899aabb".to_string()).unwrap();
+    sidecar.save(&inst).unwrap();
+    let json = inspect_json(&cfg, &owner, "running");
+    let (be, calls) = backend(
+        &cfg,
+        Box::new(move |args| version(args, false).unwrap_or_else(|| ok(&json))),
+    );
+    let err = be.stop_unproven(&cfg, &inst).unwrap_err();
+    assert!(
+        matches!(kind(&err), AppleError::IdentityConflict(_)),
+        "{err:#}"
+    );
+    assert!(mutations(&calls).is_empty(), "{:?}", calls.borrow());
+}
+
+/// `start` boots a stopped or crashed sandbox; a running or booting one is
+/// refused before any runtime change.
+#[test]
+fn start_gates_on_the_sandbox_status() {
+    for (status, boots) in [
+        ("stopped", true),
+        ("crashed", true),
+        ("running", false),
+        ("booting", false),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(tmp.path());
+        let owner = Owner::load_or_init(&cfg).unwrap();
+        let inst = test_inst(&cfg);
+        write_sidecar(&inst, &owner);
+        let json = inspect_json(&cfg, &owner, status);
+        let (be, calls) = backend(
+            &cfg,
+            Box::new(move |args| {
+                if let Some(o) = version(args, true) {
+                    return o;
+                }
+                if starts(args, &["inspect"]) {
+                    return ok(&json);
+                }
+                if starts(args, &["logs"]) || starts(args, &["stop"]) {
+                    return ok("");
+                }
+                fail("boot refused by test")
+            }),
+        );
+        let err = be.start_existing(&cfg, &inst).unwrap_err();
+        let started = mutations(&calls).first().is_some_and(|m| m == "start");
+        assert_eq!(started, boots, "{status}: {err:#}");
+        match status {
+            "running" => assert!(format!("{err:#}").contains("already running"), "{err:#}"),
+            "booting" => assert!(
+                matches!(kind(&err), AppleError::OperationUncertain(_)),
+                "{err:#}"
+            ),
+            _ => assert!(matches!(kind(&err), AppleError::BootTimeout(_)), "{err:#}"),
+        }
+        if !boots {
+            assert!(mutations(&calls).is_empty(), "{status}");
+        }
+    }
+}
+
+#[test]
+fn cmd_stop_falls_back_to_stop_unproven_when_the_probe_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_cfg(tmp.path());
+    let owner = Owner::load_or_init(&cfg).unwrap();
+    let inst = test_inst(&cfg);
+    write_sidecar(&inst, &owner);
+    let stopped = Rc::new(RefCell::new(false));
+    let s = Rc::clone(&stopped);
+    let (on, off) = (
+        inspect_json(&cfg, &owner, "running"),
+        inspect_json(&cfg, &owner, "stopped"),
+    );
+    let (be, calls) = backend(
+        &cfg,
+        Box::new(move |args| {
+            if let Some(o) = version(args, false) {
+                return o;
+            }
+            if starts(args, &["inspect"]) {
+                return ok(if *s.borrow() { &off } else { &on });
+            }
+            if starts(args, &["stop"]) {
+                *s.borrow_mut() = true;
+                return ok("");
+            }
+            fail("unexpected")
+        }),
+    );
+    assert!(
+        be.as_running(&cfg, inst.clone()).is_err(),
+        "precondition: the liveness probe fails on an unqualified runtime"
+    );
+    crate::commands::cmd_stop(&be, &cfg, &inst).unwrap();
+    assert!(*stopped.borrow());
+    assert_eq!(mutations(&calls), ["stop"]);
+}
+
 #[test]
 fn follow_logs_replace_guest_control_bytes() {
     // `stream_logs` needs a RunningInstance, which cannot be minted without
@@ -1195,23 +1385,6 @@ fn host_key_read_retries_a_half_written_file_and_detects_restarts() {
     }
 }
 
-#[test]
-fn legacy_instance_destroy_removes_local_state_only() {
-    let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_cfg(tmp.path());
-    Owner::load_or_init(&cfg).unwrap();
-    let inst = test_inst(&cfg);
-    std::fs::write(
-        MachineSidecar::path(&inst),
-        r#"{"schema_version":1,"backend":"apple-container","machine_id":"coop-0a1b2c3d-1","network_id":"coop-0a1b2c3d-1"}"#,
-    )
-    .unwrap();
-    let (be, calls) = backend(&cfg, Box::new(|_| fail("no runtime call expected")));
-    be.destroy_instance(&cfg, &inst).unwrap();
-    assert!(calls.borrow().is_empty());
-    assert!(!inst.dir.exists());
-}
-
 fn manifest(image_ref: &str, disk: Option<CommittedDisk>) -> ImageManifest {
     ImageManifest {
         schema_version: state::SCHEMA_VERSION,
@@ -1223,7 +1396,6 @@ fn manifest(image_ref: &str, disk: Option<CommittedDisk>) -> ImageManifest {
         base_image: image::BASE_IMAGE.into(),
         platform: image::PLATFORM.into(),
         guest_user: crate::guest::GuestUser::default(),
-        pubkey_fingerprint: String::new(),
         created: "now".into(),
     }
 }
@@ -1413,6 +1585,52 @@ fn commit_saves_a_disk_manifest_from_the_runtime_record() {
     assert_eq!(covering_gib(committed.bytes).unwrap(), GiB::new(8).unwrap());
 }
 
+/// A commit the runtime reports as failed may still have published its
+/// disk; nothing refers to it, so it is deleted and no manifest is written.
+#[test]
+fn failed_commit_deletes_its_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_cfg(tmp.path());
+    let owner = Owner::load_or_init(&cfg).unwrap();
+    let inst = test_inst(&cfg);
+    write_sidecar(&inst, &owner);
+    let stopped = inspect_json(&cfg, &owner, "stopped");
+    let (be, calls) = backend(
+        &cfg,
+        Box::new(move |args| {
+            if let Some(o) = version(args, true) {
+                return o;
+            }
+            if starts(args, &["inspect"]) {
+                return ok(&stopped);
+            }
+            if starts(args, &["commit"]) {
+                return fail("metadata write failed");
+            }
+            if starts(args, &["disk", "delete"]) {
+                return ok("");
+            }
+            fail("unexpected")
+        }),
+    );
+    let image = ImageName::new("snap").unwrap();
+    let err = be
+        .commit_disk(&cfg, &StoppedInstance::new(inst.clone()), &image)
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("metadata write failed"),
+        "{err:#}"
+    );
+    let calls = calls.borrow();
+    let commit = calls.iter().find(|c| starts(c, &["commit"])).unwrap();
+    let deleted = calls
+        .iter()
+        .find(|c| starts(c, &["disk", "delete"]))
+        .and_then(|c| c.last());
+    assert_eq!(deleted, commit.last(), "the committed disk is deleted");
+    assert!(ImageManifest::load(&cfg, &image).is_err());
+}
+
 #[test]
 fn disk_bytes_round_up_to_whole_gib() {
     assert_eq!(covering_gib(1).unwrap(), GiB::new(1).unwrap());
@@ -1476,27 +1694,10 @@ fn resource_change_that_does_not_apply_is_uncertain() {
     assert_eq!(
         Journal::try_load(&inst).unwrap().unwrap().op,
         JournalOp::SetResources {
-            operation: Some(op(&flag(&set, "--operation"))),
+            operation: op(&flag(&set, "--operation")),
             prior,
         }
     );
-}
-
-#[test]
-fn legacy_journal_only_instance_can_be_destroyed() {
-    let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_cfg(tmp.path());
-    Owner::load_or_init(&cfg).unwrap();
-    let inst = test_inst(&cfg);
-    std::fs::write(
-        inst.dir.join("operation.json"),
-        r#"{"schema_version":1,"backend":"apple-container","machine_id":"coop-0a1b2c3d-2","network_id":"coop-0a1b2c3d-2"}"#,
-    )
-    .unwrap();
-    let (be, calls) = backend(&cfg, Box::new(|_| fail("no runtime call expected")));
-    be.destroy_instance(&cfg, &inst).unwrap();
-    assert!(calls.borrow().is_empty());
-    assert!(!inst.dir.exists());
 }
 
 // ── Simulated runtime ─────────────────────────────────────
@@ -2334,7 +2535,7 @@ fn interrupted_rollback_is_reconciled_from_its_journal() {
     assert_eq!(
         Journal::try_load(&f.inst).unwrap().unwrap().op,
         JournalOp::SetResources {
-            operation: Some(op(&sets[1].0)),
+            operation: op(&sets[1].0),
             prior: Resources {
                 cpus: 6,
                 memory_bytes: 6144 * 1024 * 1024
@@ -2404,7 +2605,7 @@ fn recovery_refuses_a_journal_for_another_sandbox() {
         &inst,
         &owner,
         JournalOp::RestoreDisk {
-            operation: Some(op("coop-r")),
+            operation: op("coop-r"),
             prior_generation: 0,
         },
         MachineName::generate(&owner.id).unwrap(),
@@ -2544,6 +2745,58 @@ fn grow_requires_its_own_committed_operation() {
             matches!(kind(&err), AppleError::OperationUncertain(_)),
             "{ours} {grown}: {err:#}"
         );
+    }
+}
+
+/// A grow that exits non-zero is uncertain when the runtime's record shows
+/// it committed anyway or cannot be read, and a plain failure when the record
+/// shows it did not commit.
+#[test]
+fn failed_grow_is_uncertain_only_when_it_committed() {
+    // (runtime record after the grow: Some(committed) or unreadable)
+    for after in [Some(true), Some(false), None] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(tmp.path());
+        let owner = Owner::load_or_init(&cfg).unwrap();
+        let inst = test_inst(&cfg);
+        write_sidecar(&inst, &owner);
+        let sent: Rc<RefCell<Option<OperationId>>> = Rc::new(RefCell::new(None));
+        let s = Rc::clone(&sent);
+        let stopped = inspect_json(&cfg, &owner, "stopped");
+        let (be, calls) = backend(
+            &cfg,
+            Box::new(move |args| {
+                if let Some(o) = version(args, true) {
+                    return o;
+                }
+                if starts(args, &["inspect"]) {
+                    return match (&*s.borrow(), after) {
+                        (Some(_), None) => fail("inspect timed out"),
+                        (Some(sent), Some(true)) => ok(&with_last_operation(&stopped, sent)),
+                        _ => ok(&stopped),
+                    };
+                }
+                if starts(args, &["grow"]) {
+                    *s.borrow_mut() = Some(op(&flag(args, "--operation")));
+                    return fail("resize2fs exited 1");
+                }
+                fail("unexpected")
+            }),
+        );
+        let err = be
+            .resize_disk(
+                &cfg,
+                &StoppedInstance::new(inst.clone()),
+                GiB::new(32).unwrap(),
+            )
+            .unwrap_err();
+        let uncertain = matches!(
+            err.downcast_ref::<AppleError>(),
+            Some(AppleError::OperationUncertain(_))
+        );
+        assert_eq!(uncertain, after != Some(false), "{after:?}: {err:#}");
+        assert!(format!("{err:#}").contains("resize2fs exited 1"), "{err:#}");
+        assert_eq!(mutations(&calls), ["grow"]);
     }
 }
 

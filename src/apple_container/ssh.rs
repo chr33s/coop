@@ -21,46 +21,52 @@ const ED25519_PREFIX: &str = "ssh-ed25519";
 /// Base64 of the ed25519 wire blob: `u32 len || "ssh-ed25519" || u32 len || 32 bytes`.
 const ED25519_BLOB_LEN: usize = 4 + 11 + 4 + 32;
 
-/// A validated guest host public key.
+/// Why text is not a single OpenSSH ed25519 public key.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum KeyFormatError {
+    #[error("must be exactly one line")]
+    NotOneLine,
+    #[error("is malformed")]
+    Malformed,
+    #[error("has type {0:?}, not ssh-ed25519")]
+    WrongType(String),
+    #[error("is not valid base64")]
+    NotBase64,
+    #[error("is not an ed25519 public key")]
+    BadBlob,
+}
+
+/// An OpenSSH ed25519 public key: its base64 text and decoded wire blob.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HostPublicKey {
+struct Ed25519Key {
     base64: String,
     blob: Vec<u8>,
 }
 
-impl HostPublicKey {
-    /// Parse exactly one `ssh-ed25519 <base64> [comment]` line. The comment is
-    /// guest-controlled and dropped.
-    pub(crate) fn parse(text: &str) -> Result<Self> {
+impl Ed25519Key {
+    /// Parse exactly one `ssh-ed25519 <base64> [comment]` line, dropping the
+    /// comment.
+    fn parse(text: &str) -> std::result::Result<Self, KeyFormatError> {
         let mut lines = text.lines().filter(|l| !l.trim().is_empty());
         let (Some(line), None) = (lines.next(), lines.next()) else {
-            bail!(AppleError::HostKeyChanged(
-                "guest host public key must be exactly one line".into()
-            ));
+            return Err(KeyFormatError::NotOneLine);
         };
         let mut fields = line.split_whitespace();
         let (Some(kind), Some(b64)) = (fields.next(), fields.next()) else {
-            bail!(AppleError::HostKeyChanged(
-                "malformed guest host public key".into()
-            ));
+            return Err(KeyFormatError::Malformed);
         };
         if kind != ED25519_PREFIX {
-            bail!(AppleError::HostKeyChanged(format!(
-                "guest host key type {:?} is not ssh-ed25519",
-                super::cli::sanitize_for_display(kind)
+            return Err(KeyFormatError::WrongType(super::cli::sanitize_for_display(
+                kind,
             )));
         }
-        let blob = decode_base64(b64).ok_or_else(|| {
-            AppleError::HostKeyChanged("guest host key is not valid base64".into())
-        })?;
+        let blob = crate::base64::decode(b64).ok_or(KeyFormatError::NotBase64)?;
         let well_formed = blob.len() == ED25519_BLOB_LEN
             && blob[..4] == [0, 0, 0, 11]
             && &blob[4..15] == ED25519_PREFIX.as_bytes()
             && blob[15..19] == [0, 0, 0, 32];
         if !well_formed {
-            bail!(AppleError::HostKeyChanged(
-                "guest host key blob is not an ed25519 public key".into()
-            ));
+            return Err(KeyFormatError::BadBlob);
         }
         Ok(Self {
             base64: b64.to_string(),
@@ -69,16 +75,40 @@ impl HostPublicKey {
     }
 
     /// OpenSSH-style `SHA256:<base64>` fingerprint.
-    pub(crate) fn fingerprint(&self) -> String {
+    fn fingerprint(&self) -> String {
         let digest = sha2::Sha256::digest(&self.blob);
         format!(
             "SHA256:{}",
-            crate::devcontainer_oci::base64_encode(&digest).trim_end_matches('=')
+            crate::base64::encode(&digest).trim_end_matches('=')
         )
+    }
+}
+
+/// Fingerprint of one of coop's own ed25519 public keys (not a guest's).
+pub(crate) fn ed25519_fingerprint(text: &str) -> std::result::Result<String, KeyFormatError> {
+    Ed25519Key::parse(text).map(|k| k.fingerprint())
+}
+
+/// A validated guest host public key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostPublicKey(Ed25519Key);
+
+impl HostPublicKey {
+    /// Parse exactly one `ssh-ed25519 <base64> [comment]` line. The comment is
+    /// guest-controlled and dropped.
+    pub(crate) fn parse(text: &str) -> Result<Self> {
+        Ed25519Key::parse(text)
+            .map(Self)
+            .map_err(|e| AppleError::HostKeyChanged(format!("guest host public key {e}")).into())
+    }
+
+    /// OpenSSH-style `SHA256:<base64>` fingerprint.
+    pub(crate) fn fingerprint(&self) -> String {
+        self.0.fingerprint()
     }
 
     fn known_hosts_line(&self, alias: &Hostname) -> String {
-        format!("{alias} {ED25519_PREFIX} {}\n", self.base64)
+        format!("{alias} {ED25519_PREFIX} {}\n", self.0.base64)
     }
 }
 
@@ -183,25 +213,6 @@ pub(crate) fn pinned_target(
     })
 }
 
-const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-fn decode_base64(s: &str) -> Option<Vec<u8>> {
-    let s = s.trim_end_matches('=');
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
-    let mut acc = 0u32;
-    let mut bits = 0u32;
-    for c in s.bytes() {
-        let v = u32::try_from(B64.iter().position(|&b| b == c)?).ok()?;
-        acc = (acc << 6) | v;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push(u8::try_from((acc >> bits) & 0xff).ok()?);
-        }
-    }
-    Some(out)
-}
-
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
@@ -233,6 +244,25 @@ mod tests {
             key.fingerprint(),
             "SHA256:10O2vYbKkmA/sBuRrfwbSNiR5pAFM/qtkqldbUJESvk"
         );
+    }
+
+    /// coop's own key fingerprints the same way, but a bad one is not
+    /// reported as a changed guest host key.
+    #[test]
+    fn own_key_fingerprint_is_neutral() {
+        assert_eq!(
+            ed25519_fingerprint(KEY).unwrap(),
+            HostPublicKey::parse(KEY).unwrap().fingerprint()
+        );
+        assert_eq!(
+            ed25519_fingerprint("ssh-rsa AAAA x").unwrap_err(),
+            KeyFormatError::WrongType("ssh-rsa".into())
+        );
+        let err = HostPublicKey::parse("ssh-rsa AAAA x").unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<AppleError>(),
+            Some(AppleError::HostKeyChanged(m)) if m.contains("not ssh-ed25519")
+        ));
     }
 
     #[test]
@@ -311,18 +341,5 @@ mod tests {
                 "{bad:?}: {err:#}"
             );
         }
-    }
-
-    #[test]
-    fn base64_decodes_known_vectors() {
-        for (enc, dec) in [
-            ("", &b""[..]),
-            ("Zg==", b"f"),
-            ("Zm8", b"fo"),
-            ("Zm9vYmFy", b"foobar"),
-        ] {
-            assert_eq!(decode_base64(enc).unwrap(), dec);
-        }
-        assert!(decode_base64("Zm9v*").is_none());
     }
 }

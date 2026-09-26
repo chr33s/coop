@@ -26,30 +26,22 @@
 
 ### Fixes
 
-- **`coop stop` no longer reports success when it could not check the
-  instance** — a failed liveness probe used to be treated as "not running", so
-  `coop stop` printed "stopped" while the VM kept running. It now returns the
-  probe error (after tearing down the credential proxy) unless the backend can
-  stop the machine without a guest connection.
+- **`coop stop` no longer reports an instance stopped when its liveness probe
+  fails** — a failed probe used to be treated as "not running", so `coop stop`
+  printed "stopped" while the VM kept running. It now tears down the
+  credential proxy and stops the instance through the backend's control plane
+  (PID file, `limactl`, or the runtime), or returns an error if that fails.
 - **`coop status` lists every instance even when one cannot be probed** — that
   instance is shown as `unknown` (JSON `"state": "unknown"`) with a warning,
   instead of the whole listing failing.
 - **rsync transfers work when the VM key path contains a space** — SSH options
   containing whitespace are now quoted in rsync's `-e` command.
-- **`coop list` shows `unknown` for an instance whose state cannot be read** —
-  on the Apple sandbox backend an unfinished operation or a failed probe was
-  listed as `stopped`. The unfinished-operation error now names the single
-  command that recovers it (`start` for a resize or restore, `destroy` otherwise).
-- **Apple sandbox: guest SSH never contacts the host agent** — pinned
-  connections set `IdentityAgent=none`, and `coop ssh-config` no longer claims
-  that pinned aliases skip host-key verification.
+- **Editor SSH aliases work when the VM key path contains a space** — the
+  `IdentityFile` in the `coop-<name>` block of `~/.ssh/config` is now quoted.
 - **Lima: an instance starts again after `coop resize --size`** — Lima 2.x
   refuses to boot ("disk shrinking is not supported") when `lima.yaml` records
   a smaller disk than the file on disk. Growing the disk now updates `disk:`
   in `lima.yaml` too.
-- **`coop images` does not report `0.0 GiB` for Apple sandbox images** — their
-  content lives in the runtime's image store, so the size is `n/a` (JSON
-  `"size_bytes": null`).
 
 ### Internal
 

@@ -15,7 +15,7 @@ use anyhow::{Result, bail};
 
 use super::AppleError;
 use super::protocol::{Effective, EffectiveMount, Inspect, SandboxStatus, VersionInfo};
-use super::state::MachineName;
+use super::state::{MachineName, OwnerId, Resources};
 
 /// The protocol and containerization release this build was validated with.
 pub(crate) const PROTOCOL: u32 = 2;
@@ -66,10 +66,9 @@ pub(crate) fn qualify(info: &VersionInfo) -> Result<QualifiedRuntime> {
 /// recorded when it created the sandbox.
 pub(crate) struct Expected<'a> {
     pub(crate) sandbox: &'a MachineName,
-    pub(crate) owner: &'a str,
+    pub(crate) owner: &'a OwnerId,
     pub(crate) runtime_root: &'a Path,
-    pub(crate) cpus: u32,
-    pub(crate) memory_bytes: u64,
+    pub(crate) resources: Resources,
 }
 
 /// Where the runtime keeps `sandbox`'s disk under its (canonical) root.
@@ -83,17 +82,19 @@ pub(crate) fn rootfs_path(runtime_root: &Path, sandbox: &MachineName) -> std::pa
 /// Pre-boot check of the runtime's persisted record.
 pub(crate) fn verify_record(inspect: &Inspect, expected: &Expected<'_>) -> Result<()> {
     let r = &inspect.record;
-    if r.id != expected.sandbox.as_str() || r.owner != expected.owner {
+    if r.id != expected.sandbox.as_str() || r.owner != expected.owner.as_str() {
         bail!(AppleError::IdentityConflict(format!(
             "sandbox {} is recorded for owner {:?}, not this installation",
             expected.sandbox,
             super::cli::sanitize_for_display(&r.owner)
         )));
     }
-    if r.cpus != expected.cpus || r.memory_bytes != expected.memory_bytes {
+    if r.resources() != expected.resources {
         bail!(AppleError::IdentityConflict(format!(
-            "sandbox {} records {} vCPUs / {} bytes, expected {} / {}",
-            expected.sandbox, r.cpus, r.memory_bytes, expected.cpus, expected.memory_bytes
+            "sandbox {} records {}, expected {}",
+            expected.sandbox,
+            r.resources(),
+            expected.resources
         )));
     }
     Ok(())
@@ -149,10 +150,14 @@ pub(crate) fn verify_effective(
             "sandbox {name} reports no address"
         )));
     };
-    if eff.cpus != expected.cpus || eff.memory_bytes != expected.memory_bytes {
+    let running = Resources {
+        cpus: eff.cpus,
+        memory_bytes: eff.memory_bytes,
+    };
+    if running != expected.resources {
         bail!(AppleError::IdentityConflict(format!(
-            "sandbox {name} runs with {} vCPUs / {} bytes, expected {} / {}",
-            eff.cpus, eff.memory_bytes, expected.cpus, expected.memory_bytes
+            "sandbox {name} runs with {running}, expected {}",
+            expected.resources
         )));
     }
     if eff.image_digest != inspect.record.image_digest {
@@ -253,7 +258,9 @@ mod tests {
     use crate::apple_container::protocol::{parse_inspect, parse_version};
 
     const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/coop-sandbox");
-    const OWNER: &str = "0a1b2c3d00112233445566778899aabb";
+    fn owner() -> OwnerId {
+        OwnerId::try_from("0a1b2c3d00112233445566778899aabb".to_string()).unwrap()
+    }
     const ROOT: &str = "/Users/me/.coop-apple/backends/apple-container-v1/runtime";
 
     fn fixture(name: &str) -> String {
@@ -264,13 +271,15 @@ mod tests {
         MachineName::new("coop-0a1b2c3d-00112233445566ff").unwrap()
     }
 
-    fn expected(name: &MachineName) -> Expected<'_> {
+    fn expected<'a>(name: &'a MachineName, owner: &'a OwnerId) -> Expected<'a> {
         Expected {
             sandbox: name,
-            owner: OWNER,
+            owner,
             runtime_root: Path::new(ROOT),
-            cpus: 2,
-            memory_bytes: 2048 * 1024 * 1024,
+            resources: Resources {
+                cpus: 2,
+                memory_bytes: 2048 * 1024 * 1024,
+            },
         }
     }
 
@@ -285,7 +294,39 @@ mod tests {
     fn gate(json: &str) -> Result<SecurityReady> {
         let name = sandbox();
         let inspect = parse_inspect(json, &name)?;
-        verify_effective(&inspect, &expected(&name))
+        verify_effective(&inspect, &expected(&name, &owner()))
+    }
+
+    /// The runtime reports the values its sources declare, and `Package.swift`
+    /// pins the same containerization release, so a bump on either side
+    /// must be mirrored here.
+    #[test]
+    fn pins_match_the_runtime_sources() {
+        let layout = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/macos/coop-sandbox/Sources/CoopSandboxCore/Layout.swift"
+        ));
+        let package = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/macos/coop-sandbox/Package.swift"
+        ));
+        let protocol = format!("public let protocolVersion = {PROTOCOL}\n");
+        let layout_pin = format!("public let containerizationVersion = \"{CONTAINERIZATION}\"\n");
+        let package_pin = format!(
+            "\"https://github.com/apple/containerization.git\", exact: \"{CONTAINERIZATION}\")"
+        );
+        assert!(
+            layout.contains(&protocol),
+            "Layout.swift lacks {protocol:?}"
+        );
+        assert!(
+            layout.contains(&layout_pin),
+            "Layout.swift lacks {layout_pin:?}"
+        );
+        assert!(
+            package.contains(&package_pin),
+            "Package.swift lacks {package_pin:?}"
+        );
     }
 
     #[test]

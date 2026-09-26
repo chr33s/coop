@@ -1,7 +1,7 @@
 # Design: Apple sandbox mutations — transactions, serialization, and maintenance
 
 **Status:** implemented (runtime 0.2.0, protocol 2) · **Scope:** `macos/coop-sandbox` and `src/apple_container/`; the backend contract is in [`backends.md`](../backends.md), the security spec in [`trust-model.md`](../trust-model.md)
-**Date:** 2026-09-26 · **Origin:** a static review of the fork's Apple sandbox work against upstream `trailofbits/coop` (fork head `5e7dc0a`, upstream head `82b2865`, merge base `338228c`)
+**Date:** 2026-09-26
 
 ---
 
@@ -10,15 +10,7 @@
 - **Kept:** the direct `apple/containerization` runtime
   ([`apple-sandbox-runtime.md`](apple-sandbox-runtime.md)) and its security
   model. Nothing here removes a check.
-- **Fixed first, simplified second.** The review found four defects:
-  1. A resource rollback that was neither journaled nor locked.
-  2. A disk growth whose recorded size could disagree with its disk after a
-     crash.
-  3. No same-sandbox exclusion inside the runtime.
-  4. Maintenance that depended on application images.
-  Each is fixed with tests. The structural cleanup (journal representation,
-  shared boot sequence, test layout) followed.
-- **The end state has:**
+- **Mechanisms:**
   - one runtime disk-publication path (`DiskUpdate`);
   - one protected resource update used in both directions
     (`update_resources`);
@@ -37,7 +29,7 @@ lifecycle, disks, resources, or recovery is reviewed against them.
 | INV-04 | An interrupted forward update or rollback stays recoverable; neither silently leaves Rust and Swift records inconsistent. |
 | INV-05 | A rollback never overwrites a newer successful operation. |
 | INV-06 | Mutations of one sandbox serialize at the runtime boundary; mutations of different sandboxes stay concurrent. |
-| INV-07 | A new SSH host key is enrolled only on first provisioning or after a correlated, coop-authorized restore. A disk-generation increase alone is not authorization, except for a restore journal written before operation ids (§3.4). |
+| INV-07 | A new SSH host key is enrolled only on first provisioning or after a correlated, coop-authorized restore. A disk-generation increase alone is not authorization. |
 | INV-08 | Runtime qualification, effective-configuration verification, and SSH readiness stay separate checks. |
 | INV-09 | Maintenance runs trusted tools from a separate boot image, never programs from the guest-controlled target disk. |
 | INV-10 | Cleanup and stopping remain available when qualification or safe SSH hand-out fails, subject to ownership checks. |
@@ -77,6 +69,13 @@ operation on the sandbox, the owner's claim, or `reconcile`.
 - **Otherwise:** it discards the scratch disk and keeps the old state.
 - **Unreadable or self-contradictory staged state:** an error, never a guess.
   `delete` still works in that case.
+
+`commit` publishes a committed disk the same way (`DiskCommit`): it stages
+`disks/.pending-<name>.json` with the work disk's inode and metadata, renames
+the disk into place (the commit point), then writes `<name>.json`. `reconcile`
+settles staged commits before sweeping orphans (`settled-disk-commit`) and
+keeps any disk whose staged commit it cannot resolve
+(`unresolved-disk-commit`).
 
 Readers resolve the committed view without writing, so a read never mutates
 outside a guard. Restores staged by runtime 0.1.0 (`restore.pending.json`)
@@ -157,10 +156,7 @@ runtime checks it again under its guard (`--expect-operation`).
 
 **Restore.** `restore` journals an operation id. coop re-pins the host key
 after an interrupted restore only when the runtime's last operation is that
-id and the generation rose. A journal written before operation ids (left
-by a crash under an earlier build) falls back to the generation check alone.
-That fallback is still coop's own journaled restore, and the guest cannot
-cause it.
+id and the generation rose.
 
 **Grow.** `grow` also passes an id and checks it on read-back. coop keeps no
 grow journal: the runtime's disk update is self-recovering, and nothing coop
@@ -196,12 +192,10 @@ store copy.
 
 **Journal.** `operation.json` holds one tagged variant per operation (`Create`
 and `Destroy` with their own stages, `SetResources`, and `RestoreDisk`)
-instead of parallel `Operation`/`JournalOp`/`Stage` types. Journals in the
-earlier flat layout are converted by a narrow adapter (`state::legacy`).
-Contradictory combinations are refused with a recovery hint, never dropped.
+instead of parallel `Operation`/`JournalOp`/`Stage` types. Every variant that
+changes the sandbox carries its operation id.
 
-**Sidecar.** There is no creation-state field. Old sidecars carrying
-`"creation_state": "ready"` still load, because the field is ignored.
+**Sidecar.** There is no creation-state field.
 
 **Boot sequence.**
 
@@ -255,9 +249,7 @@ mutation/recovery paths.
   - grow and restore accepted only with their own committed operation;
   - restore re-pinning only for coop's own operation;
   - destroy working when the runtime cannot inspect the sandbox;
-  - maintenance install, reinstall, and failure cleanup in setup;
-  - legacy journal (every flat-layout combination) and sidecar
-    compatibility.
+  - maintenance install, reinstall, and failure cleanup in setup.
 - **Real hardware (`tests/integration-apple-sandbox.sh`):**
   - maintenance install, and survival after its store image is deleted;
   - two concurrent grows of one sandbox applying once;
@@ -274,12 +266,12 @@ mutation/recovery paths.
 
 | Field | Value |
 | --- | --- |
-| Tree | `c1b1b80` plus its closeout-review fixes (uncommitted when run); `c1b1b80` itself also passed |
+| Tree | `4a9050b` plus its review fixes (uncommitted when run) |
 | Hardware | Apple M5 Max |
 | OS | macOS 27.0 (26A428) |
 | Toolchain | `container` 1.4.1, `containerization` 0.45.0, Swift 6.4 |
 | Command | `./tests/integration-apple-sandbox.sh` (all phases) |
-| Result | 76 passed, 0 failed, 1 skipped: host services on the NAT gateway, reachable by design |
+| Result | 103 passed, 0 failed, 1 skipped: host services on the NAT gateway, reachable by design (includes the `coop` end-to-end phase) |
 
 The coop-level `./tests/run-integration.sh` (Lima, and Firecracker remotely)
 was not run for this change.
@@ -287,16 +279,3 @@ was not run for this change.
 Record results for each candidate revision (commit, hardware, OS,
 runtime/dependency versions, commands, results) in the PR that changes the
 runtime. The run above is not evidence for a later revision.
-
-## 5. Landing upstream
-
-The runtime series is separate from changes that stand alone. The following
-can be reviewed as independent units, each with its own regression coverage:
-
-- the Lima disk-size metadata fix (`f2151f8`);
-- the shared SSH `HostKeyPolicy` changes;
-- the probe and error-reporting improvements.
-
-Do not describe shared changes as inert for the default backends without
-tests that show it. Keep routine upstream dependency syncs out of this series
-where practical.

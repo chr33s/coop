@@ -109,11 +109,11 @@ use serde::Serialize;
 
 #[derive(Serialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum InstanceState { Running, Stopped }
+pub(crate) enum InstanceState { Running, Stopped, Unknown }
 
 #[derive(Serialize, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum BackendKind { Firecracker, Lima }
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum BackendKind { Firecracker, Lima, AppleContainer }
 ```
 
 Provide the projection from the live backend enum (match on `PlatformBackend`'s
@@ -256,9 +256,9 @@ and `:1676`) — update them to `Commands::List { .. }`.
 
 Deliberately **smaller** than `InstanceStatus`: `cmd_list` only calls
 `probe_running` (by default `is_running`; an error lists as `unknown`) and does
-**not** run the per-instance usage SSH query that `status` runs. Keep `list` cheap — do not add usage here. Consumers who want usage call
-`status --json`. Reusing `InstanceState` keeps the two consistent where they
-overlap.
+**not** run the per-instance usage SSH query that `status` runs. Keep `list`
+cheap — do not add usage here. Consumers who want usage call `status --json`.
+Reusing `InstanceState` keeps the two consistent where they overlap.
 
 ```json
 [ { "name": "my-project", "state": "running" },

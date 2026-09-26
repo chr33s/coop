@@ -20,8 +20,7 @@ use crate::config::{CoopConfig, Instance};
 /// Literal backend tag stored in every record.
 pub(crate) const BACKEND_TAG: &str = "apple-container";
 /// Schema of the instance record, journal, and image manifest. Version 1 was
-/// the `container machine` backend; its records are refused (see
-/// [`legacy_machine`]).
+/// the retired `container machine` backend; its records are refused.
 pub(crate) const SCHEMA_VERSION: u32 = 2;
 /// Schema of `owner.json`, unchanged since version 1.
 const OWNER_SCHEMA_VERSION: u32 = 1;
@@ -194,11 +193,13 @@ fn check_header(schema_version: u32, backend: &str, path: &Path, want: u32) -> R
         )));
     }
     if schema_version == 1 && want == SCHEMA_VERSION {
+        let dir = path.parent().unwrap_or(path);
         bail!(AppleError::IdentityConflict(format!(
-            "{} was written by the retired `container machine` backend; `coop destroy` \
-             removes the instance's local state (its machine and network stay in the Apple \
-             Container runtime until you delete them there)",
-            path.display()
+            "{} has schema version 1 (the retired `container machine` backend); this build \
+             understands {want}. Remove {} by hand, and delete its machine and network with \
+             `container machine delete` / `container network delete`",
+            path.display(),
+            dir.display()
         )));
     }
     if schema_version != want {
@@ -283,14 +284,12 @@ impl Owner {
 // ── Machine record ────────────────────────────────────────────
 
 /// `apple-machine.json`, written once creation has completed (an
-/// in-progress creation lives in the journal). Records written by earlier
-/// builds also carry `"creation_state": "ready"`, which is ignored on read.
+/// in-progress creation lives in the journal).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct MachineSidecar {
     pub(crate) schema_version: u32,
     pub(crate) backend: String,
     pub(crate) owner_id: OwnerId,
-    pub(crate) instance_id: String,
     /// `coop-sandbox` id; its vmnet network is internal to the sandbox.
     pub(crate) machine_id: MachineName,
     pub(crate) image_ref: String,
@@ -449,16 +448,13 @@ pub(crate) enum JournalOp {
     },
     /// A CPU/memory change, forward or rolled back, tagged `operation`.
     SetResources {
-        /// `None` only for a journal converted by [`legacy::convert`].
-        operation: Option<OperationId>,
+        operation: OperationId,
         /// The runtime's resources before the change.
         prior: Resources,
     },
     /// Disk replaced by `coop restore`.
     RestoreDisk {
-        /// `None` only for a journal converted by [`legacy::convert`]; a
-        /// higher disk generation alone then proves the restore applied.
-        operation: Option<OperationId>,
+        operation: OperationId,
         /// The runtime's disk generation before the restore.
         prior_generation: u64,
     },
@@ -533,22 +529,16 @@ impl Journal {
             return Ok(None);
         };
         check_raw_header(&content, &path)?;
-        Self::parse(&content)
-            .with_context(|| format!("Failed to parse {}", path.display()))
+        serde_json::from_str(&content)
+            .with_context(|| {
+                format!(
+                    "Failed to parse {} (a journal from an older build is not supported: \
+                     check the sandbox with `coop-sandbox inspect`, then remove the file \
+                     by hand)",
+                    path.display()
+                )
+            })
             .map(Some)
-    }
-
-    /// The current layout nests the operation under `op`; a journal in the
-    /// earlier flat layout is converted by [`legacy::convert`].
-    fn parse(content: &str) -> Result<Self> {
-        #[derive(Deserialize)]
-        struct Layout {
-            op: Option<serde::de::IgnoredAny>,
-        }
-        if serde_json::from_str::<Layout>(content)?.op.is_some() {
-            return Ok(serde_json::from_str(content)?);
-        }
-        legacy::convert(serde_json::from_str(content)?)
     }
 
     /// Record the operation's progress, or (for `destroy`) take over an
@@ -571,124 +561,6 @@ impl Journal {
     }
 }
 
-/// Journals in the flat layout written before per-operation variants: one
-/// `operation`, a shared `stage`, and optional prior-state fields. Each is
-/// converted to the variant it describes; any other combination is refused,
-/// never dropped, since it may be an unfinished operation.
-mod legacy {
-    use anyhow::{Result, bail};
-    use serde::Deserialize;
-
-    use super::{CreateStage, DestroyStage, Journal, JournalOp, MachineName, OwnerId, Resources};
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-    #[serde(rename_all = "kebab-case")]
-    enum Operation {
-        Create,
-        SetResources,
-        RestoreDisk,
-        Destroy,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-    #[serde(rename_all = "kebab-case")]
-    enum Stage {
-        Reserved,
-        CreatingMachine,
-        MachineCreated,
-        Applying,
-        DeletingMachine,
-        MachineDeleted,
-    }
-
-    #[derive(Deserialize)]
-    pub(super) struct Record {
-        schema_version: u32,
-        backend: String,
-        owner_id: OwnerId,
-        operation: Operation,
-        stage: Stage,
-        machine_id: MachineName,
-        prior_resources: Option<(u32, u64)>,
-        prior_disk_generation: Option<u64>,
-    }
-
-    /// The flat layout's rule: each operation carries exactly its own
-    /// prior state.
-    fn priors_fit(operation: Operation, res: Option<(u32, u64)>, generation: Option<u64>) -> bool {
-        match operation {
-            Operation::Create | Operation::Destroy => res.is_none() && generation.is_none(),
-            Operation::SetResources => res.is_some() && generation.is_none(),
-            Operation::RestoreDisk => res.is_none() && generation.is_some(),
-        }
-    }
-
-    pub(super) fn convert(r: Record) -> Result<Journal> {
-        use Operation as O;
-        use Stage as S;
-        let op = match (
-            r.operation,
-            r.stage,
-            r.prior_resources,
-            r.prior_disk_generation,
-        ) {
-            (O::Create, S::Reserved, None, None) => JournalOp::Create {
-                stage: CreateStage::Reserved,
-            },
-            (O::Create, S::CreatingMachine, None, None) => JournalOp::Create {
-                stage: CreateStage::CreatingMachine,
-            },
-            (O::Create, S::MachineCreated, None, None) => JournalOp::Create {
-                stage: CreateStage::MachineCreated,
-            },
-            // `destroy` advanced whatever journal it found in place, keeping
-            // that operation's name and prior state.
-            (operation, S::DeletingMachine, res, generation)
-                if priors_fit(operation, res, generation) =>
-            {
-                JournalOp::Destroy {
-                    stage: DestroyStage::DeletingMachine,
-                }
-            }
-            (operation, S::MachineDeleted, res, generation)
-                if priors_fit(operation, res, generation) =>
-            {
-                JournalOp::Destroy {
-                    stage: DestroyStage::MachineDeleted,
-                }
-            }
-            (O::Destroy, S::Reserved, None, None) => JournalOp::Destroy {
-                stage: DestroyStage::Reserved,
-            },
-            (O::SetResources, S::Reserved | S::Applying, Some((cpus, memory_bytes)), None) => {
-                JournalOp::SetResources {
-                    operation: None,
-                    prior: Resources { cpus, memory_bytes },
-                }
-            }
-            (O::RestoreDisk, S::Reserved | S::Applying, None, Some(prior_generation)) => {
-                JournalOp::RestoreDisk {
-                    operation: None,
-                    prior_generation,
-                }
-            }
-            (operation, stage, ..) => bail!(
-                "unsupported {operation:?} journal at stage {stage:?} (or mismatched prior \
-                 state); check sandbox {} with `coop-sandbox inspect`, then `coop destroy` the \
-                 instance or remove the journal by hand",
-                r.machine_id
-            ),
-        };
-        Ok(Journal {
-            schema_version: r.schema_version,
-            backend: r.backend,
-            owner_id: r.owner_id,
-            machine_id: r.machine_id,
-            op,
-        })
-    }
-}
-
 /// Check a record's header before parsing the rest, so a record from
 /// another schema fails with its own explanation rather than a field error.
 fn check_raw_header(content: &str, path: &Path) -> Result<()> {
@@ -700,31 +572,6 @@ fn check_raw_header(content: &str, path: &Path) -> Result<()> {
     let header: Header = serde_json::from_str(content)
         .with_context(|| format!("Failed to parse {}", path.display()))?;
     check_header(header.schema_version, &header.backend, path, SCHEMA_VERSION)
-}
-
-/// A schema-1 instance record or journal from the retired `container
-/// machine` backend: its machine and network names, so `destroy` can name
-/// what it leaves in that runtime.
-pub(crate) fn legacy_machine(inst: &Instance) -> Result<Option<(String, String)>> {
-    #[derive(Deserialize)]
-    struct Legacy {
-        schema_version: u32,
-        backend: String,
-        machine_id: String,
-        network_id: String,
-    }
-    for path in [MachineSidecar::path(inst), Journal::path(inst)] {
-        let Some(content) = read_control_file(&path)? else {
-            continue;
-        };
-        if let Some(l) = serde_json::from_str::<Legacy>(&content)
-            .ok()
-            .filter(|l| l.schema_version == 1 && l.backend == BACKEND_TAG)
-        {
-            return Ok(Some((l.machine_id, l.network_id)));
-        }
-    }
-    Ok(None)
 }
 
 /// Per-instance known-hosts file for the pinned guest host key.
@@ -880,7 +727,6 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             backend: BACKEND_TAG.into(),
             owner_id,
-            instance_id: "00112233445566ff".into(),
             machine_id,
             image_ref: "local/coop-0a1b2c3d:x".into(),
             image_digest: "sha256:x".into(),
@@ -973,11 +819,11 @@ mod tests {
                 stage: CreateStage::MachineCreated,
             },
             JournalOp::SetResources {
-                operation: Some(OperationId::generate().unwrap()),
+                operation: OperationId::generate().unwrap(),
                 prior: resources,
             },
             JournalOp::RestoreDisk {
-                operation: Some(OperationId::generate().unwrap()),
+                operation: OperationId::generate().unwrap(),
                 prior_generation: 7,
             },
             JournalOp::Destroy {
@@ -993,229 +839,10 @@ mod tests {
         assert_eq!(raw["op"]["stage"], "deleting-machine");
     }
 
-    /// Journals in the earlier flat layout still load as the operation they
-    /// describe, and one whose prior state does not match is refused.
+    /// Records from the retired `container machine` backend (schema 1) are
+    /// refused.
     #[test]
-    fn legacy_flat_journals_are_converted_or_refused() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let inst = test_inst(&cfg);
-        let me = me();
-        let name = MachineName::generate(&me.id).unwrap();
-        let write = |operation: &str, stage: &str, resources: &str, generation: &str| {
-            fs::write(
-                Journal::path(&inst),
-                format!(
-                    r#"{{"schema_version":2,"backend":"apple-container","owner_id":"{}","operation":"{operation}","stage":"{stage}","machine_id":"{name}","prior_resources":{resources},"prior_disk_generation":{generation}}}"#,
-                    me.id.as_str()
-                ),
-            )
-            .unwrap();
-        };
-        let load = || Journal::try_load(&inst).map(|j| j.unwrap().op);
-        write("set-resources", "applying", "[8,1073741824]", "null");
-        assert_eq!(
-            load().unwrap(),
-            JournalOp::SetResources {
-                operation: None,
-                prior: Resources {
-                    cpus: 8,
-                    memory_bytes: 1 << 30
-                },
-            }
-        );
-        write("restore-disk", "applying", "null", "3");
-        assert_eq!(
-            load().unwrap(),
-            JournalOp::RestoreDisk {
-                operation: None,
-                prior_generation: 3
-            }
-        );
-        write("create", "creating-machine", "null", "null");
-        assert_eq!(
-            load().unwrap(),
-            JournalOp::Create {
-                stage: CreateStage::CreatingMachine
-            }
-        );
-        // `destroy` took over an unfinished create.
-        write("create", "deleting-machine", "null", "null");
-        assert_eq!(
-            load().unwrap(),
-            JournalOp::Destroy {
-                stage: DestroyStage::DeletingMachine
-            }
-        );
-
-        for (operation, stage, resources, generation) in [
-            ("set-resources", "applying", "null", "null"),
-            ("restore-disk", "applying", "null", "null"),
-            ("create", "applying", "null", "null"),
-            ("create", "reserved", "[1,2]", "null"),
-            ("set-resources", "applying", "[1,2]", "3"),
-        ] {
-            write(operation, stage, resources, generation);
-            let err = load().unwrap_err();
-            assert!(
-                format!("{err:#}").contains("coop destroy"),
-                "{operation} {stage}: {err:#}"
-            );
-        }
-    }
-
-    /// Every combination the flat layout could hold converts to the
-    /// operation it describes, including a destroy that took over another
-    /// operation's journal; a stage its operation never reached is refused.
-    #[test]
-    #[expect(clippy::too_many_lines, reason = "one row per flat-layout combination")]
-    fn legacy_flat_journal_conversion_table() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let inst = test_inst(&cfg);
-        let me = me();
-        let name = MachineName::generate(&me.id).unwrap();
-        let set = JournalOp::SetResources {
-            operation: None,
-            prior: Resources {
-                cpus: 1,
-                memory_bytes: 2,
-            },
-        };
-        let restore = JournalOp::RestoreDisk {
-            operation: None,
-            prior_generation: 3,
-        };
-        let create = |stage| Some(JournalOp::Create { stage });
-        let destroy = |stage| Some(JournalOp::Destroy { stage });
-        let (none, res, generation) = (("null", "null"), ("[1,2]", "null"), ("null", "3"));
-        let both = ("[1,2]", "3");
-        for (operation, stage, (resources, gen_field), want) in [
-            ("create", "reserved", none, create(CreateStage::Reserved)),
-            (
-                "create",
-                "creating-machine",
-                none,
-                create(CreateStage::CreatingMachine),
-            ),
-            (
-                "create",
-                "machine-created",
-                none,
-                create(CreateStage::MachineCreated),
-            ),
-            ("destroy", "reserved", none, destroy(DestroyStage::Reserved)),
-            ("set-resources", "reserved", res, Some(set.clone())),
-            ("set-resources", "applying", res, Some(set.clone())),
-            (
-                "restore-disk",
-                "reserved",
-                generation,
-                Some(restore.clone()),
-            ),
-            (
-                "restore-disk",
-                "applying",
-                generation,
-                Some(restore.clone()),
-            ),
-            // `destroy` advanced whatever journal it found.
-            (
-                "create",
-                "deleting-machine",
-                none,
-                destroy(DestroyStage::DeletingMachine),
-            ),
-            (
-                "destroy",
-                "deleting-machine",
-                none,
-                destroy(DestroyStage::DeletingMachine),
-            ),
-            (
-                "destroy",
-                "machine-deleted",
-                none,
-                destroy(DestroyStage::MachineDeleted),
-            ),
-            (
-                "create",
-                "machine-deleted",
-                none,
-                destroy(DestroyStage::MachineDeleted),
-            ),
-            (
-                "set-resources",
-                "deleting-machine",
-                res,
-                destroy(DestroyStage::DeletingMachine),
-            ),
-            (
-                "restore-disk",
-                "machine-deleted",
-                generation,
-                destroy(DestroyStage::MachineDeleted),
-            ),
-            // Stages the operation never reached, or another's prior state.
-            ("destroy", "creating-machine", none, None),
-            ("set-resources", "machine-created", res, None),
-            ("restore-disk", "creating-machine", generation, None),
-            ("set-resources", "deleting-machine", none, None),
-            ("restore-disk", "deleting-machine", res, None),
-            ("destroy", "deleting-machine", res, None),
-            ("set-resources", "deleting-machine", both, None),
-            ("restore-disk", "deleting-machine", both, None),
-            ("create", "machine-deleted", res, None),
-        ] {
-            fs::write(
-                Journal::path(&inst),
-                format!(
-                    r#"{{"schema_version":2,"backend":"apple-container","owner_id":"{}","operation":"{operation}","stage":"{stage}","machine_id":"{name}","prior_resources":{resources},"prior_disk_generation":{gen_field}}}"#,
-                    me.id.as_str()
-                ),
-            )
-            .unwrap();
-            let got = Journal::try_load(&inst).map(|j| j.unwrap().op);
-            match want {
-                Some(want) => assert_eq!(got.unwrap(), want, "{operation} {stage}"),
-                None => assert!(got.is_err(), "{operation} {stage}"),
-            }
-        }
-    }
-
-    /// Records from builds that had `creation_state` still load.
-    #[test]
-    fn sidecar_with_creation_state_still_loads() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let inst = test_inst(&cfg);
-        let record = sidecar(owner(), MachineName::generate(&owner()).unwrap());
-        let mut raw = serde_json::to_value(&record).unwrap();
-        raw["creation_state"] = "ready".into();
-        fs::write(MachineSidecar::path(&inst), raw.to_string()).unwrap();
-        assert_eq!(MachineSidecar::load(&inst).unwrap(), record);
-    }
-
-    /// Only a schema-1 record from this backend is legacy; a current record
-    /// or another backend's schema-1 record is not.
-    #[test]
-    fn legacy_machine_needs_old_schema_and_this_backend() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let inst = test_inst(&cfg);
-        for record in [
-            r#"{"schema_version":2,"backend":"apple-container","machine_id":"a","network_id":"b"}"#,
-            r#"{"schema_version":1,"backend":"lima","machine_id":"a","network_id":"b"}"#,
-        ] {
-            fs::write(MachineSidecar::path(&inst), record).unwrap();
-            assert_eq!(legacy_machine(&inst).unwrap(), None, "{record}");
-        }
-    }
-
-    /// Records from the retired `container machine` backend are refused with
-    /// an explanation, and `legacy_machine` names what they point at.
-    #[test]
-    fn schema_one_records_are_legacy() {
+    fn schema_one_records_are_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = test_cfg(tmp.path());
         let inst = test_inst(&cfg);
@@ -1226,12 +853,9 @@ mod tests {
         .unwrap();
         let err = MachineSidecar::try_load(&inst).unwrap_err();
         assert!(
-            format!("{err:#}").contains("retired `container machine` backend"),
+            format!("{err:#}").contains("has schema version 1 (the retired")
+                && format!("{err:#}").contains(&format!("Remove {} by hand", inst.dir.display())),
             "{err:#}"
-        );
-        assert_eq!(
-            legacy_machine(&inst).unwrap(),
-            Some(("coop-0a1b2c3d-1".into(), "coop-0a1b2c3d-1".into()))
         );
     }
 }

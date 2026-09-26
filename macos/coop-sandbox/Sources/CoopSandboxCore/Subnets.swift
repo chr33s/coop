@@ -23,10 +23,26 @@ public struct SubnetAllocator: Sendable {
     func locked<T>(_ body: (inout State) throws -> T) throws -> T {
         let lock = try FileLock.acquire(root.allocationLock, .exclusive)
         defer { withExtendedLifetime(lock) {} }
-        var state = (try? JSONDecoder.iso.decode(State.self, from: Data(contentsOf: root.subnetState))) ?? State()
+        var state = try loadState()
         let result = try body(&state)
         try JSONEncoder.pretty.encode(state).write(to: root.subnetState, options: .atomic)
         return result
+    }
+
+    /// A missing file is an empty quarantine. One that cannot be read is an
+    /// error: resetting it would hand out subnets vmnet still refuses.
+    func loadState() throws -> State {
+        let data: Data
+        do {
+            data = try Data(contentsOf: root.subnetState)
+        } catch CocoaError.fileReadNoSuchFile {
+            return State()
+        }
+        do {
+            return try JSONDecoder.iso.decode(State.self, from: data)
+        } catch {
+            throw SandboxError("unreadable subnet state \(root.subnetState.path) (\(error)); remove it to clear the quarantine")
+        }
     }
 
     static func prune(_ state: inout State, now: Date) {

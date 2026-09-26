@@ -57,8 +57,9 @@ impl InstanceState {
 
 /// Which VM backend is in use. Like [`backend::PlatformBackend`] and
 /// [`crate::secret_store::Backend`], the variants are `#[cfg]`-gated per
-/// OS — only the host's backend can ever be selected, so only its token
-/// (`"firecracker"` on Linux, `"lima"` on macOS) is ever serialized.
+/// OS and feature set — only this build's backend can ever be selected, so
+/// only its token (`"firecracker"` on Linux, `"lima"` on macOS, or
+/// `"apple-container"` with that feature) is ever serialized.
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum BackendKind {

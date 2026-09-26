@@ -19,7 +19,7 @@ it if it is killed, and nothing starts at login.
 
 ```bash
 scripts/build-coop-sandbox.sh [PREFIX]    # default ~/.local/opt/coop-sandbox
-swift test --package-path macos/coop-sandbox
+swift test --package-path macos/coop-sandbox --no-parallel
 ./tests/integration-apple-sandbox.sh      # boots real VMs; ~10 min
 ```
 
@@ -56,7 +56,8 @@ maintenance inspect                       the installed maintenance artifact, or
 logs ID [-n N] [--follow]                 serial console
 delete ID --owner O                       refuses another owner's sandbox
 reconcile                                 clear crashed owners, finish interrupted creates, deletes,
-                                          and disk updates (the sweep is skipped while an operation runs)
+                                          disk updates, and commits (the sweep is skipped while an
+                                          operation runs)
 ```
 
 Status is `running`, `booting` (owner up, control channel not yet answering),
@@ -96,7 +97,12 @@ never overwrites a newer one.
   `reconcile`) finishes an update whose disk was installed and discards one
   whose disk was not, so disk and record always describe the same update.
   Unreadable or contradictory staged state is an error, never a guess. This
-  covers process crashes, not sudden power loss.
+  covers process crashes, not sudden power loss. `commit` publishes a disk
+  and its metadata the same way (`disks/.pending-<name>.json`), so an
+  interrupted `commit --replace` keeps the old disk with its own metadata.
+- **Private state.** The state root and its directories are made 0700 and
+  owned by the running user (a symlinked or foreign-owned one is refused);
+  the binary runs with umask 077 and clones disks 0600.
 - **Serialization.** Every mutation of a sandbox (create, start, set, grow,
   commit, restore, delete) holds that sandbox's guard (`locks/sandbox-<id>.lock`)
   across its stopped check and its change; other sandboxes are unaffected. An

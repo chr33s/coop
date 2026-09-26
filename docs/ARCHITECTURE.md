@@ -10,7 +10,7 @@ start, shell, stop, destroy, status, logs — behind two platform backends:
   ([`macos/coop-sandbox`](../macos/coop-sandbox)), with the `apple-container`
   Cargo feature. See [`backends.md`](backends.md).
 
-This document maps the modules, the two-backend design, the data flow from host
+This document maps the modules, the backend design, the data flow from host
 to guest, and the architectural invariants. For the security view of the same
 system, see [`trust-model.md`](trust-model.md); for Rust conventions, see
 [`code-style.md`](code-style.md).
@@ -72,12 +72,12 @@ library. The credential proxy is a separate binary crate in the same Cargo
 workspace; `--workspace` builds and tests both crates. Plain `cargo build`
 and `cargo test` select only the root `coop` package.
 
-## The two-backend design
+## The backend design
 
 The central abstraction is the `backend::VmBackend` trait — every VM operation
 (`setup`, `create_and_start`, `start_existing`, `stop`, `destroy_instance`,
 `resize_disk`, `commit_disk`, `status`, `stream_logs`, `ssh_target`, …) goes
-through it. Two implementations exist:
+through it. Three implementations exist:
 
 - `FirecrackerBackend` — `#[cfg(not(target_os = "macos"))]`; delegates to
   `setup`, `vm::FirecrackerVm`, and `network`.
@@ -102,7 +102,7 @@ Everything above the trait is **backend-shared**: the entire "shared guest
 operations" surface in `backend.rs` (env/secret forwarding, agent bootstrap,
 Claude/Codex config injection, git-repo cloning), plus `workspace.rs`,
 `ssh.rs`, `config.rs`, and the `commands/` handlers. When you touch shared
-code, it must hold for **both** backends. Known intentional divergences:
+code, it must hold for **every** backend. Known intentional divergences:
 
 | Aspect | Firecracker | Lima |
 |--------|-------------|------|

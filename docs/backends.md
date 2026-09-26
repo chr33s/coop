@@ -2,7 +2,7 @@
 
 coop selects its VM backend at compile time. macOS builds use Lima. Linux builds use Firecracker. A macOS build with the opt-in `apple-container` feature uses coop-sandbox VMs on Apple's `containerization` package instead of Lima (see [macOS / Apple sandbox](#macos--apple-sandbox-opt-in)). The binary determines the backend; there is no runtime override.
 
-Both backends expose the same CLI commands and produce the same guest environment: Ubuntu with Docker, GitHub CLI, Claude Code, and Codex pre-installed. The backends differ in how they create and manage the VM underneath.
+All backends expose the same CLI commands and produce the same guest environment: Ubuntu with Docker, GitHub CLI, Claude Code, and Codex pre-installed. The backends differ in how they create and manage the VM underneath.
 
 ## macOS / Lima
 
@@ -63,7 +63,7 @@ Each instance is one Linux VM running systemd from its own ext4 disk, on its own
 - `coop-sandbox`, built with `scripts/build-coop-sandbox.sh` (Xcode with Swift 6.2+ required).
 - Stock Apple `container` 1.4.1 or later, with its service running (`container system start`). coop uses it only to **build** images (`container build`) and to supply the guest kernel it installs; instances never run on it. coop never starts, stops, or restarts that service.
 
-Binaries come from `[apple_container]` `binary` (coop-sandbox) and `builder` (`container`), or else fixed install locations: `~/.local/opt/coop-sandbox/bin/coop-sandbox`, `/usr/local/bin/coop-sandbox`, `/opt/homebrew/bin/coop-sandbox`, and `/usr/local/bin/container`, `/opt/homebrew/bin/container`. `PATH` and project files are never consulted, and a binary that is group/world-writable or owned by another user is rejected.
+Binaries come from `[apple_container]` `binary` (coop-sandbox) and `builder` (`container`), or else fixed install locations: `~/.local/opt/coop-sandbox/bin/coop-sandbox`, `/usr/local/bin/coop-sandbox`, `/opt/homebrew/bin/coop-sandbox`, and `/usr/local/bin/container`, `/opt/homebrew/bin/container`. `PATH` and project files are never consulted, and a binary that is group/world-writable or owned by neither you nor root is rejected, as is one under a directory that is owned by neither you nor root, world-writable without the sticky bit, or group-writable without the sticky bit unless its group is `wheel` or `admin` (Homebrew's prefix is `admin`-writable).
 
 Neither Lima nor host Docker is needed. Docker runs *inside* the guest.
 
@@ -73,13 +73,13 @@ Neither Lima nor host Docker is needed. Docker runs *inside* the guest.
 scripts/build-coop-sandbox.sh            # installs ~/.local/opt/coop-sandbox/bin/coop-sandbox
 ```
 
-It builds the Swift package in release mode, signs it ad hoc with its one entitlement (`com.apple.security.virtualization`), and installs it without `sudo`. Pass a different prefix as the first argument and set `[apple_container] binary` to match. Rebuild after pulling changes to `macos/coop-sandbox`; coop refuses a runtime whose protocol or `containerization` version differs from the one it was built for.
+It builds the Swift package in release mode, signs it ad hoc with the hardened runtime and its one entitlement (`com.apple.security.virtualization`), and installs it without `sudo`. It refuses an existing `bin/` that is owned by neither you nor root, world-writable, or group-writable by a group other than `wheel` or `admin`. Pass a different prefix as the first argument and set `[apple_container] binary` to match. Rebuild after pulling changes to `macos/coop-sandbox`; coop refuses a runtime whose protocol or `containerization` version differs from the one it was built for.
 
 ### Supported combinations
 
 | coop-sandbox | containerization | macOS | Hardware | Evidence |
 |---|---|---|---|---|
-| 0.2.0 (protocol 2) | 0.45.0 | 27.0 | Apple Silicon | [`tests/integration-apple-sandbox.sh`](../tests/integration-apple-sandbox.sh) (all phases, including maintenance install and same-sandbox races): 76 passed, 1 skipped by design ([run record](design/apple-sandbox-transactions.md#4-validation)); coop end to end not yet re-run |
+| 0.2.0 (protocol 2) | 0.45.0 | 27.0 | Apple Silicon | [`tests/integration-apple-sandbox.sh`](../tests/integration-apple-sandbox.sh) (all phases, including maintenance install, same-sandbox races, and the `coop` end-to-end phase): 103 passed, 1 skipped by design ([run record](design/apple-sandbox-transactions.md#4-validation)) |
 | 0.1.0 (protocol 1), refused since protocol 2 | 0.45.0 | 27.0 | Apple Silicon | [`tests/integration-apple-sandbox.sh`](../tests/integration-apple-sandbox.sh) (isolation, host exposure, canary, pinning, persistence, resources, growth, commit/restore, crash recovery, concurrency), coop `setup`/`up`/`exec`/`stop`/`resize`/`commit`/`restore`/`destroy` end to end |
 
 The runtime also pins its guest kernel by sha256 (`vmlinux-6.18.15-186`, the kernel `container` 1.4.1 installs) and its init image (`vminit:0.45.0` by digest). `coop setup` fails with `APPLE_RUNTIME_UNAVAILABLE` on any other kernel.
@@ -112,7 +112,7 @@ The feature build defaults to `~/.coop-apple` for its config file and data direc
 
 Control files are `0600`, directories `0700`. `uninstall --purge` destroys every instance, then removes all of `~/.coop-apple` when that is the data directory, and otherwise only `backends/apple-container-v1/`. Workspace copies always skip `.coop-apple/`. Editor `~/.ssh/config` entries use `coop-apple-<name>` aliases inside `# coop-apple START/END` markers, so the two builds never touch each other's entries. Because a default-build instance named `apple-<x>` has the same alias as this build's `<x>`, each build refuses to write an alias the other already manages. The data directory path may contain spaces (SSH options are quoted) but not quote or control characters.
 
-Instances created by the retired `container machine` backend (schema 1) are refused. `coop destroy` removes their local state and names the machine and network it leaves in the Apple Container runtime; delete those there.
+Instances created by the retired `container machine` backend (schema 1) are refused, including by `coop destroy`, `destroy --all`, and `uninstall --purge`. Remove such an instance's directory under `backends/apple-container-v1/instances/` by hand, and delete its machine and network in Apple `container` (`container machine delete`, `container network delete`).
 
 `coop update` is disabled in this build (`APPLE_UPDATE_VARIANT_UNSUPPORTED`): release artifacts carry only the Lima backend. Rebuild from source instead.
 
@@ -122,7 +122,7 @@ Instances created by the retired `container machine` backend (schema 1) are refu
 
 1. Checks the platform, resolves and qualifies coop-sandbox (`coop-sandbox version`: protocol 2, containerization 0.45.0), and creates `owner.json` and the VM-access key pair.
 2. Initializes the runtime root: copies the kernel after checking its pinned sha256, and pulls the pinned init image. Unless the runtime already has the current maintenance image, builds it (Ubuntu with e2fsprogs; log in `maintenance-build.log`), installs it with `coop-sandbox maintenance install`, and deletes the store copy.
-3. Renders a minimal build context in a private temporary directory: a Dockerfile `FROM ubuntu:24.04`, the same provisioning script Lima uses (packages, profiles, OCI features, guest user, Claude Code, Codex, Docker), and a machine-setup script. The context contains the coop **public** key only. There are no build arguments and no secrets.
+3. Renders a minimal build context in a private temporary directory: a Dockerfile `FROM ubuntu:24.04` pinned by digest, the same provisioning script Lima uses (packages, profiles, OCI features, guest user, Claude Code, Codex, Docker), and a machine-setup script. The context contains the coop **public** key only. There are no build arguments and no secrets.
 4. Checks that the builder's service is running, then runs `container build --platform linux/arm64 -t local/coop-<owner>:<hash>-<nonce>`, with output in `images/<name>/build.log`. Every build gets a fresh tag, so a rebuild never retags an image in use.
 5. Saves the image as an OCI archive, imports it into the runtime's private store, and deletes the builder's copy.
 6. Boots the image in a disposable sandbox with no credentials, passing the same isolation gate an instance does. It checks the required guest binaries and the guest user's uid (1000), and waits (up to `boot_timeout_seconds`) for `ssh` and `docker`. Then it stops and deletes the sandbox. The unpacked disk stays cached for the first `coop up`.
@@ -154,7 +154,7 @@ Every later `ssh_target` (shell, exec, agent launch, push/pull, editor) re-inspe
 
 Workspaces are always copied. `--mount` directories are synced once, as on Firecracker; use `coop push`/`coop pull`.
 
-Local model servers on host loopback reach the guest over a per-instance `ssh -R 127.0.0.1:<guest-port>:<host-addr>:<host-port>` tunnel. The forward goes to the exact loopback address the URL names. The guest port is the same as the host port, except that a privileged port (below 1024) moves to port + 40000, so `https://localhost` becomes `https://localhost:40443` in the guest. `localhost` and `127.0.0.1` URLs keep their host, so TLS names still verify. Other `127.x` addresses are rewritten to `127.0.0.1` for plain HTTP only. IPv6-loopback endpoints are rejected. Each bootstrap reconciles the tunnels for both agents: live tunnels are kept, tunnels the config no longer needs are closed, and two endpoints that need the same guest port with different destinations are an error.
+Local model servers on host loopback reach the guest over a per-instance `ssh -R 127.0.0.1:<guest-port>:<host-addr>:<host-port>` tunnel. The forward goes to the exact loopback address the URL names. The guest port is the same as the host port, except that a privileged port (below 1024) moves to port + 40000, so `https://localhost` becomes `https://localhost:40443` in the guest. `localhost` and `127.0.0.1` URLs keep their host, so TLS names still verify. Other `127.x` addresses are rewritten to `127.0.0.1` for plain HTTP only. IPv6-loopback endpoints are rejected. Every boot first closes the tunnels recorded for the previous boot. Each bootstrap then reconciles the tunnels for both agents: live tunnels are kept, tunnels the config no longer needs are closed, and two endpoints that need the same guest port with different destinations are an error.
 
 ### Resize, commit, restore
 
@@ -164,7 +164,7 @@ All three need the instance stopped.
 - **`coop resize --size`** grows the disk offline. The runtime clones the disk, extends it, and runs `e2fsck`/`resize2fs` in a short maintenance VM, with the instance's disk attached as data. It then publishes the grown disk and its new size as one recoverable update (a crash between the two is finished by the runtime's next operation on the sandbox), so this takes about a second. Shrinking is refused.
 - **Maintenance image.** Maintenance VMs boot their own small image (Ubuntu with e2fsprogs), which `coop setup` builds with the stock builder and installs into the runtime outside its image store, then removes from the store. It does not depend on any instance's image, so deleting or replacing images never affects growth or commits. `coop setup` reinstalls it when its recipe version changes.
 - **`coop commit --image <name>`** saves an APFS clone of the disk with its SSH host keys and machine-id removed. `coop up --image <name>` and `coop restore` then clone it, and every instance created from it generates its own identity.
-- **`coop restore`** swaps in a clone of a committed disk, or a fresh copy of a base image with `--reprovision`. It then grows the new disk back to the instance's size if that is larger. The operation is journaled: a restore interrupted by a crash is reconciled on the next `coop start` from the runtime's record, and it re-pins the host key only if the runtime's last committed operation is that restore (a higher disk generation alone is not enough, except for a restore journal written before operation ids).
+- **`coop restore`** swaps in a clone of a committed disk, or a fresh copy of a base image with `--reprovision`. It then grows the new disk back to the instance's size if that is larger. The operation is journaled: a restore interrupted by a crash is reconciled on the next `coop start` from the runtime's record, and it re-pins the host key only if the runtime's last committed operation is that restore (a higher disk generation alone is not enough).
 
 ### Stop, destroy, recovery
 
@@ -186,7 +186,7 @@ All three need the instance stopped.
 | `APPLE_IDENTITY_CONFLICT` | Ownership, name, image, resource, or boot identity mismatch. |
 | `APPLE_HOST_KEY_CHANGED` | Missing or changed pinned host key. |
 | `APPLE_BOOT_TIMEOUT` | Boot or readiness failed or exceeded its deadline, or no valid host key appeared in time; the error includes the last lines of the console log. Disk and journal are kept. |
-| `APPLE_OPERATION_UNCERTAIN` | Timed-out or cancelled runtime call, unconfirmed stop, a booting or crashed sandbox, or an unfinished journal; reconciled on retry. |
+| `APPLE_OPERATION_UNCERTAIN` | Timed-out or cancelled runtime call, unconfirmed stop, a booting or crashed sandbox, or an unfinished journal; reconciled on retry. `coop list` shows a crashed sandbox as stopped, since `coop start` accepts it. |
 
 `coop logs` (snapshot and `--follow`) replaces control characters in the guest's console output before printing it.
 
@@ -194,14 +194,14 @@ Runtime and builder commands run with a cleared environment: only `HOME`, `USER`
 
 ### Validation status
 
-Validated on macOS 27.0 (Apple M5 Max) with coop-sandbox 0.1.0 and containerization 0.45.0. Runtime 0.2.0 has re-run only the runtime suite; see the table above.
+Validated on macOS 27.0 (Apple M5 Max) with coop-sandbox 0.1.0 and containerization 0.45.0. Runtime 0.2.0 has re-run the runtime suite and the `coop` phase; see the table above.
 
 - **Runtime ([`tests/integration-apple-sandbox.sh`](../tests/integration-apple-sandbox.sh); the selection experiment is in [`design/apple-sandbox-runtime.md`](design/apple-sandbox-runtime.md)):**
   - Peer isolation: a root guest cannot reach another sandbox by TCP, UDP, or ICMP over IPv4 or IPv6. That holds with forged on-link routes, static neighbour entries, spoofed source addresses, and broadcast/multicast, and after restarts; the host reaches each listener as the positive control.
   - Host exposure: no mounts, agent sockets, host canary file, or host vsock listeners reach the guest, and a canary secret never reaches the runtime, its logs, the image, or the guest.
   - Identity and lifecycle: pinned SSH over the native channel; 20 stop/start cycles with no loss of data or identity; CPU/memory changes, disk growth, and commit/restore.
   - Recovery and scale: every crash-injection scenario ends in a known state, and 1/4/8 concurrent sandboxes each get their own address and subnet.
-- **coop end to end:** `setup` (build, import, verification), `up` with an explicit disk, `exec`, `status`, `logs`, `stop`/`start`, `resize --size/--mem/--vcpus`, `commit`, `restore` with host-key re-pinning, `up --image` from a committed image with a fresh identity, rejection of a guest-changed host key, `destroy`, and image deletion releasing the runtime's disks.
+- **coop end to end:** the suite's `coop` phase covers `setup` (build, import, verification), `up`, `exec`, `status`, `stop`/`start`, `resize --size/--mem/--vcpus`, rollback of a failed `resize --start`, `commit`, `restore` with host-key re-pinning, `destroy`, and image deletion. Run by hand on 0.1.0 only: `up` with an explicit disk, `logs`, `up --image` from a committed image with a fresh identity, and rejection of a guest-changed host key.
 
 Not covered: other macOS releases or kernels, and live-provider API calls.
 

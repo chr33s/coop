@@ -218,7 +218,9 @@ pub fn stop(inst: &Instance) {
 ///
 /// A tunnel that is still alive and was opened for the same SSH target and
 /// destination is kept, so re-running bootstrap never rebinds a guest port
-/// while the old listener may still hold it. Tunnels no longer wanted — local
+/// while the old listener may still hold it. The spec does not identify the
+/// guest's boot, so callers that just booted the guest must first close every
+/// recorded tunnel with [`stop_model_tunnels`]. Tunnels no longer wanted — local
 /// mode switched off, or an endpoint moved — are closed. Fails closed: a
 /// forward the guest does not acknowledge aborts the bootstrap before any URL
 /// depending on it is published.
@@ -227,19 +229,22 @@ pub fn sync_model_tunnels(
     target: &SshTarget,
     wanted: &std::collections::BTreeMap<u16, crate::backend::ReverseTunnel>,
 ) -> Result<()> {
+    let mut kept = std::collections::BTreeSet::new();
     for port in recorded_model_tunnels(inst) {
         let keep = wanted
             .get(&port)
             .is_some_and(|&t| model_tunnel_is_current(inst, port, &model_tunnel_spec(target, t)));
-        if !keep {
+        if keep {
+            kept.insert(port);
+        } else {
             stop_model_tunnel(inst, port);
         }
     }
     for (&port, tunnel) in wanted {
-        let spec = model_tunnel_spec(target, *tunnel);
-        if model_tunnel_is_current(inst, port, &spec) {
+        if kept.contains(&port) {
             continue;
         }
+        let spec = model_tunnel_spec(target, *tunnel);
         let name = model_tunnel_name(port);
         spawn_reverse_forward_to(
             inst,
@@ -352,7 +357,7 @@ fn recorded_model_tunnels(inst: &Instance) -> Vec<u16> {
 }
 
 /// Kill every local-model tunnel recorded for `inst`.
-fn stop_model_tunnels(inst: &Instance) {
+pub fn stop_model_tunnels(inst: &Instance) {
     for port in recorded_model_tunnels(inst) {
         stop_model_tunnel(inst, port);
     }
@@ -533,7 +538,6 @@ fn spawn_reverse_forward_to(
     host_addr: std::net::Ipv4Addr,
     host_port: u16,
 ) -> Result<()> {
-    let port = guest_port;
     kill_pid_file(&fwd_pid_path(inst, name), "stale proxy tunnel");
 
     let control_dir = create_tunnel_control_dir()?;
@@ -599,7 +603,7 @@ fn spawn_reverse_forward_to(
             "-O".into(),
             "forward".into(),
             "-R".into(),
-            format!("127.0.0.1:{port}:{host_addr}:{host_port}"),
+            format!("127.0.0.1:{guest_port}:{host_addr}:{host_port}"),
         ]);
         forward_args.push(target.addr());
         let request = Command::new("ssh")
@@ -850,6 +854,36 @@ mod tests {
         assert_eq!(model_tunnel_pid(&inst, 8000), None);
         stop_model_tunnel(&inst, 8000);
         assert!(!fwd_pid_path(&inst, &model_tunnel_name(8000)).exists());
+    }
+
+    #[test]
+    fn stop_model_tunnels_clears_every_recorded_tunnel() {
+        // The post-boot teardown in `bootstrap_and_post_start`: tunnels a
+        // previous boot recorded must not survive to pass as current.
+        let tmp = tempfile::tempdir().unwrap();
+        let inst = Instance {
+            name: InstanceName::new("t").unwrap(),
+            index: InstanceIndex::new(0).unwrap(),
+            dir: tmp.path().to_path_buf(),
+            image: ImageName::new("default").unwrap(),
+        };
+        for port in [8000, 40443] {
+            fs::write(fwd_pid_path(&inst, &model_tunnel_name(port)), "0").unwrap();
+            fs::write(model_spec_path(&inst, port), "spec").unwrap();
+        }
+        let provider_pid = fwd_pid_path(&inst, Provider::Anthropic.name());
+        fs::write(&provider_pid, "0").unwrap();
+
+        stop_model_tunnels(&inst);
+
+        assert!(recorded_model_tunnels(&inst).is_empty());
+        for port in [8000, 40443] {
+            assert!(!model_spec_path(&inst, port).exists());
+        }
+        assert!(
+            provider_pid.exists(),
+            "provider proxies are not model tunnels"
+        );
     }
 
     #[test]

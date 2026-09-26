@@ -1118,7 +1118,7 @@ fn ssh_config_block(target: &SshTarget, inst: &Instance) -> String {
         target.host,
         target.port,
         target.user,
-        target.key_path.display(),
+        crate::backend::quote_ssh_value(&target.key_path.to_string_lossy()),
     )
 }
 
@@ -1401,9 +1401,7 @@ fn launch_editor(
 #[expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
-
     use crate::config::{ImageName, InstanceIndex, InstanceName};
-
     use proptest::prelude::*;
 
     #[test]
@@ -2065,6 +2063,21 @@ Host coop-app\n\
         assert!(block.contains("IdentityFile /tmp/key"));
         assert!(block.contains("StrictHostKeyChecking no"));
         assert!(block.contains("UserKnownHostsFile /dev/null"));
+    }
+
+    #[test]
+    fn ssh_config_block_quotes_identity_file_with_space() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inst = temp_instance(dir.path());
+        let target = SshTarget {
+            key_path: PathBuf::from("/Users/me/my data/vm_key"),
+            ..fake_ssh_target()
+        };
+        let block = ssh_config_block(&target, &inst);
+        assert!(
+            block.contains("IdentityFile \"/Users/me/my data/vm_key\"\n"),
+            "{block}"
+        );
     }
 
     #[test]

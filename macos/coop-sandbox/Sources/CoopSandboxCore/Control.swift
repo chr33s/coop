@@ -60,6 +60,10 @@ public struct EffectiveConfig: Codable, Sendable {
 }
 
 public enum ControlSocket {
+    /// Largest request line an owner reads; bounds its memory per
+    /// connection. `exec -i` stdin travels inside the request.
+    public static let maxRequestBytes = 8 << 20
+
     static func prepareDirectory(for path: URL) throws {
         let dir = path.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -130,9 +134,16 @@ public enum ControlSocket {
                 let handle = FileHandle(fileDescriptor: conn, closeOnDealloc: true)
                 Task.detached {
                     let response: ControlResponse
-                    if let line = readLine(handle), let request = try? JSONDecoder().decode(ControlRequest.self, from: line) {
-                        response = await handler(request)
-                    } else {
+                    switch readLine(handle, limit: maxRequestBytes) {
+                    case .line(let line):
+                        if let request = try? JSONDecoder().decode(ControlRequest.self, from: line) {
+                            response = await handler(request)
+                        } else {
+                            response = ControlResponse(ok: false, error: "malformed request")
+                        }
+                    case .tooLong:
+                        response = ControlResponse(ok: false, error: "request exceeds \(maxRequestBytes) bytes")
+                    case .closed:
                         response = ControlResponse(ok: false, error: "malformed request")
                     }
                     var out = (try? JSONEncoder().encode(response)) ?? Data()
@@ -163,26 +174,39 @@ public enum ControlSocket {
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         guard rc == 0 else { throw SandboxError("not running (connect \(path.path): errno \(errno))") }
         var data = try JSONEncoder().encode(request)
+        guard data.count <= maxRequestBytes else {
+            throw SandboxError("request is \(data.count) bytes; the limit is \(maxRequestBytes) (is exec stdin too large?)")
+        }
         data.append(0x0A)
         try handle.write(contentsOf: data)
-        guard let line = readLine(handle) else { throw SandboxError("owner closed the connection or did not reply in time") }
+        guard case .line(let line) = readLine(handle, limit: nil) else {
+            throw SandboxError("owner closed the connection or did not reply in time")
+        }
         return try JSONDecoder().decode(ControlResponse.self, from: line)
     }
 
-    /// Reads one request/response line. `FileHandle.read(upToCount:)` blocks
-    /// until the full count arrives, so read(2) directly.
-    private static func readLine(_ handle: FileHandle) -> Data? {
+    enum ReadResult: Equatable {
+        case line(Data)
+        /// The peer sent more than the limit without a newline.
+        case tooLong
+        /// End of stream, an error, or a timeout, before any byte.
+        case closed
+    }
+
+    /// Reads one request/response line of at most `limit` bytes (excluding
+    /// the newline). `FileHandle.read(upToCount:)` blocks until the full
+    /// count arrives, so read(2) directly.
+    static func readLine(_ handle: FileHandle, limit: Int?) -> ReadResult {
         var buffer = Data()
         var chunk = [UInt8](repeating: 0, count: 65536)
         while true {
             let n = read(handle.fileDescriptor, &chunk, chunk.count)
             if n < 0, errno == EINTR { continue }
-            guard n > 0 else { return buffer.isEmpty ? nil : buffer }
-            if let nl = chunk[0..<n].firstIndex(of: 0x0A) {
-                buffer.append(contentsOf: chunk[0..<nl])
-                return buffer
-            }
-            buffer.append(contentsOf: chunk[0..<n])
+            guard n > 0 else { return buffer.isEmpty ? .closed : .line(buffer) }
+            let end = chunk[0..<n].firstIndex(of: 0x0A) ?? n
+            if let limit, buffer.count + end > limit { return .tooLong }
+            buffer.append(contentsOf: chunk[0..<end])
+            if end < n { return .line(buffer) }
         }
     }
 }

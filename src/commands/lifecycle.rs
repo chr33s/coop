@@ -1207,8 +1207,7 @@ fn start_instance(
     // An explicit disk size is a request, not a default: reject it before any
     // VM cost on a backend that cannot honour it rather than dropping it.
     if opts.disk.is_some() {
-        be.capabilities()
-            .require(be, backend::Capability::DiskResize)?;
+        be.require(backend::Capability::DiskResize)?;
     }
 
     // Derive the GitHub repo slug as early as possible so the auto-prompt
@@ -1588,6 +1587,10 @@ fn bootstrap_and_post_start(
     opts: &StartOpts<'_>,
     mode: backend::BootMode,
 ) -> Result<()> {
+    // The guest just booted, so a recorded local-model tunnel belongs to an
+    // earlier boot (a crash skips `cmd_stop`). Its ssh can outlive that boot
+    // and would otherwise pass as current while this guest has no listener.
+    proxy::stop_model_tunnels(inst);
     let post_start = opts.post_start_override.or(cfg.post_start.as_deref());
     let proxy_configured =
         proxy_state::effective_upstream(inst, proxy::Provider::Anthropic, &cfg.proxy)?.is_some()
@@ -1780,9 +1783,8 @@ pub(crate) fn cmd_stop(
     // backend to stop something that was actually running.
     // A failed probe is not "not running": reporting the instance stopped
     // while it may still be up would leave its agent running unnoticed.
-    // Backends that can stop a machine without a guest connection get one
-    // more chance via `stop_unproven`; the credential proxy is torn down
-    // either way.
+    // The backend gets one more chance via its control-plane
+    // `stop_unproven`; the credential proxy is torn down either way.
     let probe = match be.as_running(cfg, inst.clone()) {
         Ok(probe) => probe,
         Err(probe_err) => {
@@ -1901,14 +1903,14 @@ fn instance_status<'a>(
     cfg: &config::CoopConfig,
     inst: &'a config::Instance,
 ) -> Result<json::InstanceStatus<'a>> {
-    let (state, usage) = match be.as_running(cfg, inst.clone())? {
-        Some(running) => (
-            json::InstanceState::Running,
-            backend::query_resource_usage(running.target()),
-        ),
-        None => (json::InstanceState::Stopped, None),
-    };
-    Ok(status_record(be, inst, state, usage))
+    if let Some(running) = be.as_running(cfg, inst.clone())? {
+        let usage = backend::query_resource_usage(running.target());
+        return Ok(status_record(be, inst, json::InstanceState::Running, usage));
+    }
+    // `as_running` may read an unconfirmed state (Lima's `Broken`) as not
+    // running; ask the probe `coop list` uses, so both agree.
+    be.probe_running(inst)?;
+    Ok(status_record(be, inst, json::InstanceState::Stopped, None))
 }
 
 fn status_record<'a>(
@@ -2020,12 +2022,10 @@ pub(crate) fn cmd_resize(
     // Checked before the stopped-state probe so an unsupported request has no
     // side effects and never reaches `disk_path`.
     if opts.disk.is_some() {
-        be.capabilities()
-            .require(be, backend::Capability::DiskResize)?;
+        be.require(backend::Capability::DiskResize)?;
     }
     if opts.mem.is_some() || opts.vcpus.is_some() {
-        be.capabilities()
-            .require(be, backend::Capability::MachineResources)?;
+        be.require(backend::Capability::MachineResources)?;
     }
 
     let inst = cfg.resolve_instance(opts.name)?;
@@ -2061,8 +2061,7 @@ pub(crate) fn cmd_commit(
     image: &config::ImageName,
     force: bool,
 ) -> Result<()> {
-    be.capabilities()
-        .require(be, backend::Capability::DiskSnapshots)?;
+    be.require(backend::Capability::DiskSnapshots)?;
     let inst = cfg.resolve_instance(name)?;
     let source_image = inst.image.clone();
 
@@ -2161,8 +2160,7 @@ pub(crate) fn cmd_restore(
 ) -> Result<()> {
     // Both modes replace the disk; reject before the reprovision prompt,
     // the stop, or any metadata write.
-    be.capabilities()
-        .require(be, backend::Capability::DiskSnapshots)?;
+    be.require(backend::Capability::DiskSnapshots)?;
     let image = match &opts.mode {
         RestoreMode::Reprovision(reprovision) => {
             return reprovision_instance(be, cfg, opts.name, reprovision);
@@ -2296,7 +2294,8 @@ fn reprovision_instance(
     // `proxy::stop` (the guest's copy of the capability token dies with the
     // disk; the first-boot bootstrap reissues it).
     //
-    // A failed `as_running` probe aborts here, before anything is changed; the
+    // A failed `as_running` probe falls back to the backend's control-plane
+    // stop; if that fails too, this aborts before the disk is touched. The
     // `as_stopped` proof below is what actually gates the disk swap.
     cmd_stop(be, cfg, &inst)?;
 

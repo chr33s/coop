@@ -558,6 +558,32 @@ pub fn is_running(inst: &Instance) -> bool {
     lima_state(&inst.name).is_some_and(|s| s.is_running())
 }
 
+/// Like [`is_running`], but a failed `limactl` query is an error rather
+/// than "not running". A VM that a successful listing does not contain is
+/// confirmed not running; a `Broken` or unrecognized status is an error,
+/// since it confirms neither.
+pub fn probe_running(inst: &Instance) -> Result<bool> {
+    let Some(info) = find_limactl_entry(&lima_name_for(&inst.name))? else {
+        return Ok(false);
+    };
+    let status = info["status"]
+        .as_str()
+        .context("limactl reported no status")?;
+    running_from_state(&LimaState::from_status_str(status))
+}
+
+/// Whether a Lima status confirms the VM running (`Ok(true)`) or stopped
+/// (`Ok(false)`); any other status is an error.
+fn running_from_state(state: &LimaState) -> Result<bool> {
+    match state {
+        LimaState::Running => Ok(true),
+        LimaState::Stopped => Ok(false),
+        LimaState::Broken | LimaState::Unknown(_) => {
+            bail!("Lima reports the VM as {state}; its running state is unknown")
+        }
+    }
+}
+
 /// Get a human-readable status string.
 pub fn status(cfg: &CoopConfig, inst: &Instance) -> Result<String> {
     let info = limactl_info(&inst.name)?;
@@ -1854,6 +1880,13 @@ fn limactl_info(name: &InstanceName) -> Result<serde_json::Value> {
 /// Find a `limactl list --json` entry by its Lima VM name (the
 /// `coop-<instance>` form, or the special `coop-builder`).
 fn limactl_list_entry(lima_name: &str) -> Result<serde_json::Value> {
+    find_limactl_entry(lima_name)?
+        .with_context(|| format!("Lima instance '{lima_name}' not found in limactl list"))
+}
+
+/// [`limactl_list_entry`], with `Ok(None)` when the listing succeeded but has
+/// no VM named `lima_name`.
+fn find_limactl_entry(lima_name: &str) -> Result<Option<serde_json::Value>> {
     let output = Command::new("limactl")
         .args(["list", "--json"])
         .output()
@@ -1877,11 +1910,11 @@ fn limactl_list_entry(lima_name: &str) -> Result<serde_json::Value> {
             )
         })?;
         if val["name"].as_str() == Some(lima_name) {
-            return Ok(val);
+            return Ok(Some(val));
         }
     }
 
-    bail!("Lima instance '{lima_name}' not found in limactl list")
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -2329,6 +2362,14 @@ Host h
             LimaState::from_status_str("Restarting"),
             LimaState::Unknown("Restarting".to_string()),
         );
+    }
+
+    #[test]
+    fn only_running_or_stopped_is_a_confirmed_state() {
+        assert!(running_from_state(&LimaState::Running).unwrap());
+        assert!(!running_from_state(&LimaState::Stopped).unwrap());
+        assert!(running_from_state(&LimaState::Broken).is_err());
+        assert!(running_from_state(&LimaState::Unknown("Restarting".into())).is_err());
     }
 
     #[test]

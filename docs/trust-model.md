@@ -386,11 +386,8 @@ exposure, and coop verifies the effective configuration anyway
   `coop restore`: coop replaced the disk itself, and the restore removed the
   host keys. That path is journaled with an operation id. After a crash, the
   runtime's record must show both a higher disk generation and that
-  operation as its last committed one before the flag is set. The one
-  exception: a restore journal written before operation ids (a crash under
-  an earlier build) falls back to the generation check alone. It is still
-  coop's own journaled restore, never something the guest can cause. Flag
-  any other path that re-enrolls.
+  operation as its last committed one before the flag is set. Flag any other
+  path that re-enrolls.
 - **Runtime subprocesses** get a cleared environment. Only `HOME`, `USER`,
   `LOGNAME`, `TMPDIR`, locale, and a fixed `PATH` are passed (`cli.rs`), so
   `SSH_AUTH_SOCK`, provider and GitHub tokens, `DYLD_*`, and `CONTAINER_*`
@@ -399,14 +396,25 @@ exposure, and coop verifies the effective configuration anyway
   Output is size-bounded and deadline-bound. A timeout means the outcome is
   uncertain, not that the operation failed. Only builds, creates, and boots
   honour Ctrl-C; stop/delete/cleanup never do.
-- **Runtime binaries** come from config or fixed install paths, never from
-  `PATH`. They must be host-owned and not writable by others, and they must not
-  be project-local.
+- **Runtime binaries** are resolved only from the user's config or fixed
+  install paths, never from `PATH` or project files. After symlinks are
+  resolved, the binary must be a regular executable file owned by the user or
+  root and not group- or world-writable. Every ancestor directory must also be
+  owned by the user or root, and must not be world-writable unless it is
+  sticky, nor group-writable unless it is sticky or its group is `wheel` or
+  `admin` (whose members can already use sudo; Homebrew's prefix is
+  `admin`-writable). The check reads mode bits only; an ACL that grants
+  others write access is not detected. `scripts/build-coop-sandbox.sh` signs the runtime with the
+  hardened runtime and refuses an install `bin/` that is owned by neither
+  you nor root, world-writable, or group-writable by a group other than
+  `wheel` or `admin`. The runtime runs with umask `077`
+  and keeps its state directories `0700` and disk files `0600`.
 - **Guest-controlled text** that coop displays (host-key comments,
   runtime/guest error text, console-log excerpts, and `coop logs` in both
   snapshot and `--follow` mode) has its control characters replaced first.
 - **Local-model tunnels** (`proxy::sync_model_tunnels`) are reconciled on
-  every bootstrap. A tunnel the current model config no longer needs is
+  every bootstrap, and every boot first closes those recorded for the
+  previous boot. A tunnel the current model config no longer needs is
   closed, so switching local mode off really removes the guest's path to the
   host server. Tunnel PIDs are only trusted or signalled while `ps` still
   reports them as an `ssh` process.
@@ -432,7 +440,7 @@ exposure, and coop verifies the effective configuration anyway
   machine-id rather than following it. Disk growth runs the same way.
   Maintenance VMs have no network, and whatever they run stays inside that VM.
 - **The maintenance image** is built by `coop setup` like the instance image
-  (stock builder, the same pinned-by-tag Ubuntu base and apt, so no new
+  (stock builder, the same digest-pinned Ubuntu base and apt, so no new
   outbound URL), from a fixed recipe with no build context beyond its
   Dockerfile: Ubuntu plus e2fsprogs. The runtime unpacks it into its own
   `maintenance/` directory, records its version and digest, checks that it

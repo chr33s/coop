@@ -89,9 +89,25 @@ public struct SandboxRoot: Sendable {
         }
     }
 
+    /// Creates the state directories and makes each private: a real
+    /// directory (not a symlink) owned by this user, mode 0700. One that
+    /// already existed with a wider mode is narrowed; one owned by another
+    /// user, or a symlink, is refused.
     public func createDirectories() throws {
         for dir in [root, sandboxes, bases, disks, locks, maintenance] {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try Self.makePrivate(dir)
+        }
+    }
+
+    static func makePrivate(_ dir: URL) throws {
+        var st = stat()
+        guard lstat(dir.path, &st) == 0 else { throw SandboxError("lstat \(dir.path): errno \(errno)") }
+        guard (st.st_mode & S_IFMT) == S_IFDIR, st.st_uid == getuid() else {
+            throw SandboxError("state directory \(dir.path) is not a directory owned by this user")
+        }
+        if (st.st_mode & 0o7777) != 0o700, chmod(dir.path, 0o700) != 0 {
+            throw SandboxError("chmod \(dir.path): errno \(errno)")
         }
     }
 }
@@ -416,10 +432,13 @@ public enum OperationLock {
     }
 }
 
+/// Clones `from` to `to`, owner-only: clonefile(2) copies the source's
+/// mode, which the process umask does not narrow.
 public func clone(_ from: URL, to: URL) throws {
     guard clonefile(from.path, to.path, 0) == 0 else {
         throw SandboxError("clonefile \(from.lastPathComponent) -> \(to.lastPathComponent): errno \(errno)")
     }
+    guard chmod(to.path, 0o600) == 0 else { throw SandboxError("chmod \(to.lastPathComponent): errno \(errno)") }
 }
 
 public func printJSON<T: Encodable>(_ value: T) throws {

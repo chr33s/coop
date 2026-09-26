@@ -6,8 +6,9 @@ start, shell, stop, destroy, status, logs — behind two platform backends:
 
 - **Linux** — Firecracker microVMs on KVM.
 - **macOS** — Lima VMs on Apple Virtualization.framework (`limactl`).
-- **macOS, opt-in** — Apple Container machines (`container machine`), with
-  the `apple-container` Cargo feature. See [`backends.md`](backends.md).
+- **macOS, opt-in** — `coop-sandbox` VMs on `apple/containerization`
+  ([`macos/coop-sandbox`](../macos/coop-sandbox)), with the `apple-container`
+  Cargo feature. See [`backends.md`](backends.md).
 
 This document maps the modules, the two-backend design, the data flow from host
 to guest, and the architectural invariants. For the security view of the same
@@ -24,7 +25,7 @@ coop/
 │   ├── backend.rs          # VmBackend trait, PlatformBackend alias, shared guest ops
 │   ├── vm.rs               # Firecracker process management (typestate machine)
 │   ├── lima.rs             # macOS/Lima backend implementation
-│   ├── apple_container/    # opt-in macOS Apple Container backend (feature `apple-container`)
+│   ├── apple_container/    # opt-in macOS coop-sandbox backend (feature `apple-container`)
 │   ├── setup.rs            # Firecracker host setup + golden-image builder
 │   ├── network.rs          # Firecracker TAP/bridge/NAT networking
 │   ├── config.rs           # config model + loading (the type-safe core)
@@ -82,7 +83,8 @@ through it. Two implementations exist:
   `setup`, `vm::FirecrackerVm`, and `network`.
 - `LimaBackend` — `#[cfg(target_os = "macos")]`; delegates to `lima`.
 - `AppleContainerBackend` — `#[cfg(all(target_os = "macos", feature =
-  "apple-container"))]`; `src/apple_container/`. It replaces Lima as the macOS
+  "apple-container"))]`; `src/apple_container/`, driving the Swift runtime in
+  `macos/coop-sandbox/` over its JSON CLI. It replaces Lima as the macOS
   `PlatformBackend` only when the feature is enabled.
 
 **Backend selection is compile-time, not runtime.** `backend::PlatformBackend`

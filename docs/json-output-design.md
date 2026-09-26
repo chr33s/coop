@@ -276,7 +276,7 @@ pub(crate) struct ImageInfo<'a> {
     pub name: &'a config::ImageName,
     pub profiles: Vec<String>,     // String: profile names are plain String in the domain
     pub created: Option<&'a str>,  // None where the human path prints "unknown"
-    pub size_bytes: Option<u64>,   // raw bytes; null when images live in a runtime store (Apple Container)
+    pub size_bytes: Option<u64>,   // raw bytes; null when images live in a runtime store (Apple sandbox)
 }
 ```
 

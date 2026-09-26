@@ -1,12 +1,22 @@
 # Coop Apple Container Backend — Implementation Specification
 
-**Document ID:** COOP-APPLE-001  
-**Version:** 0.1.0  
-**Date:** 2026-09-25  
-**Status:** Implemented; qualified on `1.4.1+coop.83b256f` / macOS 27 (§17.3). Firecracker default-backend regression pending  
-**Target repository:** `trailofbits/coop`  
-**Coop source baseline:** `338228c44977ed4c408ae7c83d79f2e03f60693c`  
-**Apple source baseline:** `apple/container` tag `1.4.1`  
+> **Superseded.** This specification describes the `container machine`
+> backend built on the `vendor/container` fork. That runtime was retired in
+> favour of coop-sandbox on `apple/containerization`
+> ([`macos/coop-sandbox`](../../macos/coop-sandbox)); see
+> [`docs/backends.md`](../backends.md) for the current backend and
+> [`apple-sandbox-runtime.md`](apple-sandbox-runtime.md)
+> for the decision. The trust boundaries, journal, and pinning described here
+> carried over; the runtime interface, network model, and disk capabilities did
+> not.
+
+**Document ID:** COOP-APPLE-001\
+**Version:** 0.1.0\
+**Date:** 2026-09-25\
+**Status:** Implemented; qualified on `1.4.1+coop.83b256f` / macOS 27 (§17.3). Firecracker default-backend regression pending\
+**Target repository:** `trailofbits/coop`\
+**Coop source baseline:** `338228c44977ed4c408ae7c83d79f2e03f60693c`\
+**Apple source baseline:** `apple/container` tag `1.4.1`\
 **Delivery model:** Opt-in, compile-time macOS backend; Lima remains the default
 
 ## 1. Decision and implementation boundary
@@ -587,7 +597,7 @@ These are dependency-ordered deliverables, not calendar estimates. Mark completi
 
 ### WP-0 — Baseline and contract harness
 
-**Dependencies:** None.  
+**Dependencies:** None.\
 **Deliverables:** Pin source revisions; capture real 1.4.1 machine create/run/inspect/list/log/resource behavior; document JSON fixtures, name constraints, units, timeout/error behavior, and required extension fields.
 
 - [ ] Build and test the unchanged Coop baseline on macOS and Linux.
@@ -599,7 +609,7 @@ These are dependency-ordered deliverables, not calendar estimates. Mark completi
 
 ### WP-1 — Apple security prerequisite
 
-**Dependencies:** WP-0.  
+**Dependencies:** WP-0.\
 **Deliverables:** Reviewed runtime patch, exact build identity, serialization/API tests, dedicated-network and agent-disable support.
 
 - [x] Implement all Section 7 extension points without changing unrelated default behavior.
@@ -611,7 +621,7 @@ These are dependency-ordered deliverables, not calendar estimates. Mark completi
 
 ### WP-2 — Backend skeleton, ownership, and capabilities
 
-**Dependencies:** WP-0; may proceed while WP-1 is under review.  
+**Dependencies:** WP-0; may proceed while WP-1 is under review.\
 **Deliverables:** Cargo selection, CLI adapter, parsers, capability errors, backend data namespace, typed manifests/journals, ownership-safe cleanup.
 
 - [x] Default macOS/Linux builds remain unchanged.
@@ -623,7 +633,7 @@ These are dependency-ordered deliverables, not calendar estimates. Mark completi
 
 ### WP-3 — Image and secure lifecycle
 
-**Dependencies:** WP-1 and WP-2 for real-runtime secure tests.  
+**Dependencies:** WP-1 and WP-2 for real-runtime secure tests.\
 **Deliverables:** OCI builder, image manifests, configured guest account, secure creation/restart, host-key enrollment, stop/destroy, resource changes.
 
 - [x] Required binaries/services verified in a disposable machine.
@@ -635,7 +645,7 @@ These are dependency-ordered deliverables, not calendar estimates. Mark completi
 
 ### WP-4 — Shared product integration
 
-**Dependencies:** WP-3.  
+**Dependencies:** WP-3.\
 **Deliverables:** Workspaces, agents, proxy, editor SSH, local-model endpoint plans, status/logs, profile/quickstart compatibility, updater protection.
 
 - [x] No whole-home mount or unrestricted agent-config copy is introduced.
@@ -647,7 +657,7 @@ These are dependency-ordered deliverables, not calendar estimates. Mark completi
 
 ### WP-5 — Qualification and release
 
-**Dependencies:** WP-1 through WP-4.  
+**Dependencies:** WP-1 through WP-4.\
 **Deliverables:** Security review, real-hardware CI, source/build provenance, support matrix, operational docs, rollback evidence, benchmark report.
 
 - [ ] Run the complete acceptance suite and all default-backend regression checks.

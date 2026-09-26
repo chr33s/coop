@@ -416,7 +416,7 @@ coop destroy --all
 
 ### `list`
 
-Print every instance with its state: `running`, `stopped`, or `unknown` when the backend cannot determine it (shown with a warning, for example an Apple Container instance with an unfinished operation). It never connects to a guest over SSH, so it returns quickly even when VMs are unreachable; Lima and Firecracker read local state, and Apple Container asks the runtime (`machine inspect`). Use `status` instead when you need resource usage or per-instance detail.
+Print every instance with its state: `running`, `stopped`, or `unknown` when the backend cannot determine it (shown with a warning, for example an Apple sandbox instance with an unfinished operation). It never connects to a guest over SSH, so it returns quickly even when VMs are unreachable; Lima and Firecracker read local state, and the Apple sandbox backend asks the runtime (`coop-sandbox inspect`). Use `status` instead when you need resource usage or per-instance detail.
 
 ```
 coop list
@@ -689,7 +689,7 @@ Linux/Firecracker the host and port are stable, so the refresh is a no-op.
 On Lima and Firecracker the block sets `StrictHostKeyChecking no` and
 `UserKnownHostsFile /dev/null`, so `ssh coop-*` connections skip host-key
 verification. This is intentional — these VMs regenerate their host keys, so
-pinning them would only produce spurious mismatch warnings. The Apple Container
+pinning them would only produce spurious mismatch warnings. The Apple sandbox
 backend instead pins each guest's host key: its `coop-apple-*` block sets
 `StrictHostKeyChecking yes` with the instance's own `known_hosts`, plus
 `ForwardAgent no` and `IdentityAgent none`, and a changed key is refused.
@@ -718,7 +718,7 @@ coop images --delete old-image
 With `--json`, each element is `{ "name", "profiles", "created", "size_bytes" }`.
 Absence is modelled honestly: `profiles` is `[]` (not `"none"`), `created` is
 `null` (not `"unknown"`), and `size_bytes` is the raw byte count (the text path's
-`"8.0 GiB"` is presentation only), or `null` on the Apple Container backend,
+`"8.0 GiB"` is presentation only), or `null` on the Apple sandbox backend,
 whose images live in the runtime's image store rather than coop's data
 directory.
 

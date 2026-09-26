@@ -4,25 +4,25 @@
 
 ### New features
 
-- **Opt-in Apple Container backend (macOS)** — building with
-  `--features apple-container` replaces Lima with Apple's `container machine`
-  runtime. Each instance gets a dedicated network, no host-home mount, no host
-  SSH-agent forwarding, and a pinned SSH host key; workspaces are copied.
-  Disk sizing and commit/restore are rejected before any change. It needs an
-  Apple Container build with a per-machine network and SSH-agent switch that
-  stock 1.4.1 lacks, and refuses to start guests without it. Its state lives
-  in `~/.coop-apple`, and `coop update` is disabled for this build. See
-  [`docs/backends.md`](docs/backends.md).
-- **Apple Container runtime fork vendored at `vendor/container`** — a git
-  submodule of [chr33s/container](https://github.com/chr33s/container) that
-  adds `container machine create --network` / `--no-ssh-agent` and reports
-  both in `machine inspect`, which the Apple Container backend requires.
-  [`docs/backends.md`](docs/backends.md) describes building and installing
-  it. The backend now treats a `machine inspect` record that reports
-  `sshAgentForwarding` without `network` as a machine on the runtime's
-  built-in network (and refuses it), instead of as an unqualified runtime.
-  `scripts/build-apple-container-runtime.sh` builds it into a directory you
-  own, without `sudo`.
+- **Opt-in Apple sandbox backend (macOS)** — building with
+  `--features apple-container` replaces Lima with coop-sandbox
+  ([`macos/coop-sandbox`](macos/coop-sandbox)), a Swift runtime on Apple's
+  `containerization` 0.45.0 built with `scripts/build-coop-sandbox.sh`. Each
+  instance is its own VM on its own vmnet network with no host mounts, socket
+  relays, published ports, or host SSH-agent forwarding. coop verifies the
+  running VM's effective configuration and pins its SSH host key before every
+  hand-out; workspaces are copied. It supports explicit disk sizes, offline
+  disk growth (`coop resize --size`), CPU/memory changes, and
+  `coop commit`/`coop restore`. Committed disks have their guest identity
+  removed, and a restore re-pins the new host key. Sandbox owners run as
+  launchd jobs, and a crash restarts them on the same disk. Stock Apple
+  `container` 1.4.1 is used only to build images and supply the guest kernel.
+  State lives in `~/.coop-apple`, and `coop update` is disabled for this
+  build. See [`docs/backends.md`](docs/backends.md). The choice over stock
+  Apple containers and a `container machine` fork is recorded in
+  [`docs/design/apple-sandbox-runtime.md`](docs/design/apple-sandbox-runtime.md);
+  [`tests/integration-apple-sandbox.sh`](tests/integration-apple-sandbox.sh)
+  checks it on real hardware.
 
 ### Fixes
 
@@ -37,25 +37,17 @@
 - **rsync transfers work when the VM key path contains a space** — SSH options
   containing whitespace are now quoted in rsync's `-e` command.
 - **`coop list` shows `unknown` for an instance whose state cannot be read** —
-  on the Apple Container backend an unfinished operation or a failed probe was
+  on the Apple sandbox backend an unfinished operation or a failed probe was
   listed as `stopped`. The unfinished-operation error now names the single
-  command that recovers it (`start` for a resize, `destroy` otherwise).
-- **Apple Container: `setup` and guest commands work on the runtime fork** —
-  the image installs `lsb-release` for the Docker repository step, the image
-  digest is read from `configuration.descriptor`, and `machine run` commands
-  are sent as one shell-quoted string, which the runtime passes to the guest
-  shell.
-- **Apple Container: guest SSH never contacts the host agent** — pinned
+  command that recovers it (`start` for a resize or restore, `destroy` otherwise).
+- **Apple sandbox: guest SSH never contacts the host agent** — pinned
   connections set `IdentityAgent=none`, and `coop ssh-config` no longer claims
   that pinned aliases skip host-key verification.
 - **Lima: an instance starts again after `coop resize --size`** — Lima 2.x
   refuses to boot ("disk shrinking is not supported") when `lima.yaml` records
   a smaller disk than the file on disk. Growing the disk now updates `disk:`
   in `lima.yaml` too.
-- **Apple Container: `stop_timeout_seconds` defaults to 60** — the runtime
-  stops one machine at a time, so a stop queued behind concurrent stops could
-  exceed the old 30 s default and be reported as uncertain.
-- **`coop images` does not report `0.0 GiB` for Apple Container images** — their
+- **`coop images` does not report `0.0 GiB` for Apple sandbox images** — their
   content lives in the runtime's image store, so the size is `n/a` (JSON
   `"size_bytes": null`).
 

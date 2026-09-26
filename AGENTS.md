@@ -55,6 +55,7 @@ cargo build --workspace
 cargo fmt -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --all-targets --features apple-container -- -D warnings  # macOS only
+swift test --package-path macos/coop-sandbox                          # macOS only
 cargo test --workspace
 cargo deny --workspace check
 taplo format --check

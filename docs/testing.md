@@ -106,32 +106,50 @@ Linux CI and release preflight run this gate explicitly; ordinary unit tests
 mark it ignored, and macOS preflight reports it as unrun. This host test does
 not replace the Firecracker and Lima VM integration gates.
 
-## Apple Container backend (macOS, opt-in)
+## Apple sandbox backend (macOS, opt-in)
 
 The `apple-container` feature builds only on macOS. Its unit tests replace the
-`container` CLI with a scripted runtime, so they run without Apple Container
-installed:
+`coop-sandbox` runtime (and the stock `container` builder) with a scripted
+executor, so they run without either installed. The runtime itself is a Swift
+package with its own unit tests (IDs, records, subnet allocation, the control
+protocol, reconcile); none of them boots a VM:
 
 ```bash
 cargo clippy --all-targets --features apple-container -- -D warnings
 cargo test --features apple-container
+swift test --package-path macos/coop-sandbox
 ```
 
-Parser fixtures live in `tests/fixtures/apple-container/`. That directory's
-README records which files were captured from a real runtime and which were
-derived from source: the pinned 1.4.1 tag for stock-runtime shapes, and the
-`vendor/container` fork for the extension fields.
+Parser fixtures in `tests/fixtures/coop-sandbox/` are real `coop-sandbox`
+output; the directory's README says how they were captured.
 
-`tests/apple-container-contract.sh` runs a feature build against the installed
-runtime. It checks that a stock runtime (no machine network / SSH-agent
-extension) refuses `coop setup` with `APPLE_RUNTIME_UNQUALIFIED`, writes no
-state, and leaves runtime machines and networks unchanged, and that
-`coop update` is refused. It only probes the runtime and uses a throwaway data
-directory.
+### Real-hardware checks
 
-The real-hardware acceptance suite needs a qualified runtime, and none exists
-yet: isolation, host-exposure canaries, restart, recovery, and endurance
-(spec T-07 to T-29) are all still to do.
+`tests/integration-apple-sandbox.sh` boots real `coop-sandbox` VMs and checks
+what unit tests cannot:
+
+- peer isolation between sandboxes over IPv4/IPv6 TCP, UDP, and ICMP,
+  including forged routes, static neighbours, spoofed sources, and
+  broadcast/multicast;
+- host exposure (mounts, agent sockets, a host canary file, vsock) and a canary
+  secret in the caller's environment;
+- pinned SSH over the native channel;
+- stop/start persistence, CPU/memory changes, disk sizes and offline growth,
+  commit/restore (including a guest that disables its own `rm`), crash
+  recovery with launchd respawn, and concurrent sandboxes.
+
+It builds the runtime and a small test image (`tests/fixtures/apple-sandbox/`)
+and touches only its own temporary state root and image tag:
+
+```bash
+./tests/integration-apple-sandbox.sh                   # ~10 min
+./tests/integration-apple-sandbox.sh --only isolation,snapshots
+```
+
+Run it before changing the `containerization` pin, the runtime's VM
+configuration, or the isolation gate, and whenever the macOS major version
+changes. [`design/apple-sandbox-runtime.md`](design/apple-sandbox-runtime.md)
+records why this runtime was chosen.
 
 ## Mutation testing
 
@@ -163,6 +181,14 @@ parsing, or state composition:
   carved into: input-compatibility guards, summary/message builders, the
   `TranslatorInputs` builder, byte→GiB arithmetic kernels, and predicates like
   `discovered_local_devcontainer` / `is_sensitive_workspace`
+
+- `src/apple_container/` — the sandbox backend's parsers, isolation gate,
+  records, journal reconciliation, and lifecycle against a scripted runtime.
+  The module compiles only with its feature on macOS, so sweep it separately:
+
+  ```bash
+  cargo mutants --features apple-container -f 'src/apple_container/*.rs'
+  ```
 
 **Don't bother with:** `backend.rs`, `lima.rs`, `setup.rs`, `update.rs`,
 `shell.rs`, `port_forward.rs`, `cmd.rs`, `ssh.rs`, `vm.rs`, `prompt.rs` (TTY

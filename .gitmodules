@@ -1,3 +1,0 @@
-[submodule "vendor/container"]
-	path = vendor/container
-	url = https://github.com/chr33s/container.git

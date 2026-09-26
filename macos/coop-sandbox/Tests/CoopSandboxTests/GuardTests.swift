@@ -25,12 +25,12 @@ import Testing
         return paths
     }
 
-    @Test func deleteRefusesAnotherOwner() throws {
+    @Test func deleteRefusesAnotherOwner() async throws {
         let r = try root()
         let paths = try stoppedSandbox(r, "a", owner: "mine")
-        #expect(throws: SandboxError.self) { try Sandboxes.delete(root: r, id: try SandboxID("a"), owner: "theirs") }
+        await #expect(throws: SandboxError.self) { try await Sandboxes.delete(root: r, id: try SandboxID("a"), owner: "theirs") }
         #expect(FileManager.default.fileExists(atPath: paths.record.path))
-        try Sandboxes.delete(root: r, id: try SandboxID("a"), owner: "mine")
+        try await Sandboxes.delete(root: r, id: try SandboxID("a"), owner: "mine")
         #expect(!FileManager.default.fileExists(atPath: paths.dir.path))
     }
 
@@ -61,42 +61,50 @@ import Testing
         #expect(try paths.loadRecord().diskGeneration == before.diskGeneration)
     }
 
-    /// A restore that crashed between its disk swap and its record write is
-    /// finished on the next read; one that crashed before the swap is not.
-    @Test func interruptedRestoreSettlesFromTheDiskInode() throws {
+    /// A restore staged by runtime 0.1.0 and interrupted after its disk swap
+    /// still commits; one interrupted before the swap is discarded.
+    @Test func legacyStagedRestoreIsRecovered() async throws {
+        struct Legacy: Codable {
+            var inode: UInt64
+            var record: SandboxRecord
+        }
         let r = try root()
         let paths = try stoppedSandbox(r, "a")
+        let legacyWork = paths.dir.appendingPathComponent(".restore-rootfs.ext4")
+        let legacyPending = paths.dir.appendingPathComponent("restore.pending.json")
         var next = try paths.loadRecord()
         next.diskGeneration += 1
         next.imageReference = "restored"
 
-        // Crash after the swap: the prepared disk is now rootfs.
-        try Data("new".utf8).write(to: paths.restoreWork)
-        try paths.writePendingRestore(next, disk: paths.restoreWork)
-        #expect(rename(paths.restoreWork.path, paths.rootfs.path) == 0)
-        #expect(try paths.loadRecord().diskGeneration == next.diskGeneration)
-        #expect(try paths.loadRecord().imageReference == "restored")
-        #expect(!FileManager.default.fileExists(atPath: paths.pendingRestore.path))
+        try Data("new".utf8).write(to: legacyWork)
+        try JSONEncoder.pretty.encode(Legacy(inode: SandboxPaths.inode(legacyWork)!, record: next)).write(to: legacyPending)
+        #expect(rename(legacyWork.path, paths.rootfs.path) == 0)
+        #expect(try paths.loadRecord().imageReference == "restored", "readers see the committed update")
+        #expect(try paths.readRecordFile().diskGeneration == 0, "but only a guarded mutation writes it")
+        #expect(try DiskUpdate.settle(paths))
+        #expect(try paths.readRecordFile().imageReference == "restored")
+        #expect(!FileManager.default.fileExists(atPath: legacyPending.path))
 
-        // Crash before the swap: the old record stands once the scratch
-        // disk is gone, and not before (the swap could still happen).
         var later = next
         later.diskGeneration += 1
-        try Data("newer".utf8).write(to: paths.restoreWork)
-        try paths.writePendingRestore(later, disk: paths.restoreWork)
+        try Data("newer".utf8).write(to: legacyWork)
+        try JSONEncoder.pretty.encode(Legacy(inode: SandboxPaths.inode(legacyWork)!, record: later)).write(to: legacyPending)
         #expect(try paths.loadRecord().diskGeneration == next.diskGeneration)
-        #expect(FileManager.default.fileExists(atPath: paths.pendingRestore.path))
-        try FileManager.default.removeItem(at: paths.restoreWork)
+        _ = try await Sandboxes.setResources(root: r, id: try SandboxID("a"), cpus: 2, memoryBytes: nil)
         #expect(try paths.loadRecord().diskGeneration == next.diskGeneration)
-        #expect(!FileManager.default.fileExists(atPath: paths.pendingRestore.path))
+        #expect(!FileManager.default.fileExists(atPath: legacyPending.path))
+        #expect(!FileManager.default.fileExists(atPath: legacyWork.path))
+        #expect(try Data(contentsOf: paths.rootfs) == Data("new".utf8))
     }
 
-    @Test func mutationsRequireAStoppedSandbox() throws {
+    @Test func mutationsRequireAStoppedSandbox() async throws {
         let r = try root()
         let paths = try stoppedSandbox(r, "a")
         try JSONEncoder.pretty.encode(LiveState(pid: getpid(), startedAt: Date(), ipv4: nil, ipv6: nil)).write(to: paths.live)
         #expect(Sandboxes.status(paths) != .stopped)
-        #expect(throws: SandboxError.self) { try Sandboxes.setResources(root: r, id: try SandboxID("a"), cpus: 2, memoryBytes: nil) }
+        await #expect(throws: SandboxError.self) {
+            try await Sandboxes.setResources(root: r, id: try SandboxID("a"), cpus: 2, memoryBytes: nil)
+        }
     }
 
     @Test func unreadableRecordFailsListingsClosed() throws {
@@ -109,7 +117,7 @@ import Testing
     @Test func reconcileRemovesScratchAndDisksWithoutMetadata() throws {
         let r = try root()
         let paths = try stoppedSandbox(r, "a")
-        for name in [".grow-rootfs.ext4", ".restore-rootfs.ext4", ".maintenance-x.ext4"] {
+        for name in [".update-x.ext4", ".grow-rootfs.ext4", ".restore-rootfs.ext4", ".maintenance-x.ext4"] {
             try Data().write(to: paths.dir.appendingPathComponent(name))
         }
         try Data().write(to: r.disk(try SandboxID("orphan")))
@@ -212,7 +220,7 @@ import Testing
 
     /// Holds `paths`' owner lock on a separate open file, as a live owner does.
     func holdOwnerLock(_ paths: SandboxPaths) -> Int32 {
-        let fd = open(paths.lock.path, O_RDWR | O_CREAT, 0o600)
+        let fd = open(paths.lock.path, O_RDWR | O_CREAT | O_CLOEXEC, 0o600)
         #expect(fd >= 0)
         #expect(flock(fd, LOCK_EX) == 0)
         return fd

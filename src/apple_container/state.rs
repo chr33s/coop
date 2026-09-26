@@ -282,19 +282,9 @@ impl Owner {
 
 // ── Machine record ────────────────────────────────────────────
 
-/// Where a machine is in its creation lifecycle. The record is only written
-/// once creation has completed (an in-progress creation lives in the
-/// journal), so `Ready` is the one value today; the field exists so a later
-/// schema can add states without a migration. Recovery information only; live
-/// state always comes from the runtime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum CreationState {
-    /// Created and first-boot trust enrolled.
-    Ready,
-}
-
-/// `apple-machine.json`.
+/// `apple-machine.json`, written once creation has completed (an
+/// in-progress creation lives in the journal). Records written by earlier
+/// builds also carry `"creation_state": "ready"`, which is ignored on read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct MachineSidecar {
     pub(crate) schema_version: u32,
@@ -316,7 +306,6 @@ pub(crate) struct MachineSidecar {
     /// enrolls the new host key instead of requiring the old pin. Never set
     /// in response to anything the guest did.
     pub(crate) reenroll_host_key: bool,
-    pub(crate) creation_state: CreationState,
     pub(crate) created_at: String,
     pub(crate) runtime_identity: String,
 }
@@ -351,6 +340,14 @@ impl MachineSidecar {
         write_control_file(&Self::path(inst), self)
     }
 
+    /// The CPU count and memory this instance asks for.
+    pub(crate) fn resources(&self) -> Resources {
+        Resources {
+            cpus: self.requested_cpus,
+            memory_bytes: self.requested_memory_bytes,
+        }
+    }
+
     /// Refuse to act on a record that is not this installation's, or whose
     /// runtime names were not generated for it.
     pub(crate) fn check_owner(&self, owner: &Owner) -> Result<()> {
@@ -366,130 +363,156 @@ impl MachineSidecar {
 
 // ── Journal ───────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum Operation {
-    Create,
-    SetResources,
-    /// Disk replaced by `coop restore`.
-    RestoreDisk,
-    Destroy,
-}
+/// Identifies one runtime mutation (`coop-sandbox --operation`). The runtime
+/// records the last one it committed, so coop can tell whether its own
+/// operation applied, and whether another has happened since.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) struct OperationId(String);
 
-/// A journaled operation with what reconciling it needs, so an operation
-/// cannot be recorded without its prior state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum JournalOp {
-    Create,
-    /// CPU count and memory committed before the change, read when
-    /// reconciling an interrupted resize.
-    SetResources {
-        prior: (u32, u64),
-    },
-    /// The runtime's disk generation before the restore: a higher value
-    /// afterwards proves the disk was replaced.
-    RestoreDisk {
-        prior_generation: u64,
-    },
-    Destroy,
-}
+impl OperationId {
+    pub(crate) fn generate() -> Result<Self> {
+        Ok(Self(format!("coop-{}", crate::fs_util::random_hex(8)?)))
+    }
 
-impl JournalOp {
-    pub(crate) fn kind(self) -> Operation {
-        match self {
-            Self::Create => Operation::Create,
-            Self::SetResources { .. } => Operation::SetResources,
-            Self::RestoreDisk { .. } => Operation::RestoreDisk,
-            Self::Destroy => Operation::Destroy,
-        }
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
-/// Completed side effects of a journaled operation, in order.
+impl TryFrom<String> for OperationId {
+    type Error = anyhow::Error;
+    fn try_from(value: String) -> Result<Self> {
+        let ok = !value.is_empty()
+            && value.len() <= 64
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if !ok {
+            bail!("invalid operation id {value:?}");
+        }
+        Ok(Self(value))
+    }
+}
+
+impl From<OperationId> for String {
+    fn from(value: OperationId) -> Self {
+        value.0
+    }
+}
+
+impl std::fmt::Display for OperationId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A sandbox's CPU count and memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Resources {
+    pub(crate) cpus: u32,
+    pub(crate) memory_bytes: u64,
+}
+
+impl std::fmt::Display for Resources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} vCPUs / {} MiB",
+            self.cpus,
+            self.memory_bytes / (1024 * 1024)
+        )
+    }
+}
+
+/// Completed side effects of an interrupted create, in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) enum Stage {
+pub(crate) enum CreateStage {
     /// Name reserved; nothing exists in the runtime yet.
     Reserved,
     /// About to create the sandbox (outcome may be unknown after a crash).
     CreatingMachine,
     MachineCreated,
-    /// About to change resources or replace the disk.
-    Applying,
+}
+
+/// Completed side effects of an interrupted destroy, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum DestroyStage {
+    Reserved,
     /// About to delete the sandbox.
     DeletingMachine,
     MachineDeleted,
 }
 
+/// A journaled operation with exactly what reconciling it needs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub(crate) enum JournalOp {
+    Create {
+        stage: CreateStage,
+    },
+    /// A CPU/memory change, forward or rolled back: the runtime was about
+    /// to be asked for `target`, tagged `operation`.
+    SetResources {
+        /// Absent in journals written before operation ids; reconciling one
+        /// then compares the runtime's values with `prior`.
+        #[serde(default)]
+        operation: Option<OperationId>,
+        prior: Resources,
+        #[serde(default)]
+        target: Option<Resources>,
+    },
+    /// Disk replaced by `coop restore`.
+    RestoreDisk {
+        /// Absent in journals written before operation ids; a higher disk
+        /// generation alone then proves the restore applied.
+        #[serde(default)]
+        operation: Option<OperationId>,
+        /// The runtime's disk generation before the restore.
+        prior_generation: u64,
+    },
+    Destroy {
+        stage: DestroyStage,
+    },
+}
+
+impl JournalOp {
+    /// What the operation is, for messages.
+    pub(crate) fn describe(&self) -> &'static str {
+        match self {
+            Self::Create { .. } => "create",
+            Self::SetResources { .. } => "resource change",
+            Self::RestoreDisk { .. } => "restore",
+            Self::Destroy { .. } => "destroy",
+        }
+    }
+
+    /// The one command that reconciles it: `start` finishes an interrupted
+    /// resource change or restore; `destroy` removes or finishes the rest.
+    pub(crate) fn recovery_hint(&self, name: &crate::config::InstanceName) -> String {
+        match self {
+            Self::SetResources { .. } | Self::RestoreDisk { .. } => {
+                format!("run `coop start {name}` to finish it")
+            }
+            Self::Create { .. } => {
+                format!("run `coop destroy {name}` to remove what it created, then `coop up` again")
+            }
+            Self::Destroy { .. } => format!("run `coop destroy {name}` to finish it"),
+        }
+    }
+}
+
 /// `operation.json` — present only while a mutation or its recovery is
 /// pending. Written before each mutating runtime call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "JournalRecord", into = "JournalRecord")]
 pub(crate) struct Journal {
     pub(crate) schema_version: u32,
     pub(crate) backend: String,
     pub(crate) owner_id: OwnerId,
-    pub(crate) op: JournalOp,
-    pub(crate) stage: Stage,
     pub(crate) machine_id: MachineName,
-}
-
-/// The on-disk layout of [`Journal`]: the operation's prior state is stored
-/// in optional fields beside it.
-#[derive(Serialize, Deserialize)]
-struct JournalRecord {
-    schema_version: u32,
-    backend: String,
-    owner_id: OwnerId,
-    operation: Operation,
-    stage: Stage,
-    machine_id: MachineName,
-    prior_resources: Option<(u32, u64)>,
-    prior_disk_generation: Option<u64>,
-}
-
-impl TryFrom<JournalRecord> for Journal {
-    type Error = String;
-
-    fn try_from(r: JournalRecord) -> std::result::Result<Self, String> {
-        let op = match (r.operation, r.prior_resources, r.prior_disk_generation) {
-            (Operation::Create, None, None) => JournalOp::Create,
-            (Operation::Destroy, None, None) => JournalOp::Destroy,
-            (Operation::SetResources, Some(prior), None) => JournalOp::SetResources { prior },
-            (Operation::RestoreDisk, None, Some(prior_generation)) => {
-                JournalOp::RestoreDisk { prior_generation }
-            }
-            (op, ..) => return Err(format!("{op:?} journal has mismatched prior state")),
-        };
-        Ok(Self {
-            schema_version: r.schema_version,
-            backend: r.backend,
-            owner_id: r.owner_id,
-            op,
-            stage: r.stage,
-            machine_id: r.machine_id,
-        })
-    }
-}
-
-impl From<Journal> for JournalRecord {
-    fn from(j: Journal) -> Self {
-        let (prior_resources, prior_disk_generation) = match j.op {
-            JournalOp::SetResources { prior } => (Some(prior), None),
-            JournalOp::RestoreDisk { prior_generation } => (None, Some(prior_generation)),
-            JournalOp::Create | JournalOp::Destroy => (None, None),
-        };
-        Self {
-            schema_version: j.schema_version,
-            backend: j.backend,
-            owner_id: j.owner_id,
-            operation: j.op.kind(),
-            stage: j.stage,
-            machine_id: j.machine_id,
-            prior_resources,
-            prior_disk_generation,
-        }
-    }
+    pub(crate) op: JournalOp,
 }
 
 impl Journal {
@@ -507,9 +530,8 @@ impl Journal {
             schema_version: SCHEMA_VERSION,
             backend: BACKEND_TAG.into(),
             owner_id: owner.id.clone(),
-            op,
-            stage: Stage::Reserved,
             machine_id,
+            op,
         };
         journal.save(inst)?;
         Ok(journal)
@@ -521,13 +543,28 @@ impl Journal {
             return Ok(None);
         };
         check_raw_header(&content, &path)?;
-        let journal: Self = serde_json::from_str(&content)
-            .with_context(|| format!("Failed to parse {}", path.display()))?;
-        Ok(Some(journal))
+        Self::parse(&content)
+            .with_context(|| format!("Failed to parse {}", path.display()))
+            .map(Some)
     }
 
-    pub(crate) fn advance(&mut self, inst: &Instance, stage: Stage) -> Result<()> {
-        self.stage = stage;
+    /// The current layout nests the operation under `op`; a journal in the
+    /// earlier flat layout is converted by [`legacy::convert`].
+    fn parse(content: &str) -> Result<Self> {
+        #[derive(Deserialize)]
+        struct Layout {
+            op: Option<serde::de::IgnoredAny>,
+        }
+        if serde_json::from_str::<Layout>(content)?.op.is_some() {
+            return Ok(serde_json::from_str(content)?);
+        }
+        legacy::convert(serde_json::from_str(content)?)
+    }
+
+    /// Record the operation's progress, or (for `destroy`) take over an
+    /// unfinished one.
+    pub(crate) fn advance(&mut self, inst: &Instance, op: JournalOp) -> Result<()> {
+        self.op = op;
         self.save(inst)
     }
 
@@ -541,6 +578,106 @@ impl Journal {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e).context("Failed to clear operation journal"),
         }
+    }
+}
+
+/// Journals in the flat layout written before per-operation variants: one
+/// `operation`, a shared `stage`, and optional prior-state fields. Each is
+/// converted to the variant it describes; any other combination is refused,
+/// never dropped, since it may be an unfinished operation.
+mod legacy {
+    use anyhow::{Result, bail};
+    use serde::Deserialize;
+
+    use super::{CreateStage, DestroyStage, Journal, JournalOp, MachineName, OwnerId, Resources};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    enum Operation {
+        Create,
+        SetResources,
+        RestoreDisk,
+        Destroy,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    enum Stage {
+        Reserved,
+        CreatingMachine,
+        MachineCreated,
+        Applying,
+        DeletingMachine,
+        MachineDeleted,
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct Record {
+        schema_version: u32,
+        backend: String,
+        owner_id: OwnerId,
+        operation: Operation,
+        stage: Stage,
+        machine_id: MachineName,
+        prior_resources: Option<(u32, u64)>,
+        prior_disk_generation: Option<u64>,
+    }
+
+    pub(super) fn convert(r: Record) -> Result<Journal> {
+        use Operation as O;
+        use Stage as S;
+        let op = match (
+            r.operation,
+            r.stage,
+            r.prior_resources,
+            r.prior_disk_generation,
+        ) {
+            (O::Create, S::Reserved, None, None) => JournalOp::Create {
+                stage: CreateStage::Reserved,
+            },
+            (O::Create, S::CreatingMachine, None, None) => JournalOp::Create {
+                stage: CreateStage::CreatingMachine,
+            },
+            (O::Create, S::MachineCreated, None, None) => JournalOp::Create {
+                stage: CreateStage::MachineCreated,
+            },
+            // `destroy` advanced an unfinished create's journal in place.
+            (O::Create | O::Destroy, S::DeletingMachine, None, None) => JournalOp::Destroy {
+                stage: DestroyStage::DeletingMachine,
+            },
+            (O::Create | O::Destroy, S::MachineDeleted, None, None) => JournalOp::Destroy {
+                stage: DestroyStage::MachineDeleted,
+            },
+            (O::Destroy, S::Reserved, None, None) => JournalOp::Destroy {
+                stage: DestroyStage::Reserved,
+            },
+            (O::SetResources, S::Reserved | S::Applying, Some((cpus, memory_bytes)), None) => {
+                JournalOp::SetResources {
+                    operation: None,
+                    prior: Resources { cpus, memory_bytes },
+                    target: None,
+                }
+            }
+            (O::RestoreDisk, S::Reserved | S::Applying, None, Some(prior_generation)) => {
+                JournalOp::RestoreDisk {
+                    operation: None,
+                    prior_generation,
+                }
+            }
+            (operation, stage, ..) => bail!(
+                "unsupported {operation:?} journal at stage {stage:?} (or mismatched prior \
+                 state); check sandbox {} with `coop-sandbox inspect`, then `coop destroy` the \
+                 instance or remove the journal by hand",
+                r.machine_id
+            ),
+        };
+        Ok(Journal {
+            schema_version: r.schema_version,
+            backend: r.backend,
+            owner_id: r.owner_id,
+            machine_id: r.machine_id,
+            op,
+        })
     }
 }
 
@@ -704,9 +841,19 @@ mod tests {
 
     #[test]
     fn stages_are_ordered() {
-        assert!(Stage::Reserved < Stage::CreatingMachine);
-        assert!(Stage::CreatingMachine < Stage::MachineCreated);
-        assert!(Stage::DeletingMachine < Stage::MachineDeleted);
+        assert!(CreateStage::Reserved < CreateStage::CreatingMachine);
+        assert!(CreateStage::CreatingMachine < CreateStage::MachineCreated);
+        assert!(DestroyStage::DeletingMachine < DestroyStage::MachineDeleted);
+    }
+
+    #[test]
+    fn operation_ids_are_safe_tokens() {
+        let id = OperationId::generate().unwrap();
+        assert!(id.as_str().starts_with("coop-") && id.as_str().len() == 21);
+        assert_ne!(id, OperationId::generate().unwrap());
+        for bad in ["", "A", "a b", "../x", &"a".repeat(65)] {
+            assert!(OperationId::try_from(bad.to_string()).is_err(), "{bad:?}");
+        }
     }
 
     fn test_inst(cfg: &CoopConfig) -> Instance {
@@ -737,7 +884,6 @@ mod tests {
             last_observed_owner_pid: None,
             last_observed_ip: None,
             reenroll_host_key: false,
-            creation_state: CreationState::Ready,
             created_at: "now".into(),
             runtime_identity: "test".into(),
         }
@@ -781,7 +927,10 @@ mod tests {
             id: owner(),
         };
         let name = MachineName::generate(&me.id).unwrap();
-        Journal::begin(&inst, &me, JournalOp::Create, name).unwrap();
+        let op = JournalOp::Create {
+            stage: CreateStage::Reserved,
+        };
+        Journal::begin(&inst, &me, op, name).unwrap();
         Journal::complete(&inst).unwrap();
         assert!(Journal::try_load(&inst).unwrap().is_none());
         Journal::complete(&inst).unwrap();
@@ -791,49 +940,138 @@ mod tests {
         assert!(Journal::complete(&inst).is_err());
     }
 
-    /// The journal keeps its flat on-disk layout, and an operation stored
-    /// without its prior state (or with another operation's) is refused.
-    #[test]
-    fn journal_prior_state_matches_its_operation() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let inst = test_inst(&cfg);
-        let me = Owner {
+    fn me() -> Owner {
+        Owner {
             schema_version: OWNER_SCHEMA_VERSION,
             backend: BACKEND_TAG.into(),
             id: owner(),
-        };
+        }
+    }
+
+    /// Each operation carries its own fields, nested under `op`.
+    #[test]
+    fn journal_round_trips_each_operation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(tmp.path());
+        let inst = test_inst(&cfg);
+        let me = me();
         let name = MachineName::generate(&me.id).unwrap();
-        let op = JournalOp::RestoreDisk {
-            prior_generation: 7,
+        let resources = Resources {
+            cpus: 2,
+            memory_bytes: 1 << 30,
         };
-        Journal::begin(&inst, &me, op, name.clone()).unwrap();
+        for op in [
+            JournalOp::Create {
+                stage: CreateStage::MachineCreated,
+            },
+            JournalOp::SetResources {
+                operation: Some(OperationId::generate().unwrap()),
+                prior: resources,
+                target: Some(Resources {
+                    cpus: 4,
+                    ..resources
+                }),
+            },
+            JournalOp::RestoreDisk {
+                operation: Some(OperationId::generate().unwrap()),
+                prior_generation: 7,
+            },
+            JournalOp::Destroy {
+                stage: DestroyStage::DeletingMachine,
+            },
+        ] {
+            Journal::begin(&inst, &me, op.clone(), name.clone()).unwrap();
+            assert_eq!(Journal::try_load(&inst).unwrap().unwrap().op, op);
+        }
         let raw: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(Journal::path(&inst)).unwrap()).unwrap();
-        assert_eq!(raw["operation"], "restore-disk");
-        assert_eq!(raw["prior_disk_generation"], 7);
-        assert!(raw["prior_resources"].is_null());
-        assert_eq!(Journal::try_load(&inst).unwrap().unwrap().op, op);
+        assert_eq!(raw["op"]["kind"], "destroy");
+        assert_eq!(raw["op"]["stage"], "deleting-machine");
+    }
 
-        for (operation, resources, generation) in [
-            ("set-resources", "null", "null"),
-            ("restore-disk", "null", "null"),
-            ("create", "[1,2]", "null"),
-            ("set-resources", "[1,2]", "3"),
-        ] {
+    /// Journals in the earlier flat layout still load as the operation they
+    /// describe, and one whose prior state does not match is refused.
+    #[test]
+    fn legacy_flat_journals_are_converted_or_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(tmp.path());
+        let inst = test_inst(&cfg);
+        let me = me();
+        let name = MachineName::generate(&me.id).unwrap();
+        let write = |operation: &str, stage: &str, resources: &str, generation: &str| {
             fs::write(
                 Journal::path(&inst),
                 format!(
-                    r#"{{"schema_version":2,"backend":"apple-container","owner_id":"{}","operation":"{operation}","stage":"applying","machine_id":"{name}","prior_resources":{resources},"prior_disk_generation":{generation}}}"#,
+                    r#"{{"schema_version":2,"backend":"apple-container","owner_id":"{}","operation":"{operation}","stage":"{stage}","machine_id":"{name}","prior_resources":{resources},"prior_disk_generation":{generation}}}"#,
                     me.id.as_str()
                 ),
             )
             .unwrap();
+        };
+        let load = || Journal::try_load(&inst).map(|j| j.unwrap().op);
+        write("set-resources", "applying", "[8,1073741824]", "null");
+        assert_eq!(
+            load().unwrap(),
+            JournalOp::SetResources {
+                operation: None,
+                prior: Resources {
+                    cpus: 8,
+                    memory_bytes: 1 << 30
+                },
+                target: None,
+            }
+        );
+        write("restore-disk", "applying", "null", "3");
+        assert_eq!(
+            load().unwrap(),
+            JournalOp::RestoreDisk {
+                operation: None,
+                prior_generation: 3
+            }
+        );
+        write("create", "creating-machine", "null", "null");
+        assert_eq!(
+            load().unwrap(),
+            JournalOp::Create {
+                stage: CreateStage::CreatingMachine
+            }
+        );
+        // `destroy` took over an unfinished create.
+        write("create", "deleting-machine", "null", "null");
+        assert_eq!(
+            load().unwrap(),
+            JournalOp::Destroy {
+                stage: DestroyStage::DeletingMachine
+            }
+        );
+
+        for (operation, stage, resources, generation) in [
+            ("set-resources", "applying", "null", "null"),
+            ("restore-disk", "applying", "null", "null"),
+            ("create", "applying", "null", "null"),
+            ("create", "reserved", "[1,2]", "null"),
+            ("set-resources", "applying", "[1,2]", "3"),
+        ] {
+            write(operation, stage, resources, generation);
+            let err = load().unwrap_err();
             assert!(
-                Journal::try_load(&inst).is_err(),
-                "{operation} {resources} {generation}"
+                format!("{err:#}").contains("coop destroy"),
+                "{operation} {stage}: {err:#}"
             );
         }
+    }
+
+    /// Records from builds that had `creation_state` still load.
+    #[test]
+    fn sidecar_with_creation_state_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(tmp.path());
+        let inst = test_inst(&cfg);
+        let record = sidecar(owner(), MachineName::generate(&owner()).unwrap());
+        let mut raw = serde_json::to_value(&record).unwrap();
+        raw["creation_state"] = "ready".into();
+        fs::write(MachineSidecar::path(&inst), raw.to_string()).unwrap();
+        assert_eq!(MachineSidecar::load(&inst).unwrap(), record);
     }
 
     /// Only a schema-1 record from this backend is legacy; a current record

@@ -61,8 +61,10 @@ direct runtime Track B.
   journaled ext4 recovers.
 - **`containerization`'s ext4 formatter uses `sparse_super2`.** The guest
   kernel cannot resize that online, so growth runs `e2fsck`/`resize2fs` in a
-  short maintenance VM. That VM boots a coop-built image, never the guest's own
-  disk, so a root guest cannot subvert it. The same VM strips host keys and
+  short maintenance VM. That VM boots a small maintenance image coop builds for
+  the purpose (installed apart from the image store), never the guest's own
+  disk or an application image, so a root guest cannot subvert it and an
+  image's size or deletion cannot break it. The same VM strips host keys and
   machine-id from committed disks.
 - **Docker's overlayfs snapshotter cannot run on an overlayfs root.** The
   read-only-image plus writable-upper disk model was therefore rejected in
@@ -78,7 +80,7 @@ direct runtime Track B.
 ## 4. Consequences
 
 - The `apple-container` build drives `coop-sandbox` over a versioned JSON CLI
-  (protocol 1), with the isolation gate, journal, and host-key pinning of the
+  (protocol 1, now 2), with the isolation gate, journal, and host-key pinning of the
   earlier backend carried over. It gains `resize --size`, `commit`, and
   `restore`.
 - Stock `container` 1.4.1 remains a prerequisite, but only to build images and

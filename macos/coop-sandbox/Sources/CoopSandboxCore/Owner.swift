@@ -14,10 +14,8 @@ public enum Owner {
         try root.requireInitialized()
         let paths = root.sandbox(id)
         signal(SIGPIPE, SIG_IGN)
-        let lockFD = open(paths.lock.path, O_CREAT | O_RDWR, 0o600)
-        guard lockFD >= 0, try await acquireOwnership(lockFD) else {
-            throw SandboxError("\(id) already has an owner")
-        }
+        // Held until the process exits; the kernel then releases it.
+        _ = try await claim(root: root, id: id)
         // A stale live.json means the previous owner died without cleanup.
         try? FileManager.default.removeItem(at: paths.live)
 
@@ -95,6 +93,29 @@ public enum Owner {
         _ = signalSources
         // Let in-flight `stop` responses flush.
         try? await Task.sleep(for: .milliseconds(200))
+    }
+
+    /// Take ownership of `id`: its owner lock, held for the owner's whole
+    /// life. Taken under the sandbox's mutation guard, however the owner was
+    /// launched (`start`, or launchd respawning it), so an owner never starts
+    /// while an offline operation is replacing its disk, and an operation
+    /// that begins later sees the owner and refuses. A disk update a crash
+    /// interrupted is settled before the VM reads the disk. The guard is
+    /// released on return: nothing waits on the owner while holding it.
+    static func claim(root: SandboxRoot, id: SandboxID) async throws -> Int32 {
+        let paths = root.sandbox(id)
+        let guarded = try await FileLock.acquire(paths.mutationLock, .exclusive, polling: .milliseconds(50))
+        defer { withExtendedLifetime(guarded) {} }
+        let fd = open(paths.lock.path, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { throw SandboxError("open \(paths.lock.path): errno \(errno)") }
+        do {
+            guard try await acquireOwnership(fd) else { throw SandboxError("\(id) already has an owner") }
+            try DiskUpdate.settle(paths)
+            return fd
+        } catch {
+            close(fd)
+            throw error
+        }
     }
 
     /// `status` probes the owner lock with a momentary non-blocking flock, so

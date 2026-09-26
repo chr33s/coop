@@ -26,7 +26,7 @@ swift test --package-path macos/coop-sandbox
 The binary needs only the `com.apple.security.virtualization` entitlement and is
 signed ad hoc. Requires Xcode (Swift 6.2+) and macOS 26+ on Apple Silicon.
 
-## CLI (protocol 1)
+## CLI (protocol 2)
 
 Every command except `version` takes `--root <absolute path>`, the state root.
 It is canonicalized with realpath(3), and every path the runtime reports lies
@@ -43,19 +43,30 @@ stop ID [--timeout-seconds S]             systemd halt (SIGRTMIN+3), then unload
 exec [-i] [--timeout S] ID -- ARGV        root, over vsock; exit code is passed through
 inspect ID                                {record, status, live, effective, disk}
 list                                      [{id, status, owner}]
-set ID [--cpus N] [--memory-mib M]        stopped only; applied at the next start
-grow ID --disk-gib G                      stopped only; offline e2fsck + resize2fs
+set ID [--cpus N] [--memory-mib M] [--operation OP] [--expect-operation OP]
+                                          stopped only; applied at the next start
+grow ID --disk-gib G [--operation OP]     stopped only; offline e2fsck + resize2fs
 commit ID NAME [--replace]                save the disk with host keys and machine-id removed
-restore ID (NAME | --image REF)           replace the disk; bumps record.diskGeneration
+restore ID (NAME | --image REF) [--operation OP]
+                                          replace the disk; bumps record.diskGeneration
 disk list | disk delete NAME
+maintenance install --image REF --version V
+                                          unpack REF as the maintenance boot disk
+maintenance inspect                       the installed maintenance artifact, or null
 logs ID [-n N] [--follow]                 serial console
 delete ID --owner O                       refuses another owner's sandbox
-reconcile                                 clear crashed owners, finish interrupted creates/deletes
-                                          (the sweep is skipped while a create/grow/commit/restore runs)
+reconcile                                 clear crashed owners, finish interrupted creates, deletes,
+                                          and disk updates (the sweep is skipped while an operation runs)
 ```
 
 Status is `running`, `booting` (owner up, control channel not yet answering),
 `stopped`, or `crashed` (owner died; `start` recovers).
+
+`set`, `grow`, and `restore` record `--operation` (or a generated id) as
+`record.lastOperation` when they commit, so a caller can tell after a crash
+whether its own operation applied. `set --expect-operation` refuses unless the
+last committed operation is still the given one: a caller undoing its change
+never overwrites a newer one.
 
 ## Behaviour worth knowing
 
@@ -68,10 +79,34 @@ Status is `running`, `booting` (owner up, control channel not yet answering),
   and APFS-cloned per sandbox, so creating from a cached base takes
   milliseconds. The formatter uses `sparse_super2`, which the guest kernel
   cannot resize online, so `grow` runs `e2fsck`/`resize2fs` in a short,
-  network-less maintenance VM booted from a coop-built tools image; the
-  sandbox's disk is attached as data and none of its programs run. The grown
-  copy is swapped in only on success. `commit` uses the same VM to strip host
-  keys and machine-id.
+  network-less maintenance VM; the sandbox's disk is attached as data and none
+  of its programs run. `commit` uses the same VM to strip host keys and
+  machine-id.
+- **Maintenance image.** Maintenance VMs boot a disposable clone of a disk
+  installed by `maintenance install`: a small image (a shell and e2fsprogs)
+  unpacked into `maintenance/`, sized from its own layers, checked for the
+  programs the scripts run, and kept apart from the image store, so deleting
+  or replacing an application image never affects it. Without one, `grow`,
+  `commit`, and a `create`/`restore` that must grow fail before any disk
+  changes. coop builds and installs it during `coop setup`.
+- **Disk updates.** `grow` and `restore` prepare the new disk on a scratch
+  clone, then publish it through one path: the new record is staged beside
+  the prepared disk's inode, the disk is renamed into place, and the record is
+  written. After a crash the next guarded operation (or the owner, or
+  `reconcile`) finishes an update whose disk was installed and discards one
+  whose disk was not, so disk and record always describe the same update.
+  Unreadable or contradictory staged state is an error, never a guess. This
+  covers process crashes, not sudden power loss.
+- **Serialization.** Every mutation of a sandbox (create, start, set, grow,
+  commit, restore, delete) holds that sandbox's guard (`locks/sandbox-<id>.lock`)
+  across its stopped check and its change; other sandboxes are unaffected. An
+  owner takes the same guard to claim its sandbox, whether `start` or a
+  launchd respawn launched it, so a VM never boots while its disk is being
+  replaced. A committed disk has its own lock, so a clone never pairs one
+  version's disk with another's metadata. All are flock(2) locks, released by
+  the kernel when their holder dies; `FileLock` in `Layout.swift` documents
+  the order they are taken in. The invariants behind this are in
+  [`docs/design/apple-sandbox-transactions.md`](../../docs/design/apple-sandbox-transactions.md).
 - **Console log.** The serial console is copied to `boot.log`, capped at
   8 MiB: past the cap the file restarts with a marker line, so a guest
   flooding its console cannot fill the host disk. `logs -n` reads only the

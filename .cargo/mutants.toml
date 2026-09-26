@@ -162,8 +162,9 @@ exclude_re = [
   "\\bremove_instance_dir\\b",
   # `status` is its tested describe_sandbox text plus guest usage over real SSH.
   "AppleContainerBackend>::status ->",
-  # Equivalent: the comparison only picks the wording of a reconcile warning.
-  "replace == with != in AppleContainerBackend::recover_journal",
+  # Equivalent: for a resource-change journal without an operation id, the
+  # comparison only picks the wording of a reconcile warning.
+  "replace != with == in AppleContainerBackend::recover_journal",
   # Equivalent: `acc << 6` has zero low bits, so `| v` and `^ v` agree.
   "replace \\| with \\^ in decode_base64",
   # apple_container/cli.rs — process spawning, deadline polling, and log IO

@@ -12,6 +12,8 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/apple/containerization.git", exact: "0.45.0"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.7.0"),
+        // Already resolved through containerization; named for `FilePath`.
+        .package(url: "https://github.com/apple/swift-system.git", from: "1.6.4"),
     ],
     targets: [
         .target(
@@ -22,6 +24,7 @@ let package = Package(
                 .product(name: "ContainerizationOCI", package: "containerization"),
                 .product(name: "ContainerizationEXT4", package: "containerization"),
                 .product(name: "ContainerizationOS", package: "containerization"),
+                .product(name: "SystemPackage", package: "swift-system"),
             ]
         ),
         .executableTarget(

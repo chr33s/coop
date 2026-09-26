@@ -3,8 +3,8 @@ import Foundation
 
 /// Version of the JSON contract between coop and this binary. Bump on any
 /// incompatible change to a command's arguments or output.
-public let protocolVersion = 1
-public let runtimeVersion = "0.1.0"
+public let protocolVersion = 2
+public let runtimeVersion = "0.2.0"
 public let containerizationVersion = "0.45.0"
 
 /// On-disk layout of one runtime state root. Everything the runtime owns
@@ -46,9 +46,21 @@ public struct SandboxRoot: Sendable {
     public var subnetState: URL { root.appendingPathComponent("subnets.json") }
     public var allocationLock: URL { root.appendingPathComponent("subnets.lock") }
     public var operationLock: URL { root.appendingPathComponent("operations.lock") }
+    /// Lock files for sandboxes, committed disks, and the maintenance
+    /// artifact (see ``FileLock``). They are never removed, so every process
+    /// locks the same file for a given name, even across a delete.
+    public var locks: URL { root.appendingPathComponent("locks", isDirectory: true) }
+    /// The installed maintenance artifact (see ``MaintenanceArtifact``).
+    public var maintenance: URL { root.appendingPathComponent("maintenance", isDirectory: true) }
 
     public func sandbox(_ id: SandboxID) -> SandboxPaths {
-        SandboxPaths(dir: sandboxes.appendingPathComponent(id.rawValue, isDirectory: true))
+        SandboxPaths(id: id, dir: sandboxes.appendingPathComponent(id.rawValue, isDirectory: true), locks: locks)
+    }
+
+    /// Guards committed disk `name` and its metadata: exclusive to publish or
+    /// delete them, shared to clone them.
+    public func diskLock(_ name: SandboxID) -> URL {
+        locks.appendingPathComponent("disk-\(name.rawValue).lock")
     }
 
     public func disk(_ name: SandboxID) -> URL {
@@ -61,29 +73,33 @@ public struct SandboxRoot: Sendable {
         }
     }
 
-    /// Every committed sandbox. A directory without a record is an
-    /// uncommitted create and is skipped; a record that exists but cannot be
-    /// read is an error, so listings and subnet allocation fail closed rather
-    /// than forget a sandbox.
+    /// Every committed sandbox's `record.json`. A directory without a record
+    /// is an uncommitted create and is skipped; a record that exists but
+    /// cannot be read is an error, so listings and subnet allocation fail
+    /// closed rather than forget a sandbox. A staged disk update is not
+    /// applied: it never changes the identity, owner, or subnet these
+    /// callers read, and one left unreadable must not hide every sandbox.
     public func allRecords() throws -> [SandboxRecord] {
         guard FileManager.default.fileExists(atPath: sandboxes.path) else { return [] }
         return try FileManager.default.contentsOfDirectory(atPath: sandboxes.path).sorted().compactMap { name in
             guard let id = try? SandboxID(name) else { return nil }
             let paths = sandbox(id)
             guard FileManager.default.fileExists(atPath: paths.record.path) else { return nil }
-            return try paths.loadRecord()
+            return try paths.readRecordFile()
         }
     }
 
     public func createDirectories() throws {
-        for dir in [root, sandboxes, bases, disks] {
+        for dir in [root, sandboxes, bases, disks, locks, maintenance] {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         }
     }
 }
 
 public struct SandboxPaths: Sendable {
+    public let id: SandboxID
     public let dir: URL
+    let locks: URL
     public var record: URL { dir.appendingPathComponent("record.json") }
     public var live: URL { dir.appendingPathComponent("live.json") }
     public var rootfs: URL { dir.appendingPathComponent("rootfs.ext4") }
@@ -93,6 +109,17 @@ public struct SandboxPaths: Sendable {
     public var launchdPlist: URL { dir.appendingPathComponent("launchd.plist") }
     /// Written by an owner that failed before its VM ran; read by `start`.
     public var ownerFailed: URL { dir.appendingPathComponent("owner.failed") }
+    /// A staged disk update (see ``DiskUpdate``).
+    public var pendingDiskUpdate: URL { dir.appendingPathComponent("disk-update.pending.json") }
+    /// A staged restore written by runtime 0.1.0, still recovered.
+    var legacyPendingRestore: URL { dir.appendingPathComponent("restore.pending.json") }
+    /// Serializes every mutation of this sandbox, and an owner's claim to
+    /// it, across processes (see ``Sandboxes/mutating(_:settle:_:)``).
+    public var mutationLock: URL { locks.appendingPathComponent("sandbox-\(id.rawValue).lock") }
+    /// Held briefly: exclusive while a disk update's record is written,
+    /// shared while the record is read, so a reader never pairs a record with
+    /// the other side of a publication.
+    var recordLock: URL { locks.appendingPathComponent("record-\(id.rawValue).lock") }
     /// Unix socket paths are limited to 104 bytes on macOS, so the control
     /// socket lives in a short per-user directory keyed by a hash of `dir`.
     public var control: URL {
@@ -117,53 +144,43 @@ public struct SandboxPaths: Sendable {
         return String(h, radix: 16)
     }
 
+    /// The committed record. A disk update whose disk is already installed
+    /// is committed even if a crash interrupted its record write, so its
+    /// staged record is returned. Nothing is written here: only a guarded
+    /// mutation settles the update (``DiskUpdate/settle(_:)``).
     public func loadRecord() throws -> SandboxRecord {
-        settlePendingRestore()
-        return try JSONDecoder.iso.decode(SandboxRecord.self, from: Data(contentsOf: record))
+        let lock = try FileLock.acquire(recordLock, .shared)
+        defer { withExtendedLifetime(lock) {} }
+        let record = try readRecordFile()
+        guard let (pending, _) = try DiskUpdate.loadPending(self) else { return record }
+        return try DiskUpdate.isPublished(pending, self) ? pending.record : record
     }
 
-    /// The record a restore will commit, written before its disk swap.
-    public var pendingRestore: URL { dir.appendingPathComponent("restore.pending.json") }
-    /// The restore's prepared disk, swapped in by rename.
-    public var restoreWork: URL { dir.appendingPathComponent(".restore-rootfs.ext4") }
-
-    struct PendingRestore: Codable {
-        var inode: UInt64
-        var record: SandboxRecord
+    /// `record.json` as written, ignoring any staged disk update.
+    func readRecordFile() throws -> SandboxRecord {
+        try JSONDecoder.iso.decode(SandboxRecord.self, from: Data(contentsOf: record))
     }
 
-    static func inode(_ url: URL) -> UInt64? {
-        var st = stat()
-        return lstat(url.path, &st) == 0 ? UInt64(st.st_ino) : nil
-    }
-
-    /// Finishes a restore interrupted between its disk swap and its record
-    /// write, so the disk and its generation never disagree: the swap moved
-    /// the prepared disk (same inode) into place, or it never happened.
-    func settlePendingRestore() {
-        guard let data = try? Data(contentsOf: pendingRestore),
-            let pending = try? JSONDecoder.iso.decode(PendingRestore.self, from: data)
-        else { return }
-        if Self.inode(rootfs) == pending.inode {
-            guard (try? save(pending.record)) != nil else { return }
-        } else if FileManager.default.fileExists(atPath: restoreWork.path) {
-            return  // the swap may still happen
-        }
-        try? FileManager.default.removeItem(at: pendingRestore)
-    }
-
-    func writePendingRestore(_ record: SandboxRecord, disk: URL) throws {
-        guard let inode = Self.inode(disk) else { throw SandboxError("stat \(disk.path): errno \(errno)") }
-        try JSONEncoder.pretty.encode(PendingRestore(inode: inode, record: record)).write(to: pendingRestore, options: .atomic)
-    }
-
+    /// Callers hold the mutation guard, and no disk update is staged.
     public func save(_ record: SandboxRecord) throws {
+        let lock = try FileLock.acquire(recordLock, .exclusive)
+        defer { withExtendedLifetime(lock) {} }
+        try writeRecordFile(record)
+    }
+
+    /// Caller holds `recordLock` exclusively.
+    func writeRecordFile(_ record: SandboxRecord) throws {
         try JSONEncoder.pretty.encode(record).write(to: self.record, options: .atomic)
     }
 
     public func loadLive() -> LiveState? {
         guard let data = try? Data(contentsOf: live) else { return nil }
         return try? JSONDecoder.iso.decode(LiveState.self, from: data)
+    }
+
+    static func inode(_ url: URL) -> UInt64? {
+        var st = stat()
+        return lstat(url.path, &st) == 0 ? UInt64(st.st_ino) : nil
     }
 }
 
@@ -179,6 +196,33 @@ public struct SandboxID: RawRepresentable, Codable, Hashable, Sendable, CustomSt
         guard ok else { throw SandboxError("invalid identifier \(raw.debugDescription)") }
         rawValue = raw
     }
+    public init(from decoder: Decoder) throws {
+        try self.init(try decoder.singleValueContainer().decode(String.self))
+    }
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        try c.encode(rawValue)
+    }
+    public var description: String { rawValue }
+}
+
+/// Identifies one `set`, `grow`, or `restore`. Callers pass their own to
+/// correlate the outcome after a crash; otherwise one is generated.
+public struct OperationID: RawRepresentable, Codable, Hashable, Sendable, CustomStringConvertible {
+    public let rawValue: String
+    public init?(rawValue: String) { try? self.init(rawValue) }
+    public init(_ raw: String) throws {
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789-")
+        guard !raw.isEmpty, raw.count <= 64, raw.unicodeScalars.allSatisfy({ allowed.contains($0) }) else {
+            throw SandboxError("invalid operation id \(raw.debugDescription)")
+        }
+        rawValue = raw
+    }
+    public static func random() -> OperationID {
+        // A lowercased UUID always satisfies the rule above.
+        OperationID(unchecked: UUID().uuidString.lowercased())
+    }
+    private init(unchecked: String) { rawValue = unchecked }
     public init(from decoder: Decoder) throws {
         try self.init(try decoder.singleValueContainer().decode(String.self))
     }
@@ -211,6 +255,10 @@ public struct SandboxRecord: Codable, Sendable {
     /// Incremented each time `restore` replaces the disk, so a caller that
     /// crashed mid-restore can tell whether it applied.
     public var diskGeneration: Int = 0
+    /// The last `set`, `grow`, or `restore` committed to this record, so a
+    /// caller can tell whether its own operation applied and whether another
+    /// has happened since. Absent until the first such operation.
+    public var lastOperation: OperationID?
 
     public var subnet: String { Self.subnet(subnetIndex) }
     public static func subnet(_ index: Int) -> String { "10.231.\(index).0/24" }
@@ -280,37 +328,92 @@ public enum KernelPin {
     }
 }
 
-/// Serializes offline disk operations against `reconcile`'s sweep of scratch
-/// files and uncommitted creates. Operations hold it shared (they run
-/// concurrently with each other); the sweep needs it exclusively.
-public final class OperationLock {
+/// An flock(2) lock on a file. The kernel drops it when the holder's
+/// descriptor closes, including when the process dies, so a crashed holder
+/// never leaves a stale lock.
+///
+/// Lock order: a holder may take only locks further down this list.
+/// 1. `operations.lock` (``OperationLock``).
+/// 2. `locks/sandbox-<id>.lock`, one sandbox's mutation guard
+///    (``SandboxPaths/mutationLock``). An owner holds it only while it
+///    claims ownership; a mutation never waits for `owner.lock`, it only
+///    probes it.
+/// 3. `locks/disk-<name>.lock`, one committed disk (``SandboxRoot/diskLock(_:)``).
+/// 4. `subnets.lock`, the subnet allocator.
+/// 5. Leaf locks, held briefly with nothing taken inside them:
+///    `locks/record-<id>.lock` (``SandboxPaths/recordLock``) and
+///    `locks/maintenance.lock` (``Maintenance``).
+public final class FileLock {
+    public enum Mode: Sendable {
+        case shared, exclusive
+        var operation: Int32 { self == .shared ? LOCK_SH : LOCK_EX }
+    }
+
     private let fd: Int32
 
     private init(fd: Int32) { self.fd = fd }
 
-    /// Blocks until no sweep is running.
-    public static func shared(_ root: SandboxRoot) throws -> OperationLock {
-        let fd = open(root.operationLock.path, O_CREAT | O_RDWR, 0o600)
-        guard fd >= 0 else { throw SandboxError("open \(root.operationLock.path): errno \(errno)") }
-        guard flock(fd, LOCK_SH) == 0 else {
+    /// Blocks until the lock is granted.
+    public static func acquire(_ url: URL, _ mode: Mode) throws -> FileLock {
+        let fd = try openLockFile(url)
+        while flock(fd, mode.operation) != 0 {
+            let e = errno
+            if e == EINTR { continue }
             close(fd)
-            throw SandboxError("flock: errno \(errno)")
+            throw SandboxError("flock \(url.lastPathComponent): errno \(e)")
         }
-        return OperationLock(fd: fd)
+        return FileLock(fd: fd)
     }
 
-    /// `nil` while any operation is in progress.
-    public static func tryExclusive(_ root: SandboxRoot) -> OperationLock? {
-        let fd = open(root.operationLock.path, O_CREAT | O_RDWR, 0o600)
-        guard fd >= 0 else { return nil }
-        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
-            close(fd)
-            return nil
+    /// Waits without blocking a thread, for callers on Swift concurrency.
+    public static func acquire(_ url: URL, _ mode: Mode, polling interval: Duration) async throws -> FileLock {
+        while true {
+            if let lock = try attempt(url, mode) { return lock }
+            try await Task.sleep(for: interval)
         }
-        return OperationLock(fd: fd)
+    }
+
+    /// `nil` while a conflicting holder has it.
+    public static func attempt(_ url: URL, _ mode: Mode) throws -> FileLock? {
+        let fd = try openLockFile(url)
+        guard flock(fd, mode.operation | LOCK_NB) == 0 else {
+            let e = errno
+            close(fd)
+            if e == EWOULDBLOCK { return nil }
+            throw SandboxError("flock \(url.lastPathComponent): errno \(e)")
+        }
+        return FileLock(fd: fd)
+    }
+
+    /// Creates the lock directory inside an existing state root, never the
+    /// root itself.
+    static func openLockFile(_ url: URL) throws -> Int32 {
+        let dir = url.deletingLastPathComponent()
+        if mkdir(dir.path, 0o700) != 0, errno != EEXIST {
+            throw SandboxError("mkdir \(dir.path): errno \(errno)")
+        }
+        let fd = open(url.path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0o600)
+        guard fd >= 0 else { throw SandboxError("open \(url.path): errno \(errno)") }
+        return fd
     }
 
     deinit { close(fd) }
+}
+
+/// Serializes offline operations against `reconcile`'s sweep of scratch
+/// files and uncommitted creates. Operations hold it shared (distinct
+/// sandboxes run concurrently; ``Sandboxes/mutating(_:settle:_:)``
+/// serializes each one); the sweep needs it exclusively.
+public enum OperationLock {
+    /// Blocks until no sweep is running.
+    public static func shared(_ root: SandboxRoot) throws -> FileLock {
+        try FileLock.acquire(root.operationLock, .shared)
+    }
+
+    /// `nil` while any operation is in progress.
+    public static func tryExclusive(_ root: SandboxRoot) -> FileLock? {
+        (try? FileLock.attempt(root.operationLock, .exclusive)) ?? nil
+    }
 }
 
 public func clone(_ from: URL, to: URL) throws {

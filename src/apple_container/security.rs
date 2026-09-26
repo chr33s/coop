@@ -18,7 +18,7 @@ use super::protocol::{Effective, EffectiveMount, Inspect, SandboxStatus, Version
 use super::state::MachineName;
 
 /// The protocol and containerization release this build was validated with.
-pub(crate) const PROTOCOL: u32 = 1;
+pub(crate) const PROTOCOL: u32 = 2;
 pub(crate) const CONTAINERIZATION: &str = "0.45.0";
 
 /// Kernel pseudo-filesystems a sandbox may mount, as (type, source,
@@ -291,9 +291,9 @@ mod tests {
     #[test]
     fn qualifies_only_the_validated_runtime() {
         let v = parse_version(&fixture("version.json")).unwrap();
-        assert!(qualify(&v).unwrap().identity.contains("coop-sandbox 0.1.0"));
+        assert!(qualify(&v).unwrap().identity.contains("coop-sandbox 0.2.0"));
         for (field, value) in [
-            ("protocol", "2"),
+            ("protocol", "1"),
             ("containerization", "\"0.47.0\""),
             ("name", "\"container\""),
         ] {

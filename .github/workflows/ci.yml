@@ -84,7 +84,9 @@ jobs:
 
   # The opt-in Apple sandbox backend compiles only on macOS. Unit tests use a
   # scripted runtime, and the coop-sandbox tests boot no VM; nothing here needs
-  # Apple Container or virtualization.
+  # Apple Container or virtualization. The default (Lima) build is checked here
+  # too, since shared backend, SSH, and lifecycle code compiles differently on
+  # macOS than on the Linux jobs.
   apple-container:
     # Pinned: macos/coop-sandbox needs Swift 6.2+ and the macOS 26 SDK
     # (vmnet networks); this image's default Xcode is 26.x.
@@ -93,6 +95,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Clippy (macOS default / Lima)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Unit tests (macOS default / Lima)
+        run: cargo test
 
       - name: Clippy (apple-container)
         run: cargo clippy --all-targets --features apple-container -- -D warnings

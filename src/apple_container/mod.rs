@@ -41,7 +41,8 @@ use image::{BuildContext, BuildInputs, CommittedDisk, ImageManifest};
 use protocol::{Inspect, SandboxStatus};
 use security::{Expected, QualifiedRuntime, SecurityReady};
 use state::{
-    CreationState, Journal, JournalOp, MachineName, MachineSidecar, Operation, Owner, Stage,
+    CreateStage, DestroyStage, Journal, JournalOp, MachineName, MachineSidecar, OperationId, Owner,
+    Resources,
 };
 
 /// Stable diagnostic classes. The prefix of each message is the identifier
@@ -547,6 +548,66 @@ impl Runtime {
         }
     }
 
+    /// Boot `expected.sandbox` and read its host key, all by `deadline`. The
+    /// three conditions stay distinct and ordered: the owner answers
+    /// (`boot`), the effective configuration passes the isolation gate
+    /// (`wait_ready`), and the key is read over the native channel from the
+    /// boot the gate approved. Trusting the key and SSH readiness are the
+    /// caller's next steps ([`pin_host_key`], [`wait_for_ssh`]). On error the
+    /// sandbox may be running; the caller stops or deletes it.
+    fn boot_validated(
+        &self,
+        expected: &Expected<'_>,
+        deadline: Instant,
+    ) -> Result<(SecurityReady, ssh::HostPublicKey)> {
+        self.boot(expected.sandbox)?;
+        let ready = self.wait_ready(expected, deadline)?;
+        let key = self.read_host_key(&ready, deadline)?;
+        Ok((ready, key))
+    }
+
+    /// Change a stopped sandbox's CPU/memory as operation `op`. With
+    /// `expect`, the runtime refuses unless its last committed operation is
+    /// still `expect`, checked under its own per-sandbox guard.
+    fn set_resources(
+        &self,
+        name: &MachineName,
+        target: Resources,
+        op: &OperationId,
+        expect: Option<&OperationId>,
+    ) -> Result<()> {
+        let cpus = target.cpus.to_string();
+        let mem = (target.memory_bytes / MIB).to_string();
+        let mut rest = vec![
+            name.as_str(),
+            "--cpus",
+            cpus.as_str(),
+            "--memory-mib",
+            mem.as_str(),
+            "--operation",
+            op.as_str(),
+        ];
+        if let Some(expect) = expect {
+            rest.extend(["--expect-operation", expect.as_str()]);
+        }
+        self.text(
+            self.args(&["set"], &rest),
+            self.settings.operation,
+            MAX_JSON_OUTPUT,
+        )?;
+        Ok(())
+    }
+
+    /// The installed maintenance artifact, if any.
+    fn maintenance(&self) -> Result<Option<protocol::MaintenanceArtifact>> {
+        let json = self.text(
+            self.args(&["maintenance", "inspect"], &[]),
+            self.settings.probe,
+            MAX_JSON_OUTPUT,
+        )?;
+        protocol::parse_maintenance(&json)
+    }
+
     /// Run a fixed command as root in the guest over the native control
     /// channel (vsock). Arguments reach the guest as an argv, never a shell
     /// string.
@@ -819,19 +880,49 @@ impl Builder {
     }
 }
 
-/// The one command that reconciles an unfinished `operation`: `start`
-/// finishes an interrupted resize or restore; `destroy` removes or finishes
-/// the rest.
-fn recovery_hint(operation: Operation, name: &crate::config::InstanceName) -> String {
-    match operation {
-        Operation::SetResources | Operation::RestoreDisk => {
-            format!("run `coop start {name}` to finish it")
+/// How a boot treats the guest's SSH host key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostKeyTrust {
+    /// First boot of a new instance: pin the key it generated.
+    Enroll,
+    /// An existing instance: the key must match its pin.
+    RequirePin,
+    /// coop itself replaced the disk (`restore`, correlated by its
+    /// operation id): pin the new key.
+    ReenrollAfterRestore,
+}
+
+fn pin_host_key(
+    inst: &Instance,
+    machine: &MachineName,
+    key: &ssh::HostPublicKey,
+    trust: HostKeyTrust,
+) -> Result<()> {
+    match trust {
+        HostKeyTrust::Enroll => ssh::enroll(inst, machine, key),
+        HostKeyTrust::RequirePin => ssh::check_pin(inst, machine, key),
+        HostKeyTrust::ReenrollAfterRestore => {
+            ssh::reenroll_after_disk_replacement(inst, machine, key)
         }
-        Operation::Create => {
-            format!("run `coop destroy {name}` to remove what it created, then `coop up` again")
-        }
-        Operation::Destroy => format!("run `coop destroy {name}` to finish it"),
     }
+}
+
+/// Wait until pinned SSH accepts connections, within what is left of
+/// `deadline` (at least 5 s).
+fn wait_for_ssh(
+    cfg: &CoopConfig,
+    inst: &Instance,
+    ready: &SecurityReady,
+    user: &crate::guest::GuestUser,
+    deadline: Instant,
+) -> Result<()> {
+    ssh::pinned_target(cfg, inst, ready.sandbox(), ready.ip(), user)?
+        .wait_until_ready(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_secs(5)),
+        )
+        .context("Guest booted but SSH is not accepting connections")
 }
 
 /// Argument vector for `coop-sandbox create`. There is no argument for a
@@ -905,9 +996,19 @@ impl AppleContainerBackend {
             None => Source::Image(&manifest.image_ref),
         };
 
-        journal.advance(inst, Stage::CreatingMachine)?;
+        journal.advance(
+            inst,
+            JournalOp::Create {
+                stage: CreateStage::CreatingMachine,
+            },
+        )?;
         rt.create(&machine, &source, cpus, memory_mib, disk, owner)?;
-        journal.advance(inst, Stage::MachineCreated)?;
+        journal.advance(
+            inst,
+            JournalOp::Create {
+                stage: CreateStage::MachineCreated,
+            },
+        )?;
 
         let mut sidecar = MachineSidecar {
             schema_version: state::SCHEMA_VERSION,
@@ -930,25 +1031,15 @@ impl AppleContainerBackend {
             last_observed_owner_pid: None,
             last_observed_ip: None,
             reenroll_host_key: false,
-            creation_state: CreationState::Ready,
             created_at: crate::setup::utc_timestamp(),
             runtime_identity: q.identity.clone(),
         };
         security::verify_record(&rt.inspect(&machine)?, &rt.expected(&sidecar))?;
 
         let deadline = Instant::now() + rt.settings.boot;
-        rt.boot(&machine)?;
-        let ready = rt.wait_ready(&rt.expected(&sidecar), deadline)?;
-        let key = rt.read_host_key(&ready, deadline)?;
-        ssh::enroll(inst, &machine, &key)?;
-        let target = ssh::pinned_target(cfg, inst, &machine, ready.ip(), &manifest.guest_user)?;
-        target
-            .wait_until_ready(
-                deadline
-                    .saturating_duration_since(Instant::now())
-                    .max(Duration::from_secs(5)),
-            )
-            .context("Guest booted but SSH is not accepting connections")?;
+        let (ready, key) = rt.boot_validated(&rt.expected(&sidecar), deadline)?;
+        pin_host_key(inst, &machine, &key, HostKeyTrust::Enroll)?;
+        wait_for_ssh(cfg, inst, &ready, &manifest.guest_user, deadline)?;
 
         sidecar.host_key_fingerprint = key.fingerprint();
         sidecar.last_observed_owner_pid = Some(ready.owner_pid());
@@ -961,11 +1052,10 @@ impl AppleContainerBackend {
         let owner = Owner::load(cfg)?;
         if let Some(journal) = Journal::try_load(inst)? {
             bail!(AppleError::OperationUncertain(format!(
-                "instance '{}' has an unfinished {:?} operation (stage {:?}); {}",
+                "instance '{}' has an unfinished {}; {}",
                 inst.name,
-                journal.op.kind(),
-                journal.stage,
-                recovery_hint(journal.op.kind(), &inst.name)
+                journal.op.describe(),
+                journal.op.recovery_hint(&inst.name)
             )));
         }
         let sidecar = MachineSidecar::load(inst)?;
@@ -973,9 +1063,11 @@ impl AppleContainerBackend {
         Ok(sidecar)
     }
 
-    /// Finish an interrupted `resize` or `restore` once the sandbox is
-    /// confirmed stopped: the runtime's record is authoritative. Other
-    /// journaled operations are left for `destroy`. Caller holds the lock.
+    /// Finish an interrupted resource change or restore once the sandbox is
+    /// confirmed stopped: the runtime's record is authoritative, and its last
+    /// committed operation says whether coop's own change applied.
+    /// Idempotent: nothing is sent to the runtime. Other journaled
+    /// operations are left for `destroy`. Caller holds the lock.
     fn recover_journal(rt: &Runtime, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         let Some(journal) = Journal::try_load(inst)? else {
             return Ok(());
@@ -998,42 +1090,52 @@ impl AppleContainerBackend {
         let rec = rt.inspect(&sidecar.machine_id)?;
         if rec.status != SandboxStatus::Stopped {
             bail!(AppleError::OperationUncertain(format!(
-                "an interrupted {:?} of '{}' cannot be reconciled while the sandbox is {}",
-                journal.op.kind(),
+                "an interrupted {} of '{}' cannot be reconciled while the sandbox is {}",
+                journal.op.describe(),
                 inst.name,
                 rec.status.label()
             )));
         }
-        match journal.op {
+        match &journal.op {
             JournalOp::SetResources {
-                prior: (prior_cpus, prior_bytes),
+                operation, prior, ..
             } => {
-                let outcome =
-                    if (rec.record.cpus, rec.record.memory_bytes) == (prior_cpus, prior_bytes) {
-                        "the change did not apply"
-                    } else {
-                        "the change applied"
-                    };
+                let applied = match operation {
+                    Some(op) => rec.record.committed(op),
+                    None => rec.record.resources() != *prior,
+                };
                 tracing::warn!(
-                    "Reconciling an interrupted resize of '{}' ({outcome}): runtime reports {} vCPUs / {} MiB",
+                    "Reconciling an interrupted resource change of '{}' ({}): runtime reports {}",
                     inst.name,
-                    rec.record.cpus,
-                    rec.record.memory_bytes / MIB
+                    if applied {
+                        "the change applied"
+                    } else {
+                        "the change did not apply"
+                    },
+                    rec.record.resources()
                 );
                 sidecar.requested_cpus = rec.record.cpus;
                 sidecar.requested_memory_bytes = rec.record.memory_bytes;
             }
-            JournalOp::RestoreDisk { prior_generation } => {
-                // Only a higher disk generation proves coop's restore replaced
-                // the disk; anything else keeps the existing pin.
-                let applied = rec.record.disk_generation > prior_generation;
+            JournalOp::RestoreDisk {
+                operation,
+                prior_generation,
+            } => {
+                // Only coop's own restore, identified by its operation id,
+                // authorizes a new host key; a higher generation alone does
+                // not (journals from before operation ids have only that).
+                let replaced = rec.record.disk_generation > *prior_generation;
+                let applied = match operation {
+                    Some(op) => replaced && rec.record.committed(op),
+                    None => replaced,
+                };
                 tracing::warn!(
                     "Reconciling an interrupted restore of '{}': {}",
                     inst.name,
                     if applied {
                         "the disk was replaced"
                     } else {
-                        "the disk was not replaced"
+                        "the disk was not replaced by this restore"
                     }
                 );
                 if applied {
@@ -1042,7 +1144,7 @@ impl AppleContainerBackend {
                     sidecar.reenroll_host_key = true;
                 }
             }
-            JournalOp::Create | JournalOp::Destroy => {}
+            JournalOp::Create { .. } | JournalOp::Destroy { .. } => {}
         }
         sidecar.save(inst)?;
         Journal::complete(inst)
@@ -1066,14 +1168,17 @@ impl AppleContainerBackend {
         security::verify_record(&rec, &rt.expected(&sidecar))?;
 
         let deadline = Instant::now() + rt.settings.boot;
+        let trust = if sidecar.reenroll_host_key {
+            HostKeyTrust::ReenrollAfterRestore
+        } else {
+            HostKeyTrust::RequirePin
+        };
         let booted = (|| -> Result<SecurityReady> {
             // Inside the guard: a boot that errors or times out may still
             // have started the sandbox, and it must not be left running.
-            rt.boot(&machine)?;
-            let ready = rt.wait_ready(&rt.expected(&sidecar), deadline)?;
-            let key = rt.read_host_key(&ready, deadline)?;
-            if sidecar.reenroll_host_key {
-                ssh::reenroll_after_disk_replacement(inst, &machine, &key)?;
+            let (ready, key) = rt.boot_validated(&rt.expected(&sidecar), deadline)?;
+            pin_host_key(inst, &machine, &key, trust)?;
+            if trust == HostKeyTrust::ReenrollAfterRestore {
                 // Close the window at once: a later start, even after this
                 // one fails, must enforce the new pin.
                 tracing::info!(
@@ -1084,17 +1189,8 @@ impl AppleContainerBackend {
                 sidecar.reenroll_host_key = false;
                 sidecar.host_key_fingerprint = key.fingerprint();
                 sidecar.save(inst)?;
-            } else {
-                ssh::check_pin(inst, &machine, &key)?;
             }
-            let target = ssh::pinned_target(cfg, inst, &machine, ready.ip(), &sidecar.guest_user)?;
-            target
-                .wait_until_ready(
-                    deadline
-                        .saturating_duration_since(Instant::now())
-                        .max(Duration::from_secs(5)),
-                )
-                .context("Guest booted but SSH is not accepting connections")?;
+            wait_for_ssh(cfg, inst, &ready, &sidecar.guest_user, deadline)?;
             Ok(ready)
         })();
         let ready = match booted {
@@ -1122,6 +1218,70 @@ impl AppleContainerBackend {
         let (rt, _) = self.qualified_runtime()?;
         let ready = security::verify_effective(rec, &rt.expected(sidecar))?;
         ssh::pinned_target(cfg, inst, ready.sandbox(), ready.ip(), &sidecar.guest_user)
+    }
+
+    /// Install the disk maintenance image unless the runtime already has
+    /// this build's version. It is built from its own small recipe
+    /// ([`image::MAINTENANCE_VERSION`]) with the stock builder, unpacked by
+    /// the runtime outside its image store, then dropped from the store.
+    fn ensure_maintenance(
+        &self,
+        cfg: &CoopConfig,
+        rt: &Runtime,
+        owner: &Owner,
+        opts: &SetupOptions,
+    ) -> Result<()> {
+        if rt
+            .maintenance()?
+            .is_some_and(|m| m.version == image::MAINTENANCE_VERSION)
+        {
+            return Ok(());
+        }
+        let builder = self.builder()?;
+        builder.require_service(rt.settings.probe)?;
+        let reference = image::maintenance_ref(owner, &crate::fs_util::random_hex(4)?);
+        let context = image::maintenance_context()?;
+        let log = cfg.state_root().join("maintenance-build.log");
+        crate::fs_util::atomic_write_with_mode(&log, "", 0o600)?;
+        tracing::info!(
+            "Building the disk maintenance image {reference} (log: {})",
+            log.display()
+        );
+        let installed = build_into_runtime(
+            rt,
+            builder,
+            &reference,
+            context.path(),
+            &log,
+            opts.builder_timeout.unwrap_or(rt.settings.build),
+        )
+        .and_then(|_| {
+            rt.text(
+                rt.args(
+                    &["maintenance", "install"],
+                    &[
+                        "--image",
+                        &reference,
+                        "--version",
+                        image::MAINTENANCE_VERSION,
+                    ],
+                ),
+                rt.settings.create,
+                MAX_JSON_OUTPUT,
+            )
+        })
+        .and_then(|json| protocol::parse_maintenance(&json));
+        // The runtime keeps its own unpacked copy; the store entry is not
+        // used again either way.
+        rt.delete_image_best_effort(&reference);
+        match installed? {
+            Some(m) if m.version == image::MAINTENANCE_VERSION && m.reference == reference => {
+                Ok(())
+            }
+            other => bail!(AppleError::RuntimeUnqualified(format!(
+                "installing maintenance image {reference} reported {other:?}"
+            ))),
+        }
     }
 
     /// Create the runtime state root with the pinned kernel and init image.
@@ -1156,28 +1316,84 @@ impl AppleContainerBackend {
         Ok(rec)
     }
 
-    fn apply_resources(
+    /// Change a stopped instance's CPU/memory to `target` under the instance
+    /// lock, journaled first: the one path for both a forward change and its
+    /// rollback. With `undo`, only if the runtime's last committed operation
+    /// is still `undo.operation` with `undo.applied` resources (checked by
+    /// coop and again by the runtime under its own guard), so a rollback
+    /// never overwrites a newer change. The sandbox must be confirmed stopped
+    /// first. A change whose outcome cannot be confirmed keeps its journal,
+    /// which the next start reconciles, and is reported as uncertain.
+    fn update_resources(
         rt: &Runtime,
-        machine: &MachineName,
-        cpus: Option<u32>,
-        memory_mib: Option<u32>,
-    ) -> Result<()> {
-        let cpus = cpus.map(|c| c.to_string());
-        let mem = memory_mib.map(|m| m.to_string());
-        let mut rest = vec![machine.as_str()];
-        if let Some(c) = &cpus {
-            rest.extend(["--cpus", c.as_str()]);
+        cfg: &CoopConfig,
+        inst: &Instance,
+        owner: &Owner,
+        target: impl FnOnce(Resources) -> Resources,
+        undo: Option<&ResourceUpdate>,
+    ) -> Result<ResourceUpdate> {
+        let _lock = state::lock_instance(inst)?;
+        Self::recover_journal(rt, cfg, inst)?;
+        let mut sidecar = Self::owned_sidecar(cfg, inst)?;
+        let machine = sidecar.machine_id.clone();
+        let rec = Self::require_stopped(rt, inst, &machine)?;
+        let prior = rec.record.resources();
+        if let Some(undo) = undo
+            && !(rec.record.committed(&undo.operation)
+                && prior == undo.applied
+                && sidecar.resources() == undo.applied)
+        {
+            bail!(AppleError::OperationUncertain(format!(
+                "sandbox {machine} changed after the update to {} (now {prior}, last operation \
+                 {}); not rolling back over the newer change",
+                undo.applied,
+                rec.record.last_operation.as_deref().unwrap_or("none")
+            )));
         }
-        if let Some(m) = &mem {
-            rest.extend(["--memory-mib", m.as_str()]);
-        }
-        rt.text(
-            rt.args(&["set"], &rest),
-            rt.settings.operation,
-            MAX_JSON_OUTPUT,
+        let target = target(prior);
+        let operation = OperationId::generate()?;
+        Journal::begin(
+            inst,
+            owner,
+            JournalOp::SetResources {
+                operation: Some(operation.clone()),
+                prior,
+                target: Some(target),
+            },
+            machine.clone(),
         )?;
-        Ok(())
+        rt.set_resources(&machine, target, &operation, undo.map(|u| &u.operation))?;
+        let after = rt.inspect(&machine)?;
+        if !after.record.committed(&operation) || after.record.resources() != target {
+            bail!(AppleError::OperationUncertain(format!(
+                "sandbox {machine} reports {} (last operation {}) after the update to {target}; {}",
+                after.record.resources(),
+                after.record.last_operation.as_deref().unwrap_or("none"),
+                JournalOp::SetResources {
+                    operation: None,
+                    prior,
+                    target: None
+                }
+                .recovery_hint(&inst.name)
+            )));
+        }
+        sidecar.requested_cpus = target.cpus;
+        sidecar.requested_memory_bytes = target.memory_bytes;
+        sidecar.save(inst)?;
+        Journal::complete(inst)?;
+        Ok(ResourceUpdate {
+            operation,
+            prior,
+            applied: target,
+        })
     }
+}
+
+/// A resource change the runtime committed.
+struct ResourceUpdate {
+    operation: OperationId,
+    prior: Resources,
+    applied: Resources,
 }
 
 impl VmBackend for AppleContainerBackend {
@@ -1197,6 +1413,7 @@ impl VmBackend for AppleContainerBackend {
         let owner = Owner::load_or_init(cfg)?;
         ensure_ssh_key(cfg)?;
         self.init_runtime(rt)?;
+        self.ensure_maintenance(cfg, rt, &owner, opts)?;
 
         let pubkey_path = cfg.ssh_key_path().with_extension("pub");
         let pubkey = std::fs::read_to_string(&pubkey_path)
@@ -1309,11 +1526,19 @@ impl VmBackend for AppleContainerBackend {
                 "generated name {machine} is already in use; retry"
             )));
         }
-        let mut journal = Journal::begin(inst, &owner, JournalOp::Create, machine.clone())?;
+        let mut journal = Journal::begin(
+            inst,
+            &owner,
+            JournalOp::Create {
+                stage: CreateStage::Reserved,
+            },
+            machine.clone(),
+        )?;
         if let Err(e) =
             Self::provision_sandbox(cfg, rt, q, inst, &owner, &manifest, disk, &mut journal)
         {
-            if journal.stage >= Stage::CreatingMachine {
+            if matches!(journal.op, JournalOp::Create { stage } if stage >= CreateStage::CreatingMachine)
+            {
                 rt.stop_after_failure(&machine);
             }
             return Err(e);
@@ -1388,11 +1613,28 @@ impl VmBackend for AppleContainerBackend {
                 }
                 let mut j = match journal {
                     Some(j) => j,
-                    None => Journal::begin(inst, &owner, JournalOp::Destroy, machine.clone())?,
+                    None => Journal::begin(
+                        inst,
+                        &owner,
+                        JournalOp::Destroy {
+                            stage: DestroyStage::Reserved,
+                        },
+                        machine.clone(),
+                    )?,
                 };
-                j.advance(inst, Stage::DeletingMachine)?;
+                j.advance(
+                    inst,
+                    JournalOp::Destroy {
+                        stage: DestroyStage::DeletingMachine,
+                    },
+                )?;
                 rt.delete(&machine, &owner)?;
-                j.advance(inst, Stage::MachineDeleted)?;
+                j.advance(
+                    inst,
+                    JournalOp::Destroy {
+                        stage: DestroyStage::MachineDeleted,
+                    },
+                )?;
             }
             // A create or delete interrupted inside the runtime leaves an
             // unlisted directory there; reconcile removes it.
@@ -1461,20 +1703,34 @@ impl VmBackend for AppleContainerBackend {
                 before.record.disk_bytes / GIB
             );
         }
-        // The runtime grows a clone offline and swaps it in only on success,
-        // so a failure leaves the disk unchanged; no journal is needed.
+        // The runtime grows a scratch clone offline, then publishes it and
+        // its new size as one recoverable update: a failure before the swap
+        // leaves the disk as it was, and a crash after it is settled by the
+        // runtime's next operation on the sandbox. Nothing coop records
+        // depends on the disk size, so coop keeps no journal of its own.
         let gib = new_size.to_string();
+        let operation = OperationId::generate()?;
         let req = Request::new(
-            rt.args(&["grow"], &[machine.as_str(), "--disk-gib", &gib]),
+            rt.args(
+                &["grow"],
+                &[
+                    machine.as_str(),
+                    "--disk-gib",
+                    &gib,
+                    "--operation",
+                    operation.as_str(),
+                ],
+            ),
             rt.settings.create,
             MAX_JSON_OUTPUT,
         );
         rt.checked(&req)?;
         let after = rt.inspect(machine)?;
-        if after.record.disk_bytes != wanted {
+        if !after.record.committed(&operation) || after.record.disk_bytes != wanted {
             bail!(AppleError::OperationUncertain(format!(
-                "sandbox {machine} reports a {} byte disk after growing to {wanted}",
-                after.record.disk_bytes
+                "sandbox {machine} reports a {} byte disk (last operation {}) after growing to {wanted}",
+                after.record.disk_bytes,
+                after.record.last_operation.as_deref().unwrap_or("none")
             )));
         }
         tracing::info!("Grew instance '{}' disk to {new_size} GiB", inst.name);
@@ -1492,64 +1748,34 @@ impl VmBackend for AppleContainerBackend {
         let inst = stopped.instance();
         let (rt, _) = self.qualified_runtime()?;
         let owner = Owner::load(cfg)?;
-        let mut sidecar;
-        let prior;
-        {
-            let _lock = state::lock_instance(inst)?;
-            Self::recover_journal(rt, cfg, inst)?;
-            sidecar = Self::owned_sidecar(cfg, inst)?;
-            let machine = sidecar.machine_id.clone();
-            let rec = Self::require_stopped(rt, inst, &machine)?;
-            prior = (rec.record.cpus, rec.record.memory_bytes);
-            let mut journal = Journal::begin(
-                inst,
-                &owner,
-                JournalOp::SetResources { prior },
-                machine.clone(),
-            )?;
-            journal.advance(inst, Stage::Applying)?;
-
-            let cpus = vcpus.map(|v| u32::from(v.get()));
-            let memory_mib = mem.map(|m| m.get().as_u32());
-            Self::apply_resources(rt, &machine, cpus, memory_mib)?;
-            let after = rt.inspect(&machine)?;
-            let want_cpus = cpus.unwrap_or(prior.0);
-            let want_mem = memory_mib.map_or(prior.1, mib_to_bytes);
-            if after.record.cpus != want_cpus || after.record.memory_bytes != want_mem {
-                bail!(AppleError::OperationUncertain(format!(
-                    "sandbox {machine} reports {} vCPUs / {} bytes after update, expected {want_cpus} / {want_mem}",
-                    after.record.cpus, after.record.memory_bytes
-                )));
-            }
-            sidecar.requested_cpus = want_cpus;
-            sidecar.requested_memory_bytes = want_mem;
-            sidecar.save(inst)?;
-            Journal::complete(inst)?;
-        }
+        let forward = Self::update_resources(
+            rt,
+            cfg,
+            inst,
+            &owner,
+            |prior| Resources {
+                cpus: vcpus.map_or(prior.cpus, |v| u32::from(v.get())),
+                memory_bytes: mem.map_or(prior.memory_bytes, |m| mib_to_bytes(m.get().as_u32())),
+            },
+            None,
+        )?;
         if !start_after {
             return Ok(());
         }
         let Err(start_err) = self.start_existing(cfg, inst) else {
             return Ok(());
         };
-        // Roll back only once the sandbox is provably stopped again.
-        let machine = sidecar.machine_id.clone();
-        let rolled_back = (|| -> Result<()> {
-            Self::require_stopped(rt, inst, &machine)?;
-            let prior_mib = u32::try_from(prior.1 / MIB).context("prior memory")?;
-            Self::apply_resources(rt, &machine, Some(prior.0), Some(prior_mib))?;
-            sidecar.requested_cpus = prior.0;
-            sidecar.requested_memory_bytes = prior.1;
-            sidecar.save(inst)
-        })();
-        match rolled_back {
-            Ok(()) => Err(start_err.context(
-                "Instance failed to start with the new resources; previous CPU/memory restored",
-            )),
-            Err(rb) => Err(start_err.context(format!(
-                "Instance failed to start with the new resources, and restoring the previous \
-                 {} vCPUs / {} bytes did not complete: {rb:#}",
-                prior.0, prior.1
+        // A failed start stops the sandbox it booted; the rollback's own
+        // stopped check refuses if that could not be confirmed.
+        match Self::update_resources(rt, cfg, inst, &owner, |_| forward.prior, Some(&forward)) {
+            Ok(_) => Err(start_err.context(format!(
+                "Instance failed to start with the new resources; previous {} restored",
+                forward.prior
+            ))),
+            Err(rb) => bail!(AppleError::OperationUncertain(format!(
+                "Instance '{}' failed to start with {} ({start_err:#}), and restoring the previous \
+                 {} did not complete ({rb:#}); check `coop status {}` before retrying",
+                inst.name, forward.applied, forward.prior, inst.name
             ))),
         }
     }
@@ -1635,19 +1861,17 @@ impl VmBackend for AppleContainerBackend {
                 sidecar.guest_user
             );
         }
-        let mut journal = Journal::begin(
-            inst,
-            &owner,
-            JournalOp::RestoreDisk {
-                prior_generation: rec.record.disk_generation,
-            },
-            machine.clone(),
-        )?;
-        journal.advance(inst, Stage::Applying)?;
-        let rest: Vec<&str> = match &manifest.disk {
+        let operation = OperationId::generate()?;
+        let journaled = JournalOp::RestoreDisk {
+            operation: Some(operation.clone()),
+            prior_generation: rec.record.disk_generation,
+        };
+        Journal::begin(inst, &owner, journaled.clone(), machine.clone())?;
+        let mut rest: Vec<&str> = match &manifest.disk {
             Some(d) => vec![machine.as_str(), d.name.as_str()],
             None => vec![machine.as_str(), "--image", manifest.image_ref.as_str()],
         };
+        rest.extend(["--operation", operation.as_str()]);
         let req = Request::new(
             rt.args(&["restore"], &rest),
             rt.settings.create,
@@ -1655,10 +1879,12 @@ impl VmBackend for AppleContainerBackend {
         );
         rt.checked(&req)?;
         let after = rt.inspect(&machine)?;
-        if after.record.disk_generation <= rec.record.disk_generation {
+        if after.record.disk_generation <= rec.record.disk_generation
+            || !after.record.committed(&operation)
+        {
             bail!(AppleError::OperationUncertain(format!(
-                "sandbox {machine} did not report a replaced disk; {}",
-                recovery_hint(Operation::RestoreDisk, &inst.name)
+                "sandbox {machine} did not report this restore as its disk; {}",
+                journaled.recovery_hint(&inst.name)
             )));
         }
         sidecar.image_ref.clone_from(&after.record.image_reference);
@@ -1685,9 +1911,9 @@ impl VmBackend for AppleContainerBackend {
     fn probe_running(&self, inst: &Instance) -> Result<bool> {
         if let Some(journal) = Journal::try_load(inst)? {
             bail!(AppleError::OperationUncertain(format!(
-                "instance '{}' has an unfinished {:?} operation",
+                "instance '{}' has an unfinished {}",
                 inst.name,
-                journal.op.kind()
+                journal.op.describe()
             )));
         }
         let Some(sidecar) = MachineSidecar::try_load(inst)? else {
@@ -1960,6 +2186,22 @@ fn build_import_and_verify(
     timeout: Duration,
     guest_user: &crate::guest::GuestUser,
 ) -> Result<String> {
+    let digest = build_into_runtime(rt, builder, image_ref, context.path(), log, timeout)?;
+    verify_image_in_sandbox(rt, cfg, owner, image_ref, guest_user)?;
+    Ok(digest)
+}
+
+/// Build `image_ref` from `context` with the stock builder (output to
+/// `log`) and move it into the runtime's store, deleting the builder's copy.
+/// Returns the digest.
+fn build_into_runtime(
+    rt: &Runtime,
+    builder: &Builder,
+    image_ref: &str,
+    context: &Path,
+    log: &Path,
+    timeout: Duration,
+) -> Result<String> {
     let build = Request::new(
         [
             "build".to_string(),
@@ -1969,7 +2211,7 @@ fn build_import_and_verify(
             "plain".into(),
             "-t".into(),
             image_ref.to_string(),
-            context.path().display().to_string(),
+            context.display().to_string(),
         ],
         timeout,
         0,
@@ -2016,7 +2258,6 @@ fn build_import_and_verify(
             imported.iter().map(|i| &i.reference).collect::<Vec<_>>()
         )));
     };
-    verify_image_in_sandbox(rt, cfg, owner, image_ref, guest_user)?;
     Ok(entry.digest.clone())
 }
 
@@ -2113,10 +2354,9 @@ fn verify_image_in_sandbox(
             owner,
         )?;
         security::verify_record(&rt.inspect(&machine)?, &expected)?;
-        let deadline = Instant::now() + rt.settings.boot;
-        rt.boot(&machine)?;
-        let ready = rt.wait_ready(&expected, deadline)?;
-        rt.read_host_key(&ready, deadline)?;
+        // A disposable sandbox: its key is read to prove the guest booted
+        // fully, and never pinned.
+        rt.boot_validated(&expected, Instant::now() + rt.settings.boot)?;
         let wanted: Vec<String> = crate::guest::required_guest_binaries(guest_user)
             .iter()
             .map(ToString::to_string)
@@ -2165,2109 +2405,4 @@ fn verify_image_in_sandbox(
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
-mod tests {
-    //! Backend tests against a scripted runtime and builder.
-
-    use std::cell::RefCell;
-    use std::path::Path;
-    use std::rc::Rc;
-
-    use super::cli::{Exec, Output, Request};
-    use super::*;
-    use crate::config::{ConfigPath, ImageName, InstanceIndex, InstanceName};
-
-    const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/coop-sandbox");
-    const FIXTURE_ID: &str = "coop-0a1b2c3d-00112233445566ff";
-    const FIXTURE_OWNER: &str = "0a1b2c3d00112233445566778899aabb";
-    const FIXTURE_ROOT: &str = "/Users/me/.coop-apple/backends/apple-container-v1/runtime";
-    const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINiqkOnkRV06x+SuorkF+O3KdBTVFznIV0+b58cidW1N root@guest\n";
-
-    fn fixture(name: &str) -> String {
-        std::fs::read_to_string(format!("{FIXTURES}/{name}")).unwrap()
-    }
-
-    type Responder = Box<dyn Fn(&[String]) -> Output>;
-    type Calls = Rc<RefCell<Vec<Vec<String>>>>;
-
-    /// Records every argument vector and answers from a shared responder.
-    #[derive(Clone)]
-    struct FakeExec {
-        calls: Calls,
-        respond: Rc<Responder>,
-    }
-
-    impl Exec for FakeExec {
-        fn run(&self, req: &Request) -> Result<Output> {
-            self.calls.borrow_mut().push(req.args.clone());
-            Ok((self.respond)(&req.args))
-        }
-
-        fn run_logged(&self, req: &Request, _log: &Path) -> Result<Output> {
-            self.run(req)
-        }
-
-        fn run_streaming(
-            &self,
-            args: &[String],
-            on_line: &mut dyn FnMut(&[u8]) -> Result<()>,
-        ) -> Result<Output> {
-            self.calls.borrow_mut().push(args.to_vec());
-            let out = (self.respond)(args);
-            for line in out.stdout.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
-                on_line(line)?;
-            }
-            Ok(out)
-        }
-    }
-
-    fn ok(stdout: &str) -> Output {
-        Output {
-            code: Some(0),
-            stdout: stdout.as_bytes().to_vec(),
-            stderr: Vec::new(),
-        }
-    }
-
-    fn fail(stderr: &str) -> Output {
-        Output {
-            code: Some(1),
-            stdout: Vec::new(),
-            stderr: stderr.as_bytes().to_vec(),
-        }
-    }
-
-    fn starts(args: &[String], prefix: &[&str]) -> bool {
-        args.len() >= prefix.len() && args.iter().zip(prefix).all(|(a, p)| a == p)
-    }
-
-    /// The runtime's `version`, qualified or not.
-    fn version(args: &[String], qualified: bool) -> Option<Output> {
-        starts(args, &["version"]).then(|| {
-            let v = fixture("version.json");
-            ok(&if qualified {
-                v
-            } else {
-                v.replace("\"protocol\" : 1", "\"protocol\" : 99")
-            })
-        })
-    }
-
-    /// Runtime and builder backed by one responder (they are told apart by
-    /// their argument vectors).
-    fn backend(cfg: &CoopConfig, respond: Responder) -> (AppleContainerBackend, Calls) {
-        let calls: Calls = Rc::new(RefCell::new(Vec::new()));
-        let exec = FakeExec {
-            calls: Rc::clone(&calls),
-            respond: Rc::new(respond),
-        };
-        (
-            AppleContainerBackend::with_exec(cfg, Box::new(exec.clone()), Box::new(exec)),
-            calls,
-        )
-    }
-
-    /// Short deadlines: nothing in these tests really boots.
-    fn test_cfg(dir: &Path) -> CoopConfig {
-        let mut cfg = CoopConfig {
-            data_dir: ConfigPath::new(dir),
-            ..CoopConfig::default()
-        };
-        cfg.apple_container.boot_timeout_seconds = crate::config::TimeoutSecs::new(2).unwrap();
-        cfg
-    }
-
-    fn test_inst(cfg: &CoopConfig) -> Instance {
-        let dir = cfg.instances_dir().join("t");
-        std::fs::create_dir_all(&dir).unwrap();
-        Instance {
-            name: InstanceName::new("t").unwrap(),
-            index: InstanceIndex::new(0).unwrap(),
-            dir,
-            image: ImageName::new("default").unwrap(),
-        }
-    }
-
-    fn sandbox_name(owner: &Owner) -> MachineName {
-        MachineName::new(format!("coop-{}-00112233445566ff", owner.id.short())).unwrap()
-    }
-
-    fn write_sidecar(inst: &Instance, owner: &Owner) -> MachineSidecar {
-        let sidecar = MachineSidecar {
-            schema_version: state::SCHEMA_VERSION,
-            backend: state::BACKEND_TAG.into(),
-            owner_id: owner.id.clone(),
-            instance_id: "00112233445566ff".into(),
-            machine_id: sandbox_name(owner),
-            image_ref: "local/coop-exp:fx".into(),
-            image_digest: "sha256:3c8ada4041838a362f1d3c0805e487beff8ef85383044efeb07844cdd7c1e0b3"
-                .into(),
-            image_manifest_id: "m".into(),
-            guest_user: crate::guest::GuestUser::default(),
-            requested_cpus: 2,
-            requested_memory_bytes: 2048 * 1024 * 1024,
-            host_key_fingerprint: "SHA256:x".into(),
-            last_observed_owner_pid: None,
-            last_observed_ip: None,
-            reenroll_host_key: false,
-            creation_state: CreationState::Ready,
-            created_at: "now".into(),
-            runtime_identity: "test".into(),
-        };
-        sidecar.save(inst).unwrap();
-        sidecar
-    }
-
-    /// A real inspect record rewritten for this test's owner, sandbox, and
-    /// runtime root, in `status`.
-    fn inspect_json(cfg: &CoopConfig, owner: &Owner, status: &str) -> String {
-        let base = if status == "running" {
-            fixture("inspect-running.json")
-        } else {
-            fixture("inspect-stopped.json")
-        };
-        let root = canonical_path(&cfg.state_root().join(RUNTIME_DIR));
-        base.replace(FIXTURE_ID, sandbox_name(owner).as_str())
-            .replace(FIXTURE_OWNER, owner.id.as_str())
-            .replace(FIXTURE_ROOT, &root.display().to_string())
-            .replace(
-                "\"status\" : \"stopped\"",
-                &format!("\"status\" : \"{status}\""),
-            )
-    }
-
-    fn with_generation(json: &str, generation: u64) -> String {
-        json.replace(
-            "\"diskGeneration\" : 0",
-            &format!("\"diskGeneration\" : {generation}"),
-        )
-    }
-
-    /// Commands that change runtime state. None may run before the gate passes.
-    fn is_mutating(args: &[String]) -> bool {
-        [
-            &["create"][..],
-            &["start"],
-            &["stop"],
-            &["exec"],
-            &["set"],
-            &["grow"],
-            &["commit"],
-            &["restore"],
-            &["delete"],
-            &["init"],
-            &["image", "import"],
-            &["image", "delete"],
-            &["image", "save"],
-            &["disk", "delete"],
-            &["build"],
-            &["system", "start"],
-            &["system", "stop"],
-        ]
-        .iter()
-        .any(|p| starts(args, p))
-    }
-
-    fn mutations(calls: &Calls) -> Vec<String> {
-        calls
-            .borrow()
-            .iter()
-            .filter(|c| is_mutating(c))
-            .map(|c| c.first().cloned().unwrap_or_default())
-            .collect()
-    }
-
-    fn kind(err: &anyhow::Error) -> &AppleError {
-        err.downcast_ref::<AppleError>().unwrap()
-    }
-
-    #[test]
-    fn unqualified_runtime_refuses_create_before_any_side_effect() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        Owner::load_or_init(&cfg).unwrap();
-        let inst = test_inst(&cfg);
-        let (be, calls) = backend(
-            &cfg,
-            Box::new(|args| version(args, false).unwrap_or_else(|| ok("[]"))),
-        );
-        let err = be.create_and_start(&cfg, &inst, None, &[]).unwrap_err();
-        assert!(
-            matches!(kind(&err), AppleError::RuntimeUnqualified(_)),
-            "{err:#}"
-        );
-        assert!(mutations(&calls).is_empty(), "{:?}", calls.borrow());
-        assert!(!MachineSidecar::path(&inst).exists());
-        assert!(Journal::try_load(&inst).unwrap().is_none());
-    }
-
-    #[test]
-    fn unqualified_runtime_refuses_ssh_target_and_start() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let owner = Owner::load_or_init(&cfg).unwrap();
-        let inst = test_inst(&cfg);
-        write_sidecar(&inst, &owner);
-        let json = inspect_json(&cfg, &owner, "running");
-        let (be, calls) = backend(
-            &cfg,
-            Box::new(move |args| version(args, false).unwrap_or_else(|| ok(&json))),
-        );
-        for err in [
-            be.ssh_target(&cfg, &inst).unwrap_err(),
-            be.start_existing(&cfg, &inst).unwrap_err(),
-        ] {
-            assert!(
-                matches!(kind(&err), AppleError::RuntimeUnqualified(_)),
-                "{err:#}"
-            );
-        }
-        assert!(mutations(&calls).is_empty());
-    }
-
-    #[test]
-    fn recovery_hint_names_the_command_for_each_operation() {
-        let name = InstanceName::new("vm1").unwrap();
-        assert!(recovery_hint(Operation::SetResources, &name).contains("`coop start vm1`"));
-        assert!(recovery_hint(Operation::RestoreDisk, &name).contains("`coop start vm1`"));
-        let create = recovery_hint(Operation::Create, &name);
-        assert!(
-            create.contains("`coop destroy vm1`") && create.contains("`coop up`"),
-            "{create}"
-        );
-        let destroy = recovery_hint(Operation::Destroy, &name);
-        assert!(
-            destroy.contains("`coop destroy vm1`") && !destroy.contains("coop up"),
-            "{destroy}"
-        );
-    }
-
-    /// Listings report `unknown` (an error here) instead of `stopped` when
-    /// the state cannot be read, is transitional, or an operation is unfinished.
-    #[test]
-    fn probe_running_distinguishes_unknown_from_stopped() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let owner = Owner::load_or_init(&cfg).unwrap();
-        let inst = test_inst(&cfg);
-        write_sidecar(&inst, &owner);
-
-        for (status, expected) in [
-            ("running", Some(true)),
-            ("stopped", Some(false)),
-            ("booting", None),
-            ("crashed", None),
-        ] {
-            let json = inspect_json(&cfg, &owner, status);
-            let (be, _) = backend(
-                &cfg,
-                Box::new(move |args| version(args, true).unwrap_or_else(|| ok(&json))),
-            );
-            let probe = be.probe_running(&inst);
-            assert_eq!(probe.as_ref().ok().copied(), expected, "{status}");
-            if let Err(e) = probe {
-                assert!(matches!(kind(&e), AppleError::OperationUncertain(_)));
-            }
-        }
-
-        // No record yet: nothing exists to be running.
-        let bare = Instance {
-            name: InstanceName::new("fresh").unwrap(),
-            dir: cfg.instances_dir().join("fresh"),
-            ..inst.clone()
-        };
-        std::fs::create_dir_all(&bare.dir).unwrap();
-        let (be, _) = backend(
-            &cfg,
-            Box::new(|args| version(args, true).unwrap_or_else(|| fail("unexpected"))),
-        );
-        assert_eq!(be.probe_running(&bare).ok(), Some(false));
-
-        let (be, _) = backend(
-            &cfg,
-            Box::new(|args| version(args, true).unwrap_or_else(|| fail("owner unreachable"))),
-        );
-        assert!(be.probe_running(&inst).is_err());
-
-        Journal::begin(&inst, &owner, JournalOp::Create, sandbox_name(&owner)).unwrap();
-        let json = inspect_json(&cfg, &owner, "stopped");
-        let (be, _) = backend(
-            &cfg,
-            Box::new(move |args| version(args, true).unwrap_or_else(|| ok(&json))),
-        );
-        let err = be.probe_running(&inst).unwrap_err();
-        assert!(matches!(kind(&err), AppleError::OperationUncertain(_)));
-    }
-
-    #[test]
-    fn liveness_probe_errors_are_not_stopped() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let owner = Owner::load_or_init(&cfg).unwrap();
-        let inst = test_inst(&cfg);
-        write_sidecar(&inst, &owner);
-
-        let (be, _) = backend(
-            &cfg,
-            Box::new(|args| version(args, true).unwrap_or_else(|| fail("interrupted"))),
-        );
-        assert!(be.as_stopped(inst.clone()).is_err());
-        assert!(be.as_running(&cfg, inst.clone()).is_err());
-        assert!(!be.is_running(&inst));
-
-        for (status, stopped_ok) in [("booting", false), ("crashed", false), ("stopped", true)] {
-            let json = inspect_json(&cfg, &owner, status);
-            let (be, _) = backend(
-                &cfg,
-                Box::new(move |args| version(args, true).unwrap_or_else(|| ok(&json))),
-            );
-            assert_eq!(be.as_stopped(inst.clone()).is_ok(), stopped_ok, "{status}");
-        }
-    }
-
-    #[test]
-    fn destroy_refuses_unowned_sandbox() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let owner = Owner::load_or_init(&cfg).unwrap();
-        let inst = test_inst(&cfg);
-        let mut sidecar = write_sidecar(&inst, &owner);
-        sidecar.machine_id = MachineName::new("users-own-sandbox").unwrap();
-        sidecar.save(&inst).unwrap();
-        let (be, calls) = backend(
-            &cfg,
-            Box::new(|args| version(args, true).unwrap_or_else(|| ok("[]"))),
-        );
-        let err = be.destroy_instance(&cfg, &inst).unwrap_err();
-        assert!(matches!(kind(&err), AppleError::IdentityConflict(_)));
-        assert!(mutations(&calls).is_empty());
-        assert!(inst.dir.exists(), "metadata must survive a refused destroy");
-    }
-
-    #[test]
-    fn destroy_reconciles_interrupted_create() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let owner = Owner::load_or_init(&cfg).unwrap();
-        let inst = test_inst(&cfg);
-        let mut journal =
-            Journal::begin(&inst, &owner, JournalOp::Create, sandbox_name(&owner)).unwrap();
-        journal.advance(&inst, Stage::CreatingMachine).unwrap();
-        // The create never landed; an unrelated sandbox exists.
-        let (be, calls) = backend(
-            &cfg,
-            Box::new(|args| {
-                version(args, true).unwrap_or_else(|| {
-                    if starts(args, &["list"]) {
-                        return ok(r#"[{"id":"someone-else","status":"running","owner":"x"}]"#);
-                    }
-                    if starts(args, &["reconcile"]) {
-                        return ok("{}");
-                    }
-                    fail("unexpected")
-                })
-            }),
-        );
-        be.destroy_instance(&cfg, &inst).unwrap();
-        assert!(mutations(&calls).is_empty());
-        // The runtime sweeps what the interrupted create left inside it.
-        assert!(calls.borrow().iter().any(|c| starts(c, &["reconcile"])));
-        assert!(!inst.dir.exists());
-    }
-
-    #[test]
-    fn destroy_stops_then_deletes_owned_sandbox() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let owner = Owner::load_or_init(&cfg).unwrap();
-        let inst = test_inst(&cfg);
-        write_sidecar(&inst, &owner);
-        let name = sandbox_name(&owner);
-        let state = Rc::new(RefCell::new((false, false))); // (stopped, deleted)
-        let (s, n) = (Rc::clone(&state), name.clone());
-        let (running, stopped) = (
-            inspect_json(&cfg, &owner, "running"),
-            inspect_json(&cfg, &owner, "stopped"),
-        );
-        let owner_id = owner.id.as_str().to_string();
-        let (be, calls) = backend(
-            &cfg,
-            Box::new(move |args| {
-                if let Some(o) = version(args, true) {
-                    return o;
-                }
-                if starts(args, &["list"]) {
-                    return ok(&if s.borrow().1 {
-                        "[]".into()
-                    } else {
-                        format!(r#"[{{"id":"{n}","status":"running","owner":"{owner_id}"}}]"#)
-                    });
-                }
-                if starts(args, &["inspect"]) {
-                    return ok(if s.borrow().0 { &stopped } else { &running });
-                }
-                if starts(args, &["stop"]) {
-                    s.borrow_mut().0 = true;
-                    return ok("");
-                }
-                if starts(args, &["delete"]) {
-                    assert!(
-                        args.windows(2)
-                            .any(|w| w[0] == "--owner" && w[1] == owner_id)
-                    );
-                    s.borrow_mut().1 = true;
-                    return ok("");
-                }
-                fail("unexpected")
-            }),
-        );
-        be.destroy_instance(&cfg, &inst).unwrap();
-        assert_eq!(mutations(&calls), ["stop", "delete"]);
-        assert!(!inst.dir.exists());
-    }
-
-    #[test]
-    fn unconfirmed_stop_is_uncertain_not_stopped() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let owner = Owner::load_or_init(&cfg).unwrap();
-        let json = inspect_json(&cfg, &owner, "running");
-        let (be, _) = backend(
-            &cfg,
-            Box::new(move |args| version(args, true).unwrap_or_else(|| ok(&json))),
-        );
-        let err = be
-            .runtime()
-            .unwrap()
-            .stop_and_confirm(&sandbox_name(&owner))
-            .unwrap_err();
-        assert!(matches!(kind(&err), AppleError::OperationUncertain(_)));
-    }
-
-    #[test]
-    fn create_args_carry_exact_values_and_no_host_surfaces() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let owner = Owner::load_or_init(&cfg).unwrap();
-        let (be, _) = backend(
-            &cfg,
-            Box::new(|args| version(args, true).unwrap_or_else(|| ok(""))),
-        );
-        let rt = be.runtime().unwrap();
-        let name = sandbox_name(&owner);
-        let args = create_args(
-            rt,
-            &name,
-            &Source::Image("local/coop-0a1b2c3d:00"),
-            NonZeroU8::new(4).unwrap(),
-            4096,
-            GiB::new(32).unwrap(),
-            &owner,
-        );
-        let joined = args.join(" ");
-        assert!(joined.starts_with("create --root /"), "{joined}");
-        for want in [
-            name.as_str(),
-            "--image local/coop-0a1b2c3d:00",
-            "--cpus 4",
-            "--memory-mib 4096",
-            "--disk-gib 32",
-            &format!("--owner {}", owner.id.as_str()),
-        ] {
-            assert!(joined.contains(want), "{want}: {joined}");
-        }
-        for never in ["mount", "volume", "publish", "socket", "ssh", "network"] {
-            assert!(!joined.contains(never), "{never}: {joined}");
-        }
-        let disk = MachineName::generate(&owner.id).unwrap();
-        let joined = create_args(
-            rt,
-            &name,
-            &Source::Disk(&disk),
-            NonZeroU8::new(1).unwrap(),
-            512,
-            GiB::new(8).unwrap(),
-            &owner,
-        )
-        .join(" ");
-        assert!(joined.contains(&format!("--from-disk {disk}")) && !joined.contains("--image"));
-        assert_eq!(mib_to_bytes(4096), 4 * 1024 * 1024 * 1024);
-    }
-
-    #[test]
-    fn guest_commands_are_argv_not_shell_text() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let owner = Owner::load_or_init(&cfg).unwrap();
-        let (be, calls) = backend(
-            &cfg,
-            Box::new(|args| version(args, true).unwrap_or_else(|| ok(""))),
-        );
-        let rt = be.runtime().unwrap();
-        let words = [
-            "/usr/bin/printf",
-            "%s\\n",
-            "a b",
-            "it's",
-            "$(id)",
-            "; true",
-            "",
-        ];
-        rt.guest(
-            &sandbox_name(&owner),
-            &words,
-            Duration::from_secs(5),
-            MAX_TEXT_OUTPUT,
-        )
-        .unwrap();
-        let call = calls.borrow().last().cloned().unwrap();
-        let dashdash = call.iter().position(|a| a == "--").unwrap();
-        assert_eq!(&call[dashdash + 1..], words);
-    }
-
-    #[test]
-    fn capabilities_include_disk_operations() {
-        let be = AppleContainerBackend::new();
-        let caps = be.capabilities();
-        for cap in [
-            Capability::DiskResize,
-            Capability::DiskSnapshots,
-            Capability::MachineResources,
-        ] {
-            assert!(caps.has(cap), "{cap:?}");
-        }
-        assert!(!caps.has(Capability::LiveMounts));
-        assert!(!be.mounts_are_live());
-        assert_eq!(
-            be.local_endpoint_route(&NetworkConfig::default()),
-            LocalEndpointRoute::ReverseTunnel
-        );
-    }
-
-    #[test]
-    fn resolve_binary_rejects_relative_missing_and_writable() {
-        assert!(resolve_binary(Some(Path::new("coop-sandbox")), &[], Tool::Runtime).is_err());
-        assert!(
-            resolve_binary(
-                Some(Path::new("/nonexistent/coop-sandbox")),
-                &[],
-                Tool::Runtime
-            )
-            .is_err()
-        );
-        let tmp = tempfile::tempdir().unwrap();
-        let writable = tmp.path().join("coop-sandbox");
-        std::fs::write(&writable, "#!/bin/sh\n").unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&writable, std::fs::Permissions::from_mode(0o777)).unwrap();
-        }
-        let err = resolve_binary(Some(&writable), &[], Tool::Runtime).unwrap_err();
-        assert!(format!("{err:#}").contains("writable"), "{err:#}");
-        // A configured path is the only candidate: defaults are not a fallback.
-        let err = resolve_binary(
-            Some(Path::new("/nonexistent/x")),
-            &[writable],
-            Tool::Runtime,
-        )
-        .unwrap_err();
-        assert!(format!("{err:#}").contains("/nonexistent/x"), "{err:#}");
-    }
-
-    /// Only a regular, executable, user- or root-owned file that no group or
-    /// other user can write is accepted.
-    #[test]
-    fn check_binary_accepts_only_private_executables() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let tmp = tempfile::tempdir().unwrap();
-        let bin = tmp.path().join("tool");
-        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
-        let set = |mode| std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(mode));
-
-        set(0o755).unwrap();
-        assert_eq!(check_binary(&bin).unwrap(), bin.canonicalize().unwrap());
-        for (mode, why) in [
-            (0o644, "not an executable"),
-            (0o775, "writable"),
-            (0o757, "writable"),
-        ] {
-            set(mode).unwrap();
-            let err = check_binary(&bin).unwrap_err();
-            assert!(format!("{err:#}").contains(why), "{mode:o}: {err:#}");
-        }
-        let dir = tmp.path().join("dir");
-        std::fs::create_dir(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(format!("{:#}", check_binary(&dir).unwrap_err()).contains("not an executable"));
-
-        // Root-owned system binaries are trusted.
-        assert!(check_binary(Path::new("/bin/sh")).is_ok());
-    }
-
-    #[test]
-    fn missing_binary_names_the_tool_and_how_to_get_it() {
-        for (tool, name, hint) in [
-            (Tool::Runtime, "`coop-sandbox`", "build-coop-sandbox.sh"),
-            (Tool::Builder, "`container`", "[apple_container] builder"),
-        ] {
-            let err = resolve_binary(None, &[], tool).unwrap_err();
-            let text = format!("{err:#}");
-            assert!(text.contains(name) && text.contains(hint), "{text}");
-        }
-        assert_eq!(AppleContainerBackend::new().to_string(), "apple-container");
-    }
-
-    #[test]
-    fn interrupted_resize_is_reconciled_from_runtime() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let owner = Owner::load_or_init(&cfg).unwrap();
-        let inst = test_inst(&cfg);
-        let mut sidecar = write_sidecar(&inst, &owner);
-        sidecar.requested_cpus = 8;
-        sidecar.requested_memory_bytes = 1 << 30;
-        sidecar.save(&inst).unwrap();
-        let mut journal = Journal::begin(
-            &inst,
-            &owner,
-            JournalOp::SetResources {
-                prior: (8, 1 << 30),
-            },
-            sandbox_name(&owner),
-        )
-        .unwrap();
-        journal.advance(&inst, Stage::Applying).unwrap();
-
-        let json = inspect_json(&cfg, &owner, "stopped");
-        let (be, calls) = backend(
-            &cfg,
-            Box::new(move |args| version(args, true).unwrap_or_else(|| ok(&json))),
-        );
-        AppleContainerBackend::recover_journal(be.runtime().unwrap(), &cfg, &inst).unwrap();
-        assert!(Journal::try_load(&inst).unwrap().is_none());
-        let after = MachineSidecar::load(&inst).unwrap();
-        // The runtime record (2 vCPUs / 2 GiB) is authoritative.
-        assert_eq!(after.requested_cpus, 2);
-        assert_eq!(after.requested_memory_bytes, 2048 * 1024 * 1024);
-        assert!(mutations(&calls).is_empty());
-
-        // A running sandbox is not reconciled.
-        let mut journal = Journal::begin(
-            &inst,
-            &owner,
-            JournalOp::SetResources {
-                prior: (8, 1 << 30),
-            },
-            sandbox_name(&owner),
-        )
-        .unwrap();
-        journal.advance(&inst, Stage::Applying).unwrap();
-        let json = inspect_json(&cfg, &owner, "running");
-        let (be, _) = backend(
-            &cfg,
-            Box::new(move |args| version(args, true).unwrap_or_else(|| ok(&json))),
-        );
-        assert!(
-            AppleContainerBackend::recover_journal(be.runtime().unwrap(), &cfg, &inst).is_err()
-        );
-        assert!(Journal::try_load(&inst).unwrap().is_some());
-    }
-
-    /// Only a higher disk generation lets the next start pin a new host key.
-    #[test]
-    fn interrupted_restore_reenrolls_only_when_the_disk_was_replaced() {
-        for (generation, reenroll) in [(3, false), (4, true)] {
-            let tmp = tempfile::tempdir().unwrap();
-            let cfg = test_cfg(tmp.path());
-            let owner = Owner::load_or_init(&cfg).unwrap();
-            let inst = test_inst(&cfg);
-            write_sidecar(&inst, &owner);
-            let mut journal = Journal::begin(
-                &inst,
-                &owner,
-                JournalOp::RestoreDisk {
-                    prior_generation: 3,
-                },
-                sandbox_name(&owner),
-            )
-            .unwrap();
-            journal.advance(&inst, Stage::Applying).unwrap();
-            let json = with_generation(&inspect_json(&cfg, &owner, "stopped"), generation);
-            let (be, _) = backend(
-                &cfg,
-                Box::new(move |args| version(args, true).unwrap_or_else(|| ok(&json))),
-            );
-            AppleContainerBackend::recover_journal(be.runtime().unwrap(), &cfg, &inst).unwrap();
-            assert!(Journal::try_load(&inst).unwrap().is_none());
-            assert_eq!(
-                MachineSidecar::load(&inst).unwrap().reenroll_host_key,
-                reenroll,
-                "{generation}"
-            );
-        }
-    }
-
-    #[test]
-    fn restore_journals_the_generation_and_marks_reenrollment() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let owner = Owner::load_or_init(&cfg).unwrap();
-        let inst = test_inst(&cfg);
-        write_sidecar(&inst, &owner);
-        let image = ImageName::new("default").unwrap();
-        ImageManifest {
-            schema_version: state::SCHEMA_VERSION,
-            backend: state::BACKEND_TAG.into(),
-            image_ref: "local/coop-exp:fx".into(),
-            digest: "sha256:3c8ada4041838a362f1d3c0805e487beff8ef85383044efeb07844cdd7c1e0b3"
-                .into(),
-            disk: None,
-            manifest_id: "m2".into(),
-            base_image: image::BASE_IMAGE.into(),
-            platform: image::PLATFORM.into(),
-            guest_user: crate::guest::GuestUser::default(),
-            pubkey_fingerprint: String::new(),
-            created: "now".into(),
-        }
-        .save(&cfg, &image)
-        .unwrap();
-        let restored = Rc::new(RefCell::new(false));
-        let r = Rc::clone(&restored);
-        let stopped = inspect_json(&cfg, &owner, "stopped");
-        let (be, calls) = backend(
-            &cfg,
-            Box::new(move |args| {
-                if let Some(o) = version(args, true) {
-                    return o;
-                }
-                if starts(args, &["image", "list"]) {
-                    return ok(
-                        r#"[{"reference":"local/coop-exp:fx","digest":"sha256:3c8ada4041838a362f1d3c0805e487beff8ef85383044efeb07844cdd7c1e0b3"}]"#,
-                    );
-                }
-                if starts(args, &["inspect"]) {
-                    return ok(&with_generation(&stopped, u64::from(*r.borrow())));
-                }
-                if starts(args, &["restore"]) {
-                    assert!(
-                        args.windows(2)
-                            .any(|w| w[0] == "--image" && w[1] == "local/coop-exp:fx")
-                    );
-                    *r.borrow_mut() = true;
-                    return ok("{}");
-                }
-                fail("unexpected")
-            }),
-        );
-        // A disk built for another guest user is refused before any change.
-        let other = ImageName::new("other").unwrap();
-        let mut foreign = ImageManifest::load(&cfg, &image).unwrap();
-        foreign.guest_user = crate::guest::GuestUser::new("dev").unwrap();
-        foreign.save(&cfg, &other).unwrap();
-        let err = be
-            .restore_disk(&cfg, &StoppedInstance::new(inst.clone()), &other)
-            .unwrap_err();
-        assert!(format!("{err:#}").contains("guest user 'dev'"), "{err:#}");
-        assert!(mutations(&calls).is_empty());
-        assert!(Journal::try_load(&inst).unwrap().is_none());
-
-        be.restore_disk(&cfg, &StoppedInstance::new(inst.clone()), &image)
-            .unwrap();
-        assert_eq!(mutations(&calls), ["restore"]);
-        let after = MachineSidecar::load(&inst).unwrap();
-        assert!(after.reenroll_host_key);
-        assert_eq!(after.image_manifest_id, "m2");
-        assert!(Journal::try_load(&inst).unwrap().is_none());
-    }
-
-    #[test]
-    fn resize_grows_but_never_shrinks() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let owner = Owner::load_or_init(&cfg).unwrap();
-        let inst = test_inst(&cfg);
-        write_sidecar(&inst, &owner);
-        // The fixture disk is 8 GiB.
-        let grown = Rc::new(RefCell::new(false));
-        let g = Rc::clone(&grown);
-        let stopped = inspect_json(&cfg, &owner, "stopped");
-        let (be, calls) = backend(
-            &cfg,
-            Box::new(move |args| {
-                if let Some(o) = version(args, true) {
-                    return o;
-                }
-                if starts(args, &["inspect"]) {
-                    let bytes = if *g.borrow() { 32u64 << 30 } else { 8u64 << 30 };
-                    return ok(&stopped.replace(
-                        "\"diskBytes\" : 8589934592",
-                        &format!("\"diskBytes\" : {bytes}"),
-                    ));
-                }
-                if starts(args, &["grow"]) {
-                    assert!(
-                        args.windows(2)
-                            .any(|w| w[0] == "--disk-gib" && w[1] == "32")
-                    );
-                    *g.borrow_mut() = true;
-                    return ok("{}");
-                }
-                fail("unexpected")
-            }),
-        );
-        let stopped_inst = StoppedInstance::new(inst.clone());
-        let err = be
-            .resize_disk(&cfg, &stopped_inst, GiB::new(4).unwrap())
-            .unwrap_err();
-        assert!(format!("{err:#}").contains("shrinking"), "{err:#}");
-        be.resize_disk(&cfg, &stopped_inst, GiB::new(8).unwrap())
-            .unwrap();
-        assert!(mutations(&calls).is_empty());
-        be.resize_disk(&cfg, &stopped_inst, GiB::new(32).unwrap())
-            .unwrap();
-        assert_eq!(mutations(&calls), ["grow"]);
-        assert!(be.disk_path(&inst).unwrap().ends_with(format!(
-            "runtime/sandboxes/{}/rootfs.ext4",
-            sandbox_name(&owner)
-        )));
-    }
-
-    #[test]
-    fn failed_restart_boot_stops_the_sandbox_and_reports_the_console_log() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let owner = Owner::load_or_init(&cfg).unwrap();
-        let inst = test_inst(&cfg);
-        write_sidecar(&inst, &owner);
-        let json = inspect_json(&cfg, &owner, "stopped");
-        let (be, calls) = backend(
-            &cfg,
-            Box::new(move |args| {
-                if let Some(o) = version(args, true) {
-                    return o;
-                }
-                if starts(args, &["inspect"]) {
-                    return ok(&json);
-                }
-                if starts(args, &["start"]) {
-                    return fail("owner failed: vmnet refused");
-                }
-                if starts(args, &["logs"]) {
-                    return ok("kernel panic \x1b[31m- not syncing\n");
-                }
-                if starts(args, &["stop"]) {
-                    return ok("");
-                }
-                fail("unexpected")
-            }),
-        );
-        let err = be.start_existing(&cfg, &inst).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("APPLE_BOOT_TIMEOUT"), "{msg}");
-        assert!(msg.contains("kernel panic ?[31m- not syncing"), "{msg}");
-        assert_eq!(mutations(&calls), ["start", "stop"]);
-    }
-
-    /// A normal start must reject a changed host key; only a coop restore
-    /// lets the next start pin a new one.
-    #[test]
-    fn start_enforces_the_pin_unless_coop_replaced_the_disk() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let owner = Owner::load_or_init(&cfg).unwrap();
-        let inst = test_inst(&cfg);
-        let mut sidecar = write_sidecar(&inst, &owner);
-        std::fs::write(state::known_hosts_path(&inst), "old-pin\n").unwrap();
-        let respond = |cfg: &CoopConfig, owner: &Owner| -> Responder {
-            let booted = Rc::new(RefCell::new(false));
-            let (stopped, running) = (
-                inspect_json(cfg, owner, "stopped"),
-                inspect_json(cfg, owner, "running"),
-            );
-            Box::new(move |args| {
-                if let Some(o) = version(args, true) {
-                    return o;
-                }
-                if starts(args, &["inspect"]) {
-                    return ok(if *booted.borrow() { &running } else { &stopped });
-                }
-                if starts(args, &["start"]) {
-                    *booted.borrow_mut() = true;
-                    return ok("{}");
-                }
-                if starts(args, &["exec"]) {
-                    return ok(KEY);
-                }
-                if starts(args, &["stop"]) {
-                    *booted.borrow_mut() = false;
-                    return ok("");
-                }
-                fail("unexpected")
-            })
-        };
-        let (be, _) = backend(&cfg, respond(&cfg, &owner));
-        let err = be.start_existing(&cfg, &inst).unwrap_err();
-        assert!(
-            matches!(kind(&err), AppleError::HostKeyChanged(_)),
-            "{err:#}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(state::known_hosts_path(&inst)).unwrap(),
-            "old-pin\n"
-        );
-
-        sidecar.reenroll_host_key = true;
-        sidecar.save(&inst).unwrap();
-        let (be, _) = backend(&cfg, respond(&cfg, &owner));
-        // SSH never answers here, so this start fails after pinning; the
-        // re-enroll window must close anyway.
-        assert!(be.start_existing(&cfg, &inst).is_err());
-        assert!(!MachineSidecar::load(&inst).unwrap().reenroll_host_key);
-        let pinned = std::fs::read_to_string(state::known_hosts_path(&inst)).unwrap();
-        assert!(
-            pinned.contains("AAAAC3NzaC1lZDI1NTE5AAAAINiqkOnkRV06x"),
-            "{pinned}"
-        );
-    }
-
-    #[test]
-    #[expect(clippy::panic, reason = "test assertion")]
-    fn unqualified_running_sandbox_is_an_error_not_stopped() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let owner = Owner::load_or_init(&cfg).unwrap();
-        let inst = test_inst(&cfg);
-        write_sidecar(&inst, &owner);
-        let json = inspect_json(&cfg, &owner, "running");
-        let (be, _) = backend(
-            &cfg,
-            Box::new(move |args| version(args, false).unwrap_or_else(|| ok(&json))),
-        );
-        let Err(err) = be.as_running(&cfg, inst.clone()) else {
-            panic!("a running sandbox on an unqualified runtime must not yield a target");
-        };
-        assert!(format!("{err:#}").contains("coop stop t"), "{err:#}");
-    }
-
-    #[test]
-    fn stop_unproven_stops_without_qualification_or_ssh() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let owner = Owner::load_or_init(&cfg).unwrap();
-        let inst = test_inst(&cfg);
-        write_sidecar(&inst, &owner);
-        let stopped = Rc::new(RefCell::new(false));
-        let s = Rc::clone(&stopped);
-        let (on, off) = (
-            inspect_json(&cfg, &owner, "running"),
-            inspect_json(&cfg, &owner, "stopped"),
-        );
-        let (be, calls) = backend(
-            &cfg,
-            Box::new(move |args| {
-                if let Some(o) = version(args, false) {
-                    return o;
-                }
-                if starts(args, &["inspect"]) {
-                    return ok(if *s.borrow() { &off } else { &on });
-                }
-                if starts(args, &["stop"]) {
-                    *s.borrow_mut() = true;
-                    return ok("");
-                }
-                fail("unexpected")
-            }),
-        );
-        be.stop_unproven(&cfg, &inst).unwrap();
-        assert!(*stopped.borrow());
-        assert_eq!(mutations(&calls), ["stop"]);
-    }
-
-    #[test]
-    fn follow_logs_replace_guest_control_bytes() {
-        // `stream_logs` needs a RunningInstance, which cannot be minted without
-        // SSH here, so this drives the same streaming call and sanitizer it uses.
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let (be, _) = backend(
-            &cfg,
-            Box::new(|args| {
-                version(args, true).unwrap_or_else(|| {
-                    if starts(args, &["logs"]) {
-                        return ok("ok\n\x1b]52;c;ZXZpbA==\x07pwned\n");
-                    }
-                    fail("unexpected")
-                })
-            }),
-        );
-        let rt = be.runtime().unwrap();
-        let mut lines = Vec::new();
-        rt.exec
-            .run_streaming(&rt.args(&["logs"], &["m", "--follow"]), &mut |line| {
-                lines.push(cli::sanitize_for_display(&String::from_utf8_lossy(line)));
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(lines, ["ok", "?]52;c;ZXZpbA==?pwned"]);
-    }
-
-    #[test]
-    fn host_key_read_retries_a_half_written_file_and_detects_restarts() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let owner = Owner::load_or_init(&cfg).unwrap();
-        let sidecar = write_sidecar(&test_inst(&cfg), &owner);
-        let running = inspect_json(&cfg, &owner, "running");
-        for restarted in [false, true] {
-            let reads = Rc::new(RefCell::new(0));
-            let r = Rc::clone(&reads);
-            let now = if restarted {
-                let pid =
-                    serde_json::from_str::<serde_json::Value>(&running).unwrap()["live"]["pid"]
-                        .as_i64()
-                        .unwrap();
-                running.replace(
-                    &format!("\"pid\" : {pid}"),
-                    &format!("\"pid\" : {}", pid + 1),
-                )
-            } else {
-                running.clone()
-            };
-            let (be, _) = backend(
-                &cfg,
-                Box::new(move |args| {
-                    if let Some(o) = version(args, true) {
-                        return o;
-                    }
-                    if starts(args, &["exec"]) {
-                        *r.borrow_mut() += 1;
-                        // First read catches the file mid-write.
-                        return ok(if *r.borrow() == 1 {
-                            "ssh-ed25519 AAAAC3Nza"
-                        } else {
-                            KEY
-                        });
-                    }
-                    if starts(args, &["inspect"]) {
-                        return ok(&now);
-                    }
-                    fail("unexpected")
-                }),
-            );
-            let rt = be.runtime().unwrap();
-            let inspect = protocol::parse_inspect(&running, &sidecar.machine_id).unwrap();
-            let ready = security::verify_effective(&inspect, &rt.expected(&sidecar)).unwrap();
-            let got = rt.read_host_key(&ready, Instant::now() + Duration::from_secs(5));
-            assert_eq!(*reads.borrow(), 2);
-            if restarted {
-                assert!(matches!(
-                    kind(&got.unwrap_err()),
-                    AppleError::IdentityConflict(_)
-                ));
-            } else {
-                assert!(got.unwrap().fingerprint().starts_with("SHA256:"));
-            }
-        }
-    }
-
-    #[test]
-    fn legacy_instance_destroy_removes_local_state_only() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        Owner::load_or_init(&cfg).unwrap();
-        let inst = test_inst(&cfg);
-        std::fs::write(
-            MachineSidecar::path(&inst),
-            r#"{"schema_version":1,"backend":"apple-container","machine_id":"coop-0a1b2c3d-1","network_id":"coop-0a1b2c3d-1"}"#,
-        )
-        .unwrap();
-        let (be, calls) = backend(&cfg, Box::new(|_| fail("no runtime call expected")));
-        be.destroy_instance(&cfg, &inst).unwrap();
-        assert!(calls.borrow().is_empty());
-        assert!(!inst.dir.exists());
-    }
-
-    fn manifest(image_ref: &str, disk: Option<CommittedDisk>) -> ImageManifest {
-        ImageManifest {
-            schema_version: state::SCHEMA_VERSION,
-            backend: state::BACKEND_TAG.into(),
-            image_ref: image_ref.into(),
-            digest: format!("sha256:{}", "a".repeat(64)),
-            disk,
-            manifest_id: "m".into(),
-            base_image: image::BASE_IMAGE.into(),
-            platform: image::PLATFORM.into(),
-            guest_user: crate::guest::GuestUser::default(),
-            pubkey_fingerprint: String::new(),
-            created: "now".into(),
-        }
-    }
-
-    /// Only this installation's images and disks are deleted, and only once
-    /// no saved manifest still uses them; an unreadable manifest keeps all.
-    #[test]
-    fn release_deletes_only_owned_and_unreferenced_content() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let owner = Owner::load_or_init(&cfg).unwrap();
-        let (be, calls) = backend(
-            &cfg,
-            Box::new(|args| version(args, true).unwrap_or_else(|| ok(""))),
-        );
-        let rt = be.runtime().unwrap();
-        let owned_ref = format!("local/coop-{}:abc", owner.id.short());
-        let owned_disk = MachineName::generate(&owner.id).unwrap();
-        let foreign_disk = MachineName::new("coop-ffffffff-0011223344556677").unwrap();
-        let committed = |name: &MachineName| {
-            manifest(
-                &owned_ref,
-                Some(CommittedDisk {
-                    name: name.clone(),
-                    bytes: 1,
-                }),
-            )
-        };
-        let deleted = || -> Vec<Vec<String>> {
-            calls
-                .borrow()
-                .iter()
-                .filter(|c| is_mutating(c))
-                .cloned()
-                .collect()
-        };
-        let base = ImageName::new("default").unwrap();
-        manifest(&owned_ref, None).save(&cfg, &base).unwrap();
-
-        // Foreign content is never touched.
-        release_manifest(
-            rt,
-            &cfg,
-            &owner,
-            &manifest("local/someone-else:1", None),
-            None,
-        );
-        release_manifest(rt, &cfg, &owner, &committed(&foreign_disk), None);
-        // The image tag is still used by `default`; the owned disk is not.
-        release_manifest(rt, &cfg, &owner, &committed(&owned_disk), None);
-        let got = deleted();
-        assert_eq!(got.len(), 1, "{got:?}");
-        assert!(
-            starts(&got[0], &["disk", "delete"]) && got[0].last() == Some(&owned_disk.to_string())
-        );
-
-        // A disk another manifest uses is kept.
-        calls.borrow_mut().clear();
-        committed(&owned_disk)
-            .save(&cfg, &ImageName::new("snap").unwrap())
-            .unwrap();
-        release_manifest(rt, &cfg, &owner, &committed(&owned_disk), Some(&base));
-        let got = deleted();
-        assert!(
-            got.iter().all(|c| !starts(c, &["disk", "delete"])),
-            "{got:?}"
-        );
-
-        // Once nothing else uses the tag, it goes with the last manifest.
-        calls.borrow_mut().clear();
-        std::fs::remove_dir_all(cfg.image_dir(&ImageName::new("snap").unwrap())).unwrap();
-        release_manifest(rt, &cfg, &owner, &manifest(&owned_ref, None), Some(&base));
-        let got = deleted();
-        assert_eq!(got.len(), 1, "{got:?}");
-        assert!(starts(&got[0], &["image", "delete"]) && got[0].last() == Some(&owned_ref));
-
-        // An unreadable manifest might reference anything: keep everything.
-        calls.borrow_mut().clear();
-        let broken = ImageName::new("broken").unwrap();
-        std::fs::create_dir_all(cfg.image_dir(&broken)).unwrap();
-        std::fs::write(cfg.image_dir(&broken).join("apple-image.json"), "{").unwrap();
-        release_manifest(rt, &cfg, &owner, &committed(&owned_disk), Some(&base));
-        assert!(deleted().is_empty());
-    }
-
-    #[test]
-    fn verify_image_checks_presence_and_digest() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let owner = Owner::load_or_init(&cfg).unwrap();
-        let digest = format!("sha256:{}", "a".repeat(64));
-        let listed = format!(r#"[{{"reference":"local/x:1","digest":"{digest}"}}]"#);
-        let (be, _) = backend(
-            &cfg,
-            Box::new(move |args| {
-                version(args, true).unwrap_or_else(|| {
-                    if starts(args, &["image", "list"]) {
-                        return ok(&listed);
-                    }
-                    if starts(args, &["disk", "list"]) {
-                        return ok(
-                            r#"[{"name":"coop-0a1b2c3d-1","logicalBytes":1,"allocatedBytes":1}]"#,
-                        );
-                    }
-                    fail("unexpected")
-                })
-            }),
-        );
-        let rt = be.runtime().unwrap();
-        rt.verify_image(&manifest("local/x:1", None)).unwrap();
-        let mut stale = manifest("local/x:1", None);
-        stale.digest = format!("sha256:{}", "b".repeat(64));
-        for bad in [
-            manifest("local/missing:1", None),
-            stale,
-            manifest(
-                "local/x:1",
-                Some(CommittedDisk {
-                    name: MachineName::generate(&owner.id).unwrap(),
-                    bytes: 1,
-                }),
-            ),
-        ] {
-            let err = rt.verify_image(&bad).unwrap_err();
-            assert!(
-                matches!(kind(&err), AppleError::IdentityConflict(_)),
-                "{err:#}"
-            );
-        }
-        let present = MachineName::new("coop-0a1b2c3d-1").unwrap();
-        rt.verify_image(&manifest(
-            "local/gone:1",
-            Some(CommittedDisk {
-                name: present,
-                bytes: 1,
-            }),
-        ))
-        .unwrap();
-    }
-
-    #[test]
-    fn commit_saves_a_disk_manifest_from_the_runtime_record() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let owner = Owner::load_or_init(&cfg).unwrap();
-        let inst = test_inst(&cfg);
-        let sidecar = write_sidecar(&inst, &owner);
-        let stopped = inspect_json(&cfg, &owner, "stopped");
-        let (be, calls) = backend(
-            &cfg,
-            Box::new(move |args| {
-                if let Some(o) = version(args, true) {
-                    return o;
-                }
-                if starts(args, &["inspect"]) {
-                    return ok(&stopped);
-                }
-                if starts(args, &["commit"]) {
-                    let name = args.last().unwrap();
-                    return ok(&format!(
-                        r#"{{"name":"{name}","logicalBytes":8589934592,"allocatedBytes":1}}"#
-                    ));
-                }
-                fail("unexpected")
-            }),
-        );
-        let image = ImageName::new("snap").unwrap();
-        be.commit_disk(&cfg, &StoppedInstance::new(inst.clone()), &image)
-            .unwrap();
-        let call = calls
-            .borrow()
-            .iter()
-            .find(|c| starts(c, &["commit"]))
-            .cloned()
-            .unwrap();
-        let disk = call.last().unwrap().clone();
-        assert!(call.contains(&sidecar.machine_id.to_string()));
-        assert!(
-            MachineName::new(disk.clone())
-                .unwrap()
-                .belongs_to(&owner.id)
-        );
-        let saved = ImageManifest::load(&cfg, &image).unwrap();
-        let committed = saved.disk.unwrap();
-        assert_eq!(committed.name.as_str(), disk);
-        assert_eq!(committed.bytes, 8 << 30);
-        // Image identity comes from the runtime record, not the instance.
-        assert_eq!(saved.image_ref, "local/coop-exp:fx");
-        assert_eq!(covering_gib(committed.bytes).unwrap(), GiB::new(8).unwrap());
-    }
-
-    #[test]
-    fn disk_bytes_round_up_to_whole_gib() {
-        assert_eq!(covering_gib(1).unwrap(), GiB::new(1).unwrap());
-        assert_eq!(covering_gib((8 << 30) + 1).unwrap(), GiB::new(9).unwrap());
-        assert!(covering_gib(0).is_err());
-    }
-
-    /// A readback that does not match the request is uncertain, and the
-    /// journal stays for `start` to reconcile.
-    #[test]
-    fn resource_change_that_does_not_apply_is_uncertain() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let owner = Owner::load_or_init(&cfg).unwrap();
-        let inst = test_inst(&cfg);
-        write_sidecar(&inst, &owner);
-        let stopped = inspect_json(&cfg, &owner, "stopped");
-        let (be, calls) = backend(
-            &cfg,
-            Box::new(move |args| {
-                if let Some(o) = version(args, true) {
-                    return o;
-                }
-                if starts(args, &["inspect"]) {
-                    return ok(&stopped);
-                }
-                if starts(args, &["set"]) {
-                    return ok("{}");
-                }
-                fail("unexpected")
-            }),
-        );
-        let err = be
-            .set_machine_resources(
-                &cfg,
-                &StoppedInstance::new(inst.clone()),
-                None,
-                NonZeroU8::new(6),
-                false,
-            )
-            .unwrap_err();
-        assert!(
-            matches!(kind(&err), AppleError::OperationUncertain(_)),
-            "{err:#}"
-        );
-        let set = calls
-            .borrow()
-            .iter()
-            .find(|c| starts(c, &["set"]))
-            .cloned()
-            .unwrap();
-        assert!(set.windows(2).any(|w| w[0] == "--cpus" && w[1] == "6"));
-        assert!(!set.contains(&"--memory-mib".to_string()));
-        // The journal carries the resources the runtime had before the change.
-        assert_eq!(
-            Journal::try_load(&inst).unwrap().unwrap().op,
-            JournalOp::SetResources {
-                prior: (2, 2048 * 1024 * 1024)
-            }
-        );
-    }
-
-    #[test]
-    fn legacy_journal_only_instance_can_be_destroyed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        Owner::load_or_init(&cfg).unwrap();
-        let inst = test_inst(&cfg);
-        std::fs::write(
-            inst.dir.join("operation.json"),
-            r#"{"schema_version":1,"backend":"apple-container","machine_id":"coop-0a1b2c3d-2","network_id":"coop-0a1b2c3d-2"}"#,
-        )
-        .unwrap();
-        let (be, calls) = backend(&cfg, Box::new(|_| fail("no runtime call expected")));
-        be.destroy_instance(&cfg, &inst).unwrap();
-        assert!(calls.borrow().is_empty());
-        assert!(!inst.dir.exists());
-    }
-
-    // ── Simulated runtime ─────────────────────────────────────
-
-    struct SimBox {
-        status: SandboxStatus,
-        image: String,
-        digest: String,
-        cpus: u32,
-        memory_bytes: u64,
-        /// Inspects left before a started sandbox reports its effective
-        /// configuration.
-        settling: u32,
-    }
-
-    /// A stateful stand-in for `coop-sandbox` and the stock builder, for
-    /// driving whole operations (setup, image verification) end to end.
-    struct Sim {
-        root: String,
-        owner: String,
-        sandboxes: std::collections::BTreeMap<String, SimBox>,
-        images: Vec<(String, String)>,
-        saved: Option<String>,
-        builder_images: Vec<String>,
-        /// Status a started sandbox settles into (`running`, or `stopped`
-        /// for a guest that powers off during boot).
-        boots_to: SandboxStatus,
-        settle_inspects: u32,
-        host_key: Option<&'static str>,
-        missing: Vec<String>,
-        uid: &'static str,
-        console: &'static str,
-        faults: Vec<Fault>,
-    }
-
-    /// Ways the simulated runtime or builder misbehaves.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Fault {
-        BuilderDown,
-        BuildFails,
-        CreateFails,
-        ServicesInactive,
-        SetIgnoresMemory,
-        LogsFail,
-    }
-
-    const SIM_DIGEST: &str =
-        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-
-    impl Sim {
-        fn new(cfg: &CoopConfig, owner: &Owner) -> Rc<RefCell<Self>> {
-            Rc::new(RefCell::new(Self {
-                root: canonical_path(&cfg.state_root().join(RUNTIME_DIR))
-                    .display()
-                    .to_string(),
-                owner: owner.id.as_str().to_string(),
-                sandboxes: std::collections::BTreeMap::new(),
-                images: Vec::new(),
-                saved: None,
-                builder_images: Vec::new(),
-                boots_to: SandboxStatus::Running,
-                settle_inspects: 0,
-                host_key: Some(KEY),
-                missing: Vec::new(),
-                uid: "1000\n",
-                console: "[    0.000000] Booting Linux\n",
-                faults: Vec::new(),
-            }))
-        }
-
-        fn has(&self, fault: Fault) -> bool {
-            self.faults.contains(&fault)
-        }
-
-        fn inspect(&mut self, id: &str) -> Output {
-            let Some(b) = self.sandboxes.get_mut(id) else {
-                return fail("no such sandbox");
-            };
-            let settling = b.status == SandboxStatus::Running && b.settling > 0;
-            b.settling = b.settling.saturating_sub(1);
-            let fixture_name = if b.status == SandboxStatus::Running {
-                "inspect-running.json"
-            } else {
-                "inspect-stopped.json"
-            };
-            let mut v: serde_json::Value = serde_json::from_str(&fixture(fixture_name)).unwrap();
-            v["status"] = b.status.label().into();
-            for key in ["record", "effective"] {
-                let Some(o) = v.get_mut(key).filter(|o| o.is_object()) else {
-                    continue;
-                };
-                o["id"] = id.into();
-                o["imageReference"] = b.image.clone().into();
-                o["imageDigest"] = b.digest.clone().into();
-                o["cpus"] = b.cpus.into();
-                o["memoryBytes"] = b.memory_bytes.into();
-            }
-            v["record"]["owner"] = self.owner.clone().into();
-            if let Some(rootfs) = v.pointer_mut("/effective/rootfs/source") {
-                *rootfs = format!("{}/sandboxes/{id}/rootfs.ext4", self.root).into();
-            }
-            if settling {
-                v["effective"] = serde_json::Value::Null;
-            }
-            ok(&v.to_string())
-        }
-
-        fn guest(&self, argv: &[String]) -> Output {
-            match argv.first().map(String::as_str) {
-                Some("/bin/cat") => self.host_key.map_or_else(|| fail("No such file"), ok),
-                Some("/bin/sh") => ok(&self
-                    .missing
-                    .iter()
-                    .filter(|m| argv.contains(m))
-                    .fold(String::new(), |out, m| out + m + "\n")),
-                Some("/usr/bin/id") => ok(self.uid),
-                Some("/usr/bin/systemctl") if argv.iter().any(|a| a == "--quiet") => {
-                    if self.has(Fault::ServicesInactive) {
-                        fail("")
-                    } else {
-                        ok("")
-                    }
-                }
-                Some("/usr/bin/systemctl") => ok("active\nactivating\n"),
-                _ => fail("unexpected guest command"),
-            }
-        }
-
-        fn respond(&mut self, args: &[String]) -> Output {
-            let flag = |name: &str| {
-                args.windows(2)
-                    .find(|w| w[0] == name)
-                    .map(|w| w[1].clone())
-                    .unwrap_or_default()
-            };
-            if !args.iter().any(|a| a == "--root") {
-                // The stock builder.
-                if starts(args, &["system", "status"]) {
-                    return if self.has(Fault::BuilderDown) {
-                        fail("not running")
-                    } else {
-                        ok("")
-                    };
-                }
-                if starts(args, &["build"]) {
-                    if self.has(Fault::BuildFails) {
-                        return fail("build failed");
-                    }
-                    self.builder_images.push(flag("-t"));
-                    return ok("");
-                }
-                if starts(args, &["image", "save"]) {
-                    self.saved = args.last().cloned();
-                    return ok("");
-                }
-                if starts(args, &["image", "delete"]) {
-                    self.builder_images.retain(|i| Some(i) != args.last());
-                    return ok("");
-                }
-                return fail("unexpected builder command");
-            }
-            let id = args.get(3).cloned().unwrap_or_default();
-            match (args[0].as_str(), args.get(1).map(String::as_str)) {
-                ("init" | "reconcile", _) => ok("{}"),
-                ("image", Some("import")) => {
-                    let reference = self.saved.clone().unwrap_or_default();
-                    self.images.push((reference.clone(), SIM_DIGEST.into()));
-                    ok(&format!(r#"[{{"reference":"{reference}","digest":"{SIM_DIGEST}"}}]"#))
-                }
-                ("image", Some("list")) => ok(&serde_json::to_string(
-                    &self
-                        .images
-                        .iter()
-                        .map(|(r, d)| serde_json::json!({"reference": r, "digest": d}))
-                        .collect::<Vec<_>>(),
-                )
-                .unwrap()),
-                ("image", Some("delete")) => {
-                    self.images.retain(|(r, _)| Some(r) != args.last());
-                    ok("")
-                }
-                ("disk", Some("list")) => ok("[]"),
-                ("list", _) => ok(&serde_json::to_string(
-                    &self
-                        .sandboxes
-                        .iter()
-                        .map(|(id, b)| {
-                            serde_json::json!({"id": id, "status": b.status.label(), "owner": self.owner})
-                        })
-                        .collect::<Vec<_>>(),
-                )
-                .unwrap()),
-                _ => self.respond_sandbox(args, &id, &flag),
-            }
-        }
-
-        fn respond_sandbox(
-            &mut self,
-            args: &[String],
-            id: &str,
-            flag: &dyn Fn(&str) -> String,
-        ) -> Output {
-            match args[0].as_str() {
-                "create" => {
-                    if self.has(Fault::CreateFails) {
-                        return fail("create failed");
-                    }
-                    let image = flag("--image");
-                    let Some((_, digest)) = self.images.iter().find(|(r, _)| *r == image) else {
-                        return fail("no such image");
-                    };
-                    let memory_mib: u64 = flag("--memory-mib").parse().unwrap();
-                    self.sandboxes.insert(
-                        id.to_string(),
-                        SimBox {
-                            status: SandboxStatus::Stopped,
-                            image,
-                            digest: digest.clone(),
-                            cpus: flag("--cpus").parse().unwrap(),
-                            memory_bytes: memory_mib * 1024 * 1024,
-                            settling: 0,
-                        },
-                    );
-                    ok("{}")
-                }
-                "inspect" => self.inspect(id),
-                "start" => {
-                    let (to, settle) = (self.boots_to, self.settle_inspects);
-                    let Some(b) = self.sandboxes.get_mut(id) else {
-                        return fail("no such sandbox");
-                    };
-                    b.status = to;
-                    b.settling = settle;
-                    ok("{}")
-                }
-                "stop" => {
-                    if let Some(b) = self.sandboxes.get_mut(id) {
-                        b.status = SandboxStatus::Stopped;
-                    }
-                    ok("")
-                }
-                "delete" => {
-                    self.sandboxes.remove(id);
-                    ok("")
-                }
-                "logs" if self.has(Fault::LogsFail) => fail("no console log"),
-                "logs" => ok(self.console),
-                "set" => {
-                    let ignores_memory = self.has(Fault::SetIgnoresMemory);
-                    let Some(b) = self.sandboxes.get_mut(id) else {
-                        return fail("no such sandbox");
-                    };
-                    if let Ok(cpus) = flag("--cpus").parse() {
-                        b.cpus = cpus;
-                    }
-                    if let Ok(mib) = flag("--memory-mib").parse::<u64>()
-                        && !ignores_memory
-                    {
-                        b.memory_bytes = mib * 1024 * 1024;
-                    }
-                    ok("{}")
-                }
-                "exec" => {
-                    // exec --root R --timeout S ID -- ARGV
-                    let dashes = args.iter().position(|a| a == "--").unwrap();
-                    self.guest(&args[dashes + 1..])
-                }
-                _ => fail("unexpected runtime command"),
-            }
-        }
-    }
-
-    fn sim_backend(cfg: &CoopConfig, sim: &Rc<RefCell<Sim>>) -> (AppleContainerBackend, Calls) {
-        let sim = Rc::clone(sim);
-        backend(
-            cfg,
-            Box::new(move |args| {
-                version(args, true).unwrap_or_else(|| sim.borrow_mut().respond(args))
-            }),
-        )
-    }
-
-    /// A test config whose kernel path exists, with a fresh owner.
-    fn setup_env(dir: &Path) -> (CoopConfig, Owner, SetupOptions) {
-        let mut cfg = test_cfg(&dir.join("data"));
-        let kernel = dir.join("vmlinux");
-        std::fs::write(&kernel, "").unwrap();
-        cfg.apple_container.kernel = Some(ConfigPath::new(&kernel));
-        let owner = Owner::load_or_init(&cfg).unwrap();
-        let opts = SetupOptions {
-            skip_confirm: true,
-            rebuild: false,
-            profiles: Vec::new(),
-            oci_features: Vec::new(),
-            extra_packages: Vec::new(),
-            post_install: None,
-            image: ImageName::new("default").unwrap(),
-            guest_user: crate::guest::GuestUser::default(),
-            builder_timeout: None,
-        };
-        (cfg, owner, opts)
-    }
-
-    /// Setup builds with the stock builder, moves the image into the runtime,
-    /// proves it boots and meets the guest contract in a disposable sandbox,
-    /// then publishes the manifest. A second setup with the same inputs
-    /// reuses it; `--rebuild` replaces it and releases the old tag.
-    #[test]
-    fn setup_verifies_in_a_disposable_sandbox_then_publishes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (cfg, owner, mut opts) = setup_env(tmp.path());
-        let sim = Sim::new(&cfg, &owner);
-        sim.borrow_mut().settle_inspects = 2;
-        let (be, calls) = sim_backend(&cfg, &sim);
-        assert!(!be.image_is_built(&cfg, &opts.image));
-
-        be.setup(&cfg, &opts).unwrap();
-        let manifest = ImageManifest::load(&cfg, &opts.image).unwrap();
-        assert!(
-            manifest
-                .image_ref
-                .starts_with(&format!("local/coop-{}:", owner.id.short()))
-        );
-        assert_eq!(manifest.digest, SIM_DIGEST);
-        assert!(be.image_is_built(&cfg, &opts.image));
-        assert!(crate::setup::TemplateConfig::load_for(&cfg, &opts.image).is_ok());
-        {
-            let s = sim.borrow();
-            assert!(s.sandboxes.is_empty(), "verification sandbox left behind");
-            assert!(s.builder_images.is_empty(), "builder copy left behind");
-            assert_eq!(s.images.len(), 1);
-        }
-        assert_eq!(
-            mutations(&calls),
-            [
-                "init", "build", "image", "image", "image", "create", "start", "exec", "exec",
-                "exec", "exec", "stop", "delete"
-            ]
-        );
-
-        calls.borrow_mut().clear();
-        be.setup(&cfg, &opts).unwrap();
-        assert_eq!(mutations(&calls), ["init"], "an up-to-date image is reused");
-
-        opts.rebuild = true;
-        be.setup(&cfg, &opts).unwrap();
-        let rebuilt = ImageManifest::load(&cfg, &opts.image).unwrap();
-        assert_ne!(rebuilt.image_ref, manifest.image_ref);
-        let s = sim.borrow();
-        assert_eq!(s.images.len(), 1, "superseded tag released");
-        assert_eq!(s.images[0].0, rebuilt.image_ref);
-    }
-
-    /// Every failed check fails setup, removes the verification sandbox and
-    /// the candidate image, and publishes nothing.
-    #[test]
-    fn setup_rejects_an_image_that_fails_verification() {
-        type Break = fn(&mut Sim);
-        let cases: [(&str, Break); 7] = [
-            ("service", |s| s.faults.push(Fault::BuilderDown)),
-            ("Image build failed", |s| s.faults.push(Fault::BuildFails)),
-            ("stopped during boot", |s| {
-                s.boots_to = SandboxStatus::Stopped;
-            }),
-            ("SSH host key", |s| s.host_key = None),
-            ("/usr/bin/docker", |s| {
-                s.missing = vec!["/usr/bin/docker".into()];
-            }),
-            ("uid 1000", |s| s.uid = "1001\n"),
-            ("services ssh, docker not active", |s| {
-                s.faults.push(Fault::ServicesInactive);
-            }),
-        ];
-        for (why, breaks) in cases {
-            let tmp = tempfile::tempdir().unwrap();
-            let (cfg, owner, opts) = setup_env(tmp.path());
-            let sim = Sim::new(&cfg, &owner);
-            breaks(&mut sim.borrow_mut());
-            let (be, _) = sim_backend(&cfg, &sim);
-            let err = be.setup(&cfg, &opts).unwrap_err();
-            assert!(format!("{err:#}").contains(why), "{why}: {err:#}");
-            assert!(
-                ImageManifest::try_load(&cfg, &opts.image)
-                    .unwrap()
-                    .is_none(),
-                "{why}"
-            );
-            assert!(!be.image_is_built(&cfg, &opts.image), "{why}");
-            let s = sim.borrow();
-            assert!(
-                s.sandboxes.is_empty() && s.images.is_empty(),
-                "{why}: left state behind"
-            );
-        }
-    }
-
-    /// A sandbox that never reports a running configuration fails at the
-    /// boot deadline, not before; the console log explains what it can.
-    #[test]
-    fn readiness_waits_for_the_deadline_then_reports_the_console() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (cfg, owner, opts) = setup_env(tmp.path());
-        let sim = Sim::new(&cfg, &owner);
-        sim.borrow_mut().settle_inspects = u32::MAX;
-        let (be, _) = sim_backend(&cfg, &sim);
-        let started = Instant::now();
-        let err = be.setup(&cfg, &opts).unwrap_err();
-        assert!(started.elapsed() >= Duration::from_secs(1), "gave up early");
-        let text = format!("{err:#}");
-        assert!(
-            text.contains("did not report a running configuration"),
-            "{text}"
-        );
-        assert!(text.contains("Booting Linux"), "{text}");
-    }
-
-    /// A sandbox matching `write_sidecar`, in `status`.
-    fn sim_sandbox(sim: &Rc<RefCell<Sim>>, owner: &Owner, status: SandboxStatus) {
-        sim.borrow_mut().sandboxes.insert(
-            sandbox_name(owner).to_string(),
-            SimBox {
-                status,
-                image: "local/coop-exp:fx".into(),
-                digest: SIM_DIGEST.into(),
-                cpus: 2,
-                memory_bytes: 2048 * 1024 * 1024,
-                settling: 0,
-            },
-        );
-    }
-
-    fn running(inst: &Instance) -> RunningInstance {
-        let target = SshTarget {
-            host: crate::backend::Hostname::from(std::net::Ipv4Addr::new(10, 231, 2, 2)),
-            port: std::num::NonZeroU16::new(22).unwrap(),
-            user: crate::backend::SshUser::new("coop").unwrap(),
-            key_path: PathBuf::from("/nonexistent/key"),
-            host_keys: crate::backend::HostKeyPolicy::Unverified,
-        };
-        RunningInstance::new(inst.clone(), target)
-    }
-
-    /// `up` refuses to overwrite existing state, and a failed boot stops the
-    /// sandbox it created and keeps the journal for `destroy`.
-    #[test]
-    fn create_refuses_existing_state_and_stops_a_failed_boot() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (cfg, owner, opts) = setup_env(tmp.path());
-        let sim = Sim::new(&cfg, &owner);
-        let (be, calls) = sim_backend(&cfg, &sim);
-        be.setup(&cfg, &opts).unwrap();
-        let inst = test_inst(&cfg);
-
-        Journal::begin(&inst, &owner, JournalOp::Create, sandbox_name(&owner)).unwrap();
-        calls.borrow_mut().clear();
-        let err = be.create_and_start(&cfg, &inst, None, &[]).unwrap_err();
-        assert!(
-            matches!(kind(&err), AppleError::OperationUncertain(_)),
-            "{err:#}"
-        );
-        assert!(mutations(&calls).is_empty());
-        Journal::complete(&inst).unwrap();
-
-        sim.borrow_mut().faults = vec![Fault::CreateFails];
-        let err = be.create_and_start(&cfg, &inst, None, &[]).unwrap_err();
-        assert!(format!("{err:#}").contains("create failed"), "{err:#}");
-        Journal::complete(&inst).unwrap();
-
-        {
-            let mut s = sim.borrow_mut();
-            s.faults.clear();
-            s.settle_inspects = u32::MAX;
-        }
-        calls.borrow_mut().clear();
-        let started = Instant::now();
-        let err = be.create_and_start(&cfg, &inst, None, &[]).unwrap_err();
-        assert!(started.elapsed() >= Duration::from_secs(1), "gave up early");
-        assert!(matches!(kind(&err), AppleError::BootTimeout(_)), "{err:#}");
-        assert_eq!(mutations(&calls), ["create", "start", "stop"]);
-        assert!(
-            sim.borrow()
-                .sandboxes
-                .values()
-                .all(|b| b.status == SandboxStatus::Stopped)
-        );
-        assert!(MachineSidecar::try_load(&inst).unwrap().is_none());
-        assert_eq!(
-            Journal::try_load(&inst).unwrap().unwrap().stage,
-            Stage::MachineCreated
-        );
-    }
-
-    #[test]
-    fn stop_and_is_running_follow_the_runtime() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let owner = Owner::load_or_init(&cfg).unwrap();
-        let inst = test_inst(&cfg);
-        let sim = Sim::new(&cfg, &owner);
-        let (be, calls) = sim_backend(&cfg, &sim);
-        assert!(!be.is_running(&inst), "no record");
-        write_sidecar(&inst, &owner);
-        sim_sandbox(&sim, &owner, SandboxStatus::Running);
-        assert!(be.is_running(&inst));
-        be.stop(&cfg, running(&inst)).unwrap();
-        assert_eq!(mutations(&calls), ["stop"]);
-        assert!(!be.is_running(&inst));
-        assert!(!be.images_in_data_dir());
-    }
-
-    #[test]
-    fn status_reports_the_runtime_record() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let owner = Owner::load_or_init(&cfg).unwrap();
-        let inst = test_inst(&cfg);
-        let sidecar = write_sidecar(&inst, &owner);
-        let rec =
-            protocol::parse_inspect(&inspect_json(&cfg, &owner, "running"), &sidecar.machine_id)
-                .unwrap();
-        let text = describe_sandbox(&inst, &sidecar, &rec, "coop-sandbox 0.1.0");
-        for want in [
-            "Instance 't' (running)",
-            "Runtime: coop-sandbox 0.1.0",
-            "Network: vmnet-shared:10.231.2.0/24 (dedicated)",
-            "vCPUs: 2",
-            "Memory: 2048 MiB",
-            // 8724152320 and 752058368 bytes.
-            "Disk: 8.1 GiB (0.7 GiB allocated)",
-            "Address: 10.231.2.2 (host key SHA256:x)",
-        ] {
-            assert!(text.contains(want), "{want:?} not in:\n{text}");
-        }
-        let stopped =
-            protocol::parse_inspect(&inspect_json(&cfg, &owner, "stopped"), &sidecar.machine_id)
-                .unwrap();
-        let text = describe_sandbox(&inst, &sidecar, &stopped, "r");
-        assert!(text.contains("Network: unavailable"), "{text}");
-        assert!(text.contains("Address: unavailable"), "{text}");
-    }
-
-    #[test]
-    fn logs_stream_or_fail_with_the_runtime() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let owner = Owner::load_or_init(&cfg).unwrap();
-        let inst = test_inst(&cfg);
-        write_sidecar(&inst, &owner);
-        let sim = Sim::new(&cfg, &owner);
-        sim_sandbox(&sim, &owner, SandboxStatus::Running);
-        let (be, calls) = sim_backend(&cfg, &sim);
-        for mode in [LogMode::Snapshot, LogMode::Follow] {
-            be.stream_logs(&cfg, &running(&inst), mode).unwrap();
-        }
-        assert_eq!(
-            calls
-                .borrow()
-                .iter()
-                .filter(|c| starts(c, &["logs"]))
-                .count(),
-            2
-        );
-        sim.borrow_mut().faults = vec![Fault::LogsFail];
-        for mode in [LogMode::Snapshot, LogMode::Follow] {
-            assert!(be.stream_logs(&cfg, &running(&inst), mode).is_err());
-        }
-    }
-
-    /// Memory that does not change is caught as well as CPUs; a restart that
-    /// fails with new resources restores the previous ones.
-    #[test]
-    fn resource_changes_are_verified_and_rolled_back() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let owner = Owner::load_or_init(&cfg).unwrap();
-        let inst = test_inst(&cfg);
-        write_sidecar(&inst, &owner);
-        let sim = Sim::new(&cfg, &owner);
-        sim_sandbox(&sim, &owner, SandboxStatus::Stopped);
-        let (be, _) = sim_backend(&cfg, &sim);
-        let stopped = StoppedInstance::new(inst.clone());
-        let mem = Some(VmMemory::new(crate::config::MiB::new(4096).unwrap()).unwrap());
-
-        sim.borrow_mut().faults = vec![Fault::SetIgnoresMemory];
-        let err = be
-            .set_machine_resources(&cfg, &stopped, mem, NonZeroU8::new(4), false)
-            .unwrap_err();
-        assert!(
-            matches!(kind(&err), AppleError::OperationUncertain(_)),
-            "{err:#}"
-        );
-        Journal::complete(&inst).unwrap();
-        sim.borrow_mut().faults.clear();
-
-        be.set_machine_resources(&cfg, &stopped, mem, NonZeroU8::new(4), false)
-            .unwrap();
-        let sidecar = MachineSidecar::load(&inst).unwrap();
-        assert_eq!(
-            (sidecar.requested_cpus, sidecar.requested_memory_bytes),
-            (4, 4096 * 1024 * 1024)
-        );
-
-        sim.borrow_mut().boots_to = SandboxStatus::Stopped;
-        let mem = Some(VmMemory::new(crate::config::MiB::new(6144).unwrap()).unwrap());
-        let err = be
-            .set_machine_resources(&cfg, &stopped, mem, NonZeroU8::new(6), true)
-            .unwrap_err();
-        assert!(
-            format!("{err:#}").contains("previous CPU/memory restored"),
-            "{err:#}"
-        );
-        let sidecar = MachineSidecar::load(&inst).unwrap();
-        let prior = (4, 4096 * 1024 * 1024);
-        assert_eq!(
-            (sidecar.requested_cpus, sidecar.requested_memory_bytes),
-            prior
-        );
-        let s = sim.borrow();
-        let b = s.sandboxes.values().next().unwrap();
-        assert_eq!((b.cpus, b.memory_bytes), prior);
-    }
-
-    #[test]
-    fn destroying_images_releases_owned_content() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (cfg, owner, opts) = setup_env(tmp.path());
-        let sim = Sim::new(&cfg, &owner);
-        let (be, _) = sim_backend(&cfg, &sim);
-        let missing = ImageName::new("missing").unwrap();
-        assert!(be.destroy_image(&cfg, &missing).is_err());
-
-        be.setup(&cfg, &opts).unwrap();
-        be.destroy_image(&cfg, &opts.image).unwrap();
-        assert!(!cfg.image_dir(&opts.image).exists());
-        assert!(sim.borrow().images.is_empty());
-
-        be.setup(&cfg, &opts).unwrap();
-        be.destroy_shared(&cfg);
-        assert!(!cfg.image_dir(&opts.image).exists());
-        assert!(sim.borrow().images.is_empty());
-    }
-
-    /// Without console output (unreadable or blank), a boot failure says
-    /// where to look instead.
-    #[test]
-    fn boot_failure_without_a_console_log_says_so() {
-        type Blank = fn(&mut Sim);
-        let cases: [Blank; 2] = [|s| s.faults.push(Fault::LogsFail), |s| s.console = "  \n"];
-        for blank in cases {
-            let tmp = tempfile::tempdir().unwrap();
-            let (cfg, owner, opts) = setup_env(tmp.path());
-            let sim = Sim::new(&cfg, &owner);
-            sim.borrow_mut().boots_to = SandboxStatus::Stopped;
-            blank(&mut sim.borrow_mut());
-            let (be, _) = sim_backend(&cfg, &sim);
-            let err = be.setup(&cfg, &opts).unwrap_err();
-            assert!(
-                format!("{err:#}").contains("Console log unavailable"),
-                "{err:#}"
-            );
-        }
-    }
-
-    /// A restart that never reports a running configuration fails at the
-    /// boot deadline, not before, and leaves the sandbox stopped.
-    #[test]
-    fn start_waits_for_the_boot_deadline() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(tmp.path());
-        let owner = Owner::load_or_init(&cfg).unwrap();
-        let inst = test_inst(&cfg);
-        write_sidecar(&inst, &owner);
-        let sim = Sim::new(&cfg, &owner);
-        sim_sandbox(&sim, &owner, SandboxStatus::Stopped);
-        sim.borrow_mut().settle_inspects = u32::MAX;
-        let (be, calls) = sim_backend(&cfg, &sim);
-        let started = Instant::now();
-        let err = be.start_existing(&cfg, &inst).unwrap_err();
-        assert!(started.elapsed() >= Duration::from_secs(1), "gave up early");
-        assert!(matches!(kind(&err), AppleError::BootTimeout(_)), "{err:#}");
-        assert_eq!(mutations(&calls), ["start", "stop"]);
-    }
-
-    /// Services get their own window after boot; setup waits it out.
-    #[test]
-    fn inactive_services_fail_only_after_their_window() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (cfg, owner, opts) = setup_env(tmp.path());
-        let sim = Sim::new(&cfg, &owner);
-        sim.borrow_mut().faults = vec![Fault::ServicesInactive];
-        let (be, _) = sim_backend(&cfg, &sim);
-        let started = Instant::now();
-        let err = be.setup(&cfg, &opts).unwrap_err();
-        assert!(started.elapsed() >= Duration::from_secs(1), "gave up early");
-        let text = format!("{err:#}");
-        assert!(text.contains("(active, activating)"), "{text}");
-    }
-
-    #[test]
-    fn canonical_path_resolves_through_the_existing_ancestor() {
-        let tmp = tempfile::tempdir().unwrap();
-        let real = tmp.path().canonicalize().unwrap();
-        assert_eq!(canonical_path(&tmp.path().join("a/b")), real.join("a/b"));
-    }
-}
+mod tests;

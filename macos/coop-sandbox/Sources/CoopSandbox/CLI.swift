@@ -10,8 +10,8 @@ struct CoopSandbox: AsyncParsableCommand {
         abstract: "coop's macOS sandbox runtime: persistent Linux VMs on apple/containerization.",
         subcommands: [
             Version.self, Init.self, ImageCommand.self, Create.self, Start.self, Run.self, Stop.self, Exec.self,
-            Inspect.self, List.self, Set.self, Grow.self, Commit.self, Restore.self, DiskCommand.self, Logs.self,
-            Delete.self, Reconcile.self,
+            Inspect.self, List.self, Set.self, Grow.self, Commit.self, Restore.self, DiskCommand.self, MaintenanceCommand.self,
+            Logs.self, Delete.self, Reconcile.self,
         ]
     )
 }
@@ -204,24 +204,40 @@ struct List: AsyncParsableCommand {
     }
 }
 
+/// `--operation`: the caller's id for a `set`, `grow`, or `restore`,
+/// recorded as `record.lastOperation` when it commits.
+struct OperationOptions: ParsableArguments {
+    @Option(help: "Operation id to record as record.lastOperation (default: generated)")
+    var operation: String?
+
+    func resolve() throws -> OperationID? { try operation.map(OperationID.init) }
+}
+
 struct Set: AsyncParsableCommand {
     static let configuration = CommandConfiguration(abstract: "Change CPU/memory of a stopped sandbox; applied at the next start.")
     @OptionGroup var root: RootOptions
+    @OptionGroup var operation: OperationOptions
     @Argument var id: String
     @Option var cpus: Int?
     @Option var memoryMib: UInt64?
+    @Option(help: "Refuse unless record.lastOperation is this operation") var expectOperation: String?
     func run() async throws {
-        try printJSON(try Sandboxes.setResources(root: try root.resolve(), id: try SandboxID(id), cpus: cpus, memoryBytes: memoryMib.map { $0 * mib }))
+        try printJSON(
+            try await Sandboxes.setResources(
+                root: try root.resolve(), id: try SandboxID(id), cpus: cpus, memoryBytes: memoryMib.map { $0 * mib },
+                operation: try operation.resolve(), expect: try expectOperation.map(OperationID.init)))
     }
 }
 
 struct Grow: AsyncParsableCommand {
     static let configuration = CommandConfiguration(abstract: "Grow a stopped sandbox's disk and filesystem (offline).")
     @OptionGroup var root: RootOptions
+    @OptionGroup var operation: OperationOptions
     @Argument var id: String
     @Option var diskGib: UInt64
     func run() async throws {
-        try printJSON(try await Sandboxes.grow(root: try root.resolve(), id: try SandboxID(id), diskBytes: diskGib * gib))
+        try printJSON(
+            try await Sandboxes.grow(root: try root.resolve(), id: try SandboxID(id), diskBytes: diskGib * gib, operation: try operation.resolve()))
     }
 }
 
@@ -239,6 +255,7 @@ struct Commit: AsyncParsableCommand {
 struct Restore: AsyncParsableCommand {
     static let configuration = CommandConfiguration(abstract: "Replace a stopped sandbox's disk with a named disk or a fresh image copy.")
     @OptionGroup var root: RootOptions
+    @OptionGroup var operation: OperationOptions
     @Argument var id: String
     @Argument(help: "Committed disk to restore from") var name: String?
     @Option(help: "Reset to a fresh copy of this image instead") var image: String?
@@ -249,7 +266,7 @@ struct Restore: AsyncParsableCommand {
 
     func run() async throws {
         let source: SandboxSource = if let image { .image(image) } else { .disk(try SandboxID(name ?? "")) }
-        try printJSON(try await Sandboxes.restore(root: try root.resolve(), id: try SandboxID(id), source: source))
+        try printJSON(try await Sandboxes.restore(root: try root.resolve(), id: try SandboxID(id), source: source, operation: try operation.resolve()))
     }
 }
 
@@ -267,7 +284,30 @@ struct DiskCommand: AsyncParsableCommand {
         static let configuration = CommandConfiguration(commandName: "delete")
         @OptionGroup var root: RootOptions
         @Argument var name: String
-        func run() async throws { try Sandboxes.deleteDisk(root: try root.resolve(), name: try SandboxID(name)) }
+        func run() async throws { try await Sandboxes.deleteDisk(root: try root.resolve(), name: try SandboxID(name)) }
+    }
+}
+
+struct MaintenanceCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "maintenance", abstract: "Manage the image disk maintenance VMs boot from.",
+        subcommands: [InstallMaintenance.self, InspectMaintenance.self])
+
+    struct InstallMaintenance: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "install", abstract: "Unpack an imported image as the maintenance disk, kept apart from the image store.")
+        @OptionGroup var root: RootOptions
+        @Option(help: "Image reference in the private store") var image: String
+        @Option(help: "Version of the image's recipe, reported back by `inspect`") var version: String
+        func run() async throws {
+            try printJSON(try await Maintenance.install(root: try root.resolve(), reference: image, version: version))
+        }
+    }
+
+    struct InspectMaintenance: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(commandName: "inspect", abstract: "The installed maintenance artifact, or null.")
+        @OptionGroup var root: RootOptions
+        func run() async throws { try printJSON(try Maintenance.installed(root: try root.resolve())) }
     }
 }
 
@@ -311,11 +351,12 @@ struct Delete: AsyncParsableCommand {
     @OptionGroup var root: RootOptions
     @Argument var id: String
     @Option(help: "Refuse unless the record's owner matches") var owner: String
-    func run() async throws { try Sandboxes.delete(root: try root.resolve(), id: try SandboxID(id), owner: owner) }
+    func run() async throws { try await Sandboxes.delete(root: try root.resolve(), id: try SandboxID(id), owner: owner) }
 }
 
 struct Reconcile: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(abstract: "Clear crashed owners and finish interrupted creates and deletes.")
+    static let configuration = CommandConfiguration(
+        abstract: "Clear crashed owners and finish interrupted creates, deletes, and disk updates.")
     @OptionGroup var root: RootOptions
     func run() async throws { try printJSON(try Sandboxes.reconcile(root: try root.resolve())) }
 }

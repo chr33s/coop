@@ -85,7 +85,9 @@ through it. Two implementations exist:
 - `AppleContainerBackend` — `#[cfg(all(target_os = "macos", feature =
   "apple-container"))]`; `src/apple_container/`, driving the Swift runtime in
   `macos/coop-sandbox/` over its JSON CLI. It replaces Lima as the macOS
-  `PlatformBackend` only when the feature is enabled.
+  `PlatformBackend` only when the feature is enabled. Its disk and resource
+  mutations follow the invariants in
+  [`design/apple-sandbox-transactions.md`](design/apple-sandbox-transactions.md).
 
 **Backend selection is compile-time, not runtime.** `backend::PlatformBackend`
 is a type alias resolved by `#[cfg]` — `LimaBackend` on macOS (or

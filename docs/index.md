@@ -16,6 +16,12 @@ short navigational entrypoint; durable detail lives here.
   `.cargo/mutants.toml` scoping and baselines), fuzzing, kani.
 - [`platform-notes.md`](platform-notes.md) — Firecracker CI-kernel workarounds,
   Docker networking, scp `~` caveat, tracing-to-stderr.
+- [`design/`](design/) — decision records:
+  - [`apple-sandbox-runtime.md`](design/apple-sandbox-runtime.md): why the
+    Apple backend runs its own runtime;
+  - [`apple-sandbox-transactions.md`](design/apple-sandbox-transactions.md):
+    its mutation invariants, disk-update recovery, per-sandbox locking, and
+    maintenance image.
 
 ## For users
 

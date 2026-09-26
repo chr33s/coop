@@ -330,7 +330,7 @@ exposure, and coop verifies the effective configuration anyway
   with kernel pseudo-filesystems only. Adding any such field or `create` flag is
   a finding.
 - **Runtime qualification.** `security::qualify` accepts only `coop-sandbox`
-  with protocol 1 and `containerization` 0.45.0. The runtime itself accepts
+  with protocol 2 and `containerization` 0.45.0. The runtime itself accepts
   only a kernel whose sha256 is in `KernelPin.allowed`. On first `coop setup`,
   `coop-sandbox init` pulls `ghcr.io/apple/containerization/vminit:0.45.0`
   (the runtime's only outbound fetch) and refuses it unless it resolves to the
@@ -421,12 +421,31 @@ exposure, and coop verifies the effective configuration anyway
   generate their own identity. This is not a uniqueness guarantee: the disk
   still boots guest-authored code, which can restore an identity it stashed.
   Pinning does not depend on it, since each instance's key is read from that
-  sandbox over its own control channel. The removal runs in a maintenance VM booted from a clone of a
-  coop-built image in the runtime's store (never the guest's own disk), with
-  the committed disk mounted `nosuid,nodev,noexec` as data. It refuses a
-  symlinked `/etc` or `/etc/ssh`, and removes a symlinked key or machine-id
-  rather than following it. Disk growth runs the same way. Maintenance VMs
-  have no network, and whatever they run stays inside that VM.
+  sandbox over its own control channel. The removal runs in a maintenance VM
+  booted from a disposable clone of the maintenance image (never the guest's
+  own disk), with the committed disk mounted `nosuid,nodev,noexec` as data. It
+  refuses a symlinked `/etc` or `/etc/ssh`, and removes a symlinked key or
+  machine-id rather than following it. Disk growth runs the same way.
+  Maintenance VMs have no network, and whatever they run stays inside that VM.
+- **The maintenance image** is built by `coop setup` like the instance image
+  (stock builder, the same pinned-by-tag Ubuntu base and apt, so no new
+  outbound URL), from a fixed recipe with no build context beyond its
+  Dockerfile: Ubuntu plus e2fsprogs. The runtime unpacks it into its own
+  `maintenance/` directory, records its version and digest, checks that it
+  holds the programs the maintenance scripts run, and keeps it apart from the
+  image store; the store copy is deleted. No application image is ever used
+  for maintenance.
+- **Mutation integrity.** Disk and resource changes follow the invariants in
+  [`design/apple-sandbox-transactions.md`](design/apple-sandbox-transactions.md)
+  (INV-01…INV-10). The security-relevant ones:
+  - no disk is replaced under a VM that can use it (the runtime's per-sandbox
+    guard covers owner startup, including launchd respawns);
+  - a rollback never overwrites a newer change;
+  - a host key is re-pinned only after a restore correlated with coop's own
+    operation id, never on a disk-generation increase alone.
+
+  Weakening any of these (skipping the guard, re-pinning on generation alone,
+  guessing at unreadable staged state) is a finding.
 
 ## `coop update` trust chain
 

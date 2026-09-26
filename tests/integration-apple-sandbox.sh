@@ -48,6 +48,7 @@ RUN="t$(openssl rand -hex 4)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/coop-sandbox-test.XXXXXX")"
 ROOT="$WORK/root"
 IMAGE="local/coop-sandbox-test:$RUN"
+MAINTENANCE="local/coop-sandbox-test-maintenance:$RUN"
 SANDBOX="$WORK/bin/coop-sandbox"
 CYCLES="${CYCLES:-5}"
 CONCURRENT="${CONCURRENT:-4}"
@@ -100,6 +101,8 @@ summary() {
 # ── Runtime helpers ───────────────────────────────────────────
 
 sbx() { "$SANDBOX" "$1" --root "$ROOT" "${@:2}"; }
+# For two-word commands (`image import`, `maintenance install`).
+sbx2() { "$SANDBOX" "$1" "$2" --root "$ROOT" "${@:3}"; }
 name() { echo "coop-test-$1-$RUN"; }
 create() { sbx create "$1" --image "$IMAGE" --cpus "${2:-2}" --memory-mib "${3:-2048}" --disk-gib "${4:-8}" --owner "$RUN" >/dev/null; }
 state() { sbx inspect "$1" 2>/dev/null | jq -r .status 2>/dev/null || echo missing; }
@@ -141,7 +144,7 @@ cleanup() {
                 sbx delete "$n" --owner "$RUN" >/dev/null 2>&1
             done
         fi
-        "$CONTAINER" image delete "$IMAGE" >/dev/null 2>&1
+        "$CONTAINER" image delete "$IMAGE" "$MAINTENANCE" >/dev/null 2>&1
         rm -rf "$WORK"
     else
         echo "Kept $WORK"
@@ -184,8 +187,8 @@ else
     fail "coop-sandbox builds and signs" "see $WORK/build.log"
     summary
 fi
-check "version reports protocol 1 on containerization 0.45.0" \
-    test "$("$SANDBOX" version | jq -r '"\(.protocol) \(.containerization)"')" = "1 0.45.0"
+check "version reports protocol 2 on containerization 0.45.0" \
+    test "$("$SANDBOX" version | jq -r '"\(.protocol) \(.containerization)"')" = "2 0.45.0"
 if "$CONTAINER" build --platform linux/arm64 -t "$IMAGE" "$FIXTURES/image" >"$WORK/image.log" 2>&1 &&
     "$CONTAINER" image save --platform linux/arm64 -o "$WORK/image.tar" "$IMAGE" >/dev/null 2>&1; then
     pass "test image builds"
@@ -200,6 +203,23 @@ imported="$("$SANDBOX" image import --root "$ROOT" --oci-tar "$WORK/image.tar")"
 # shellcheck disable=SC2016 # jq program text.
 check "image imports into the private store" jq -e --arg r "$IMAGE" 'any(.reference == $r)' <<<"$imported"
 rm -f "$WORK/image.tar"
+# The maintenance image: a shell and e2fsprogs, the same recipe coop builds.
+mkdir -p "$WORK/maintenance"
+printf '%s\n' 'FROM docker.io/library/ubuntu:24.04' \
+    'RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends e2fsprogs && rm -rf /var/lib/apt/lists/*' \
+    >"$WORK/maintenance/Dockerfile"
+if "$CONTAINER" build --platform linux/arm64 -t "$MAINTENANCE" "$WORK/maintenance" >"$WORK/maintenance.log" 2>&1 &&
+    "$CONTAINER" image save --platform linux/arm64 -o "$WORK/maintenance.tar" "$MAINTENANCE" >/dev/null 2>&1 &&
+    sbx2 image import --oci-tar "$WORK/maintenance.tar" >/dev/null; then
+    pass "maintenance image builds and imports"
+else
+    fail "maintenance image builds and imports" "see $WORK/maintenance.log"
+fi
+check "maintenance installs outside the image store" sbx2 maintenance install --image "$MAINTENANCE" --version 1
+sbx2 image delete "$MAINTENANCE" >/dev/null
+# shellcheck disable=SC2016 # jq program text.
+check "maintenance survives deleting its store image" jq -e --arg r "$MAINTENANCE" '.version == "1" and .reference == $r' <<<"$(sbx2 maintenance inspect)"
+rm -f "$WORK/maintenance.tar"
 
 if want disks; then
     echo ""
@@ -414,6 +434,27 @@ if want growth; then
     check "the guest filesystem is 32 GiB" test "$(guest "$g" df -B1 --output=size / | tail -1 | xargs)" -ge $((31 * 1024 * 1024 * 1024))
     check "data and host key survive the grow" test "$(guest "$g" cat /var/lib/coop-test/marker)$(guest "$g" cat /etc/ssh/ssh_host_ed25519_key.pub)" = "$m$key"
     sbx stop "$g"
+    # Same-sandbox races serialize in the runtime: of two identical grows,
+    # exactly one applies; a start racing a grow either waits for it and boots
+    # the grown disk, or wins and the grow is refused, never both.
+    sbx grow "$g" --disk-gib 36 >/dev/null 2>&1 &
+    g1=$!
+    sbx grow "$g" --disk-gib 36 >/dev/null 2>&1 &
+    g2=$!
+    ok=0
+    wait "$g1" && ok=$((ok + 1))
+    wait "$g2" && ok=$((ok + 1))
+    check "two concurrent grows of one sandbox apply once" test "$ok" -eq 1
+    sbx grow "$g" --disk-gib 40 >/dev/null 2>&1 &
+    g1=$!
+    check "a start racing a grow boots" boot "$g"
+    grew=0
+    wait "$g1" && grew=1
+    size="$(guest "$g" df -B1 --output=size / | tail -1 | xargs)"
+    gib39=$((39 * 1024 * 1024 * 1024))
+    serialized() { if ((grew)); then test "$size" -ge "$gib39"; else test "$size" -lt "$gib39"; fi; }
+    check "start and grow serialize (grow $( ((grew)) && echo first || echo refused))" serialized
+    sbx stop "$g"
     sbx delete "$g" --owner "$RUN"
 fi
 
@@ -449,7 +490,7 @@ if want snapshots; then
     check "it has its own identity" test "$(guest "$c" cat /etc/machine-id)" != "$mid"
     sbx stop "$c"
     sbx delete "$c" --owner "$RUN"
-    sbx disk delete snap
+    sbx2 disk delete snap
     enroll "$A" 2>/dev/null || true
 fi
 

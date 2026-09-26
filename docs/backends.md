@@ -79,6 +79,7 @@ It builds the Swift package in release mode, signs it ad hoc with its one entitl
 
 | coop-sandbox | containerization | macOS | Hardware | Evidence |
 |---|---|---|---|---|
+| 0.2.0 (protocol 2) | 0.45.0 | 27.0 | Apple Silicon | [`tests/integration-apple-sandbox.sh`](../tests/integration-apple-sandbox.sh) (all phases, including maintenance install and same-sandbox races): 76 passed, 1 skipped by design ([run record](design/apple-sandbox-transactions.md#4-validation)); coop end to end not yet re-run |
 | 0.1.0 (protocol 1) | 0.45.0 | 27.0 | Apple Silicon | [`tests/integration-apple-sandbox.sh`](../tests/integration-apple-sandbox.sh) (isolation, host exposure, canary, pinning, persistence, resources, growth, commit/restore, crash recovery, concurrency), coop `setup`/`up`/`exec`/`stop`/`resize`/`commit`/`restore`/`destroy` end to end |
 
 The runtime also pins its guest kernel by sha256 (`vmlinux-6.18.15-186`, the kernel `container` 1.4.1 installs) and its init image (`vminit:0.45.0` by digest). `coop setup` fails with `APPLE_RUNTIME_UNAVAILABLE` on any other kernel.
@@ -119,8 +120,8 @@ Instances created by the retired `container machine` backend (schema 1) are refu
 
 `coop setup`:
 
-1. Checks the platform, resolves and qualifies coop-sandbox (`coop-sandbox version`: protocol 1, containerization 0.45.0), and creates `owner.json` and the VM-access key pair.
-2. Initializes the runtime root: copies the kernel after checking its pinned sha256, and pulls the pinned init image.
+1. Checks the platform, resolves and qualifies coop-sandbox (`coop-sandbox version`: protocol 2, containerization 0.45.0), and creates `owner.json` and the VM-access key pair.
+2. Initializes the runtime root: copies the kernel after checking its pinned sha256, and pulls the pinned init image. Unless the runtime already has the current maintenance image, builds it (Ubuntu with e2fsprogs; log in `maintenance-build.log`), installs it with `coop-sandbox maintenance install`, and deletes the store copy.
 3. Renders a minimal build context in a private temporary directory: a Dockerfile `FROM ubuntu:24.04`, the same provisioning script Lima uses (packages, profiles, OCI features, guest user, Claude Code, Codex, Docker), and a machine-setup script. The context contains the coop **public** key only. There are no build arguments and no secrets.
 4. Checks that the builder's service is running, then runs `container build --platform linux/arm64 -t local/coop-<owner>:<hash>-<nonce>`, with output in `images/<name>/build.log`. Every build gets a fresh tag, so a rebuild never retags an image in use.
 5. Saves the image as an OCI archive, imports it into the runtime's private store, and deletes the builder's copy.
@@ -159,10 +160,11 @@ Local model servers on host loopback reach the guest over a per-instance `ssh -R
 
 All three need the instance stopped.
 
-- **`coop resize --mem/--vcpus`** records the new values with `coop-sandbox set` and reads them back. They apply at the next start. With `--start`, if the boot fails, the previous values are restored. The guest sees one more vCPU than configured: the runtime's own overhead.
-- **`coop resize --size`** grows the disk offline. The runtime clones the disk, extends it, and runs `e2fsck`/`resize2fs` in a short maintenance VM booted from a clone of a coop-built tools image, with the instance's disk attached as data. It swaps the result in only on success, so this takes about a second. Shrinking is refused.
+- **`coop resize --mem/--vcpus`** records the new values with `coop-sandbox set`, tagged with an operation id, and reads them back. They apply at the next start. The change is journaled; an interrupted one is reconciled on the next `coop start` from the runtime's record. With `--start`, if the boot fails and the sandbox is confirmed stopped again, the previous values are restored through the same journaled update, and only if the runtime's last committed operation is still the forward change; otherwise, or if the rollback cannot be confirmed, the result is `APPLE_OPERATION_UNCERTAIN`. The guest sees one more vCPU than configured: the runtime's own overhead.
+- **`coop resize --size`** grows the disk offline. The runtime clones the disk, extends it, and runs `e2fsck`/`resize2fs` in a short maintenance VM, with the instance's disk attached as data. It then publishes the grown disk and its new size as one recoverable update (a crash between the two is finished by the runtime's next operation on the sandbox), so this takes about a second. Shrinking is refused.
+- **Maintenance image.** Maintenance VMs boot their own small image (Ubuntu with e2fsprogs), which `coop setup` builds with the stock builder and installs into the runtime outside its image store, then removes from the store. It does not depend on any instance's image, so deleting or replacing images never affects growth or commits. `coop setup` reinstalls it when its recipe version changes.
 - **`coop commit --image <name>`** saves an APFS clone of the disk with its SSH host keys and machine-id removed. `coop up --image <name>` and `coop restore` then clone it, and every instance created from it generates its own identity.
-- **`coop restore`** swaps in a clone of a committed disk, or a fresh copy of a base image with `--reprovision`. It then grows the new disk back to the instance's size if that is larger. The operation is journaled: a restore interrupted by a crash is reconciled on the next `coop start` from the runtime's disk generation counter.
+- **`coop restore`** swaps in a clone of a committed disk, or a fresh copy of a base image with `--reprovision`. It then grows the new disk back to the instance's size if that is larger. The operation is journaled: a restore interrupted by a crash is reconciled on the next `coop start` from the runtime's record, and it re-pins the host key only if the runtime's last committed operation is that restore (a higher disk generation alone is not enough).
 
 ### Stop, destroy, recovery
 

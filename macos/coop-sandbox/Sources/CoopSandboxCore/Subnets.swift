@@ -21,7 +21,7 @@ public struct SubnetAllocator: Sendable {
 
     /// Runs `body` under an exclusive lock on the allocation state.
     func locked<T>(_ body: (inout State) throws -> T) throws -> T {
-        let fd = open(root.allocationLock.path, O_CREAT | O_RDWR, 0o600)
+        let fd = open(root.allocationLock.path, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
         guard fd >= 0 else { throw SandboxError("open \(root.allocationLock.path): errno \(errno)") }
         defer { close(fd) }
         guard flock(fd, LOCK_EX) == 0 else { throw SandboxError("flock: errno \(errno)") }

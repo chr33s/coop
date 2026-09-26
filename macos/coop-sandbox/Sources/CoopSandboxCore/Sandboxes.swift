@@ -33,7 +33,8 @@ public struct ReconcileAction: Codable, Sendable {
 }
 
 /// Sandbox lifecycle operations. Every mutation of a sandbox's disk or
-/// record requires it to be stopped with no live owner.
+/// record runs under its mutation guard and requires it to be stopped with
+/// no live owner.
 public enum Sandboxes {
     // MARK: status
 
@@ -50,7 +51,7 @@ public enum Sandboxes {
     /// Whether some process holds the owner lock (an owner between launch
     /// and writing live.json, or a wedged one).
     static func ownerHoldsLock(_ paths: SandboxPaths) -> Bool {
-        let fd = open(paths.lock.path, O_RDWR)
+        let fd = open(paths.lock.path, O_RDWR | O_CLOEXEC)
         guard fd >= 0 else { return false }
         defer { close(fd) }
         if flock(fd, LOCK_EX | LOCK_NB) == 0 {
@@ -65,6 +66,26 @@ public enum Sandboxes {
         guard s == .stopped else { throw SandboxError("\(id) is \(s.rawValue); stop it first") }
     }
 
+    /// Runs `body` holding `paths`' mutation guard, so no other mutation of
+    /// the sandbox and no owner (started by `start` or respawned by launchd)
+    /// can interleave with it; see ``Owner/claim(root:id:)``. Unless `settle`
+    /// is false, a disk update a crash interrupted is finished or discarded
+    /// first. Checks that the sandbox is stopped belong inside `body`, so the
+    /// whole check-and-mutate interval is guarded.
+    static func mutating<T>(_ paths: SandboxPaths, settle: Bool = true, _ body: () async throws -> T) async throws -> T {
+        let guarded = try await FileLock.acquire(paths.mutationLock, .exclusive, polling: .milliseconds(50))
+        defer { withExtendedLifetime(guarded) {} }
+        if settle { try DiskUpdate.settle(paths) }
+        return try await body()
+    }
+
+    /// Runs `body` holding committed disk `name`'s lock.
+    static func withDisk<T>(_ root: SandboxRoot, _ name: SandboxID, _ mode: FileLock.Mode, _ body: () throws -> T) async throws -> T {
+        let lock = try await FileLock.acquire(root.diskLock(name), mode, polling: .milliseconds(50))
+        defer { withExtendedLifetime(lock) {} }
+        return try body()
+    }
+
     // MARK: create
 
     public static func create(
@@ -77,13 +98,16 @@ public enum Sandboxes {
             throw SandboxError("cpus must be >= 1, memory >= 256 MiB, disk >= 1 GiB")
         }
         let paths = root.sandbox(id)
-        // No record yet means an uncommitted create; reconcile removes those.
-        try FileManager.default.createDirectory(at: paths.dir, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
-        do {
-            return try await populate(root: root, paths: paths, id: id, owner: owner, source: source, cpus: cpus, memoryBytes: memoryBytes, diskBytes: diskBytes)
-        } catch {
-            try? FileManager.default.removeItem(at: paths.dir)
-            throw error
+        return try await mutating(paths, settle: false) {
+            // No record yet means an uncommitted create; reconcile removes those.
+            try FileManager.default.createDirectory(at: paths.dir, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+            do {
+                return try await populate(
+                    root: root, paths: paths, id: id, owner: owner, source: source, cpus: cpus, memoryBytes: memoryBytes, diskBytes: diskBytes)
+            } catch {
+                try? FileManager.default.removeItem(at: paths.dir)
+                throw error
+            }
         }
     }
 
@@ -106,13 +130,14 @@ public enum Sandboxes {
             imageDigest = image.digest
             environment = try await image.config(for: .current).config?.env ?? ["PATH=\(LinuxProcessConfiguration.defaultPath)"]
         case .disk(let name):
-            let meta = try loadDiskMetadata(root: root, name: name)
+            let meta = try await cloneCommitted(root: root, name: name, to: paths.rootfs)
             guard diskBytes >= meta.diskBytes else {
                 throw SandboxError("disk \(name) is \(meta.diskBytes) bytes; cannot create a smaller sandbox from it")
             }
-            try clone(root.disk(name), to: paths.rootfs)
+            // Nothing refers to this disk until the record is written, so it
+            // is grown in place.
             if diskBytes > meta.diskBytes {
-                try await growInPlace(root: root, paths: paths, to: diskBytes)
+                try await growScratch(root: root, scratch: paths.dir, disk: paths.rootfs, to: diskBytes)
             }
             imageReference = meta.imageReference
             imageDigest = meta.imageDigest
@@ -134,26 +159,40 @@ public enum Sandboxes {
         return record
     }
 
+    /// Clone committed disk `name` to `url` and return its metadata, both
+    /// from one publication of that name.
+    static func cloneCommitted(root: SandboxRoot, name: SandboxID, to url: URL) async throws -> DiskMetadata {
+        try await withDisk(root, name, .shared) {
+            let meta = try loadDiskMetadata(root: root, name: name)
+            try clone(root.disk(name), to: url)
+            return meta
+        }
+    }
+
     // MARK: start / stop
 
     public static func start(root: SandboxRoot, id: SandboxID, executable: String, wait: TimeInterval) async throws -> LiveState {
         try root.requireInitialized()
         let paths = root.sandbox(id)
-        _ = try paths.loadRecord()
-        if status(paths) == .crashed {
-            // Take the job back from launchd before starting it fresh.
+        // Guarded up to the bootstrap only: the owner takes the guard to
+        // claim the sandbox, so waiting for it here would deadlock.
+        try await mutating(paths) {
+            _ = try paths.loadRecord()
+            if status(paths) == .crashed {
+                // Take the job back from launchd before starting it fresh.
+                Launchd.bootout(paths.launchdLabel)
+                try? FileManager.default.removeItem(at: paths.live)
+            }
+            try requireStopped(paths, id)
             Launchd.bootout(paths.launchdLabel)
-            try? FileManager.default.removeItem(at: paths.live)
+            let domain = Launchd.domain()
+            let plist = Launchd.plist(
+                label: paths.launchdLabel, executable: executable,
+                arguments: ["run", id.rawValue, "--root", root.root.path], log: paths.ownerLog)
+            try Launchd.write(plist, to: paths.launchdPlist)
+            try? FileManager.default.removeItem(at: paths.ownerFailed)
+            try Launchd.bootstrap(plist: paths.launchdPlist, domain: domain)
         }
-        try requireStopped(paths, id)
-        Launchd.bootout(paths.launchdLabel)
-        let domain = Launchd.domain()
-        let plist = Launchd.plist(
-            label: paths.launchdLabel, executable: executable,
-            arguments: ["run", id.rawValue, "--root", root.root.path], log: paths.ownerLog)
-        try Launchd.write(plist, to: paths.launchdPlist)
-        try? FileManager.default.removeItem(at: paths.ownerFailed)
-        try Launchd.bootstrap(plist: paths.launchdPlist, domain: domain)
 
         let deadline = Date().addingTimeInterval(wait)
         while Date() < deadline {
@@ -172,7 +211,8 @@ public enum Sandboxes {
     }
 
     /// Halt systemd cleanly, wait for the owner to exit, and unload its job.
-    /// Idempotent: stopping a stopped sandbox succeeds.
+    /// Idempotent: stopping a stopped sandbox succeeds. Not guarded: it
+    /// changes no disk or record, and must work while an owner is starting.
     public static func stop(root: SandboxRoot, id: SandboxID, timeout: TimeInterval) async throws {
         let paths = root.sandbox(id)
         _ = try paths.loadRecord()
@@ -207,143 +247,158 @@ public enum Sandboxes {
 
     // MARK: resources and disks
 
-    public static func setResources(root: SandboxRoot, id: SandboxID, cpus: Int?, memoryBytes: UInt64?) throws -> SandboxRecord {
+    /// Change CPU/memory, applied at the next start. With `expect`, refuses
+    /// unless the record's last operation is still `expect`, so a caller
+    /// undoing its own change never overwrites a newer one.
+    public static func setResources(
+        root: SandboxRoot, id: SandboxID, cpus: Int?, memoryBytes: UInt64?, operation: OperationID? = nil, expect: OperationID? = nil
+    ) async throws -> SandboxRecord {
+        let lock = try OperationLock.shared(root)
+        defer { withExtendedLifetime(lock) {} }
         let paths = root.sandbox(id)
-        try requireStopped(paths, id)
-        var record = try paths.loadRecord()
-        if let cpus {
-            guard cpus >= 1 else { throw SandboxError("cpus must be >= 1") }
-            record.cpus = cpus
+        return try await mutating(paths) {
+            try requireStopped(paths, id)
+            var record = try paths.loadRecord()
+            if let expect, record.lastOperation != expect {
+                throw SandboxError(
+                    "\(id) was changed by operation \(record.lastOperation?.rawValue ?? "(none)") after \(expect); refusing to overwrite it")
+            }
+            if let cpus {
+                guard cpus >= 1 else { throw SandboxError("cpus must be >= 1") }
+                record.cpus = cpus
+            }
+            if let memoryBytes {
+                guard memoryBytes >= 256 * 1024 * 1024 else { throw SandboxError("memory must be >= 256 MiB") }
+                record.memoryBytes = memoryBytes
+            }
+            record.lastOperation = operation ?? .random()
+            try paths.save(record)
+            return record
         }
-        if let memoryBytes {
-            guard memoryBytes >= 256 * 1024 * 1024 else { throw SandboxError("memory must be >= 256 MiB") }
-            record.memoryBytes = memoryBytes
-        }
-        try paths.save(record)
-        return record
     }
 
-    public static func grow(root: SandboxRoot, id: SandboxID, diskBytes: UInt64) async throws -> SandboxRecord {
-        let operation = try OperationLock.shared(root)
-        defer { withExtendedLifetime(operation) {} }
+    public static func grow(root: SandboxRoot, id: SandboxID, diskBytes: UInt64, operation: OperationID? = nil) async throws -> SandboxRecord {
+        let lock = try OperationLock.shared(root)
+        defer { withExtendedLifetime(lock) {} }
         let paths = root.sandbox(id)
-        try requireStopped(paths, id)
-        var record = try paths.loadRecord()
-        guard diskBytes > record.diskBytes else { throw SandboxError("shrinking a disk is not supported") }
-        try await growInPlace(root: root, paths: paths, to: diskBytes)
-        record.diskBytes = diskBytes
-        try paths.save(record)
-        return record
+        return try await mutating(paths) {
+            try requireStopped(paths, id)
+            var record = try paths.loadRecord()
+            guard diskBytes > record.diskBytes else { throw SandboxError("shrinking a disk is not supported") }
+            let op = operation ?? .random()
+            let work = DiskUpdate.workDisk(paths, op)
+            try? FileManager.default.removeItem(at: work)
+            defer { try? FileManager.default.removeItem(at: work) }
+            try clone(paths.rootfs, to: work)
+            try await growScratch(root: root, scratch: paths.dir, disk: work, to: diskBytes)
+            record.diskBytes = diskBytes
+            record.lastOperation = op
+            try DiskUpdate.publish(paths, kind: .grow, operation: op, work: work, record: record)
+            return record
+        }
     }
 
-    static func growInPlace(root: SandboxRoot, paths: SandboxPaths, to bytes: UInt64) async throws {
-        let digest = try? paths.loadRecord().imageDigest
-        try await grow(root: root, scratch: paths.dir, disk: paths.rootfs, to: bytes, imageDigest: digest)
-    }
-
-    /// Grow `disk` via a clone that is swapped in only once the resize
-    /// succeeded, so a failure leaves `disk` untouched.
-    static func grow(root: SandboxRoot, scratch: URL, disk: URL, to bytes: UInt64, imageDigest: String?) async throws {
-        let work = scratch.appendingPathComponent(".grow-\(disk.lastPathComponent)")
-        try? FileManager.default.removeItem(at: work)
-        defer { try? FileManager.default.removeItem(at: work) }
-        try clone(disk, to: work)
-        guard truncate(work.path, off_t(bytes)) == 0 else { throw SandboxError("truncate: errno \(errno)") }
-        let tools = try await Disks.toolsDisk(root: root, preferring: imageDigest)
-        let log = try await Maintenance.growFilesystem(root: root, scratch: scratch, tools: tools, disk: work)
+    /// Enlarge `disk`, a file nothing else uses yet, and grow its filesystem.
+    static func growScratch(root: SandboxRoot, scratch: URL, disk: URL, to bytes: UInt64) async throws {
+        guard truncate(disk.path, off_t(bytes)) == 0 else { throw SandboxError("truncate: errno \(errno)") }
+        let log = try await Maintenance.growFilesystem(root: root, scratch: scratch, disk: disk)
         Owner.log("grew \(disk.lastPathComponent) to \(bytes) bytes: \(log.split(separator: "\n").last ?? "")")
-        guard rename(work.path, disk.path) == 0 else { throw SandboxError("rename: errno \(errno)") }
     }
 
     /// Save a stopped sandbox's disk as `name`, with its identity removed.
     public static func commit(root: SandboxRoot, id: SandboxID, name: SandboxID, replace: Bool) async throws -> DiskSummary {
-        let operation = try OperationLock.shared(root)
-        defer { withExtendedLifetime(operation) {} }
+        let lock = try OperationLock.shared(root)
+        defer { withExtendedLifetime(lock) {} }
         let paths = root.sandbox(id)
-        try requireStopped(paths, id)
-        let record = try paths.loadRecord()
-        let target = root.disk(name)
-        if FileManager.default.fileExists(atPath: target.path), !replace {
-            throw SandboxError("disk \(name) exists")
+        return try await mutating(paths) {
+            try requireStopped(paths, id)
+            let record = try paths.loadRecord()
+            let target = root.disk(name)
+            if FileManager.default.fileExists(atPath: target.path), !replace {
+                throw SandboxError("disk \(name) exists")
+            }
+            let tmp = root.disks.appendingPathComponent(".tmp-\(name.rawValue)-\(UUID().uuidString.prefix(8)).ext4")
+            defer { try? FileManager.default.removeItem(at: tmp) }
+            try clone(paths.rootfs, to: tmp)
+            // The reset runs coop-built tools against the disk as data, so the
+            // guest's own binaries cannot interfere with it. It removes only the
+            // identity left on disk: a guest that authored the disk can still
+            // re-create its old identity when a clone boots.
+            _ = try await Maintenance.resetIdentity(root: root, scratch: root.disks, disk: tmp)
+            let meta = DiskMetadata(
+                imageReference: record.imageReference, imageDigest: record.imageDigest, environment: record.environment,
+                diskBytes: record.diskBytes, committedFrom: id, createdAt: Date())
+            return try await withDisk(root, name, .exclusive) {
+                if FileManager.default.fileExists(atPath: target.path), !replace {
+                    throw SandboxError("disk \(name) exists")
+                }
+                // Disk first, then its metadata: a disk without metadata is
+                // unusable (and reconcile removes it), and the lock keeps
+                // clones from pairing it with the replaced disk's metadata.
+                try? FileManager.default.removeItem(at: metadataURL(root: root, name: name))
+                guard rename(tmp.path, target.path) == 0 else { throw SandboxError("rename: errno \(errno)") }
+                try JSONEncoder.pretty.encode(meta).write(to: metadataURL(root: root, name: name), options: .atomic)
+                let (logical, allocated) = Disks.sizes(target)
+                return DiskSummary(name: name.rawValue, logicalBytes: logical, allocatedBytes: allocated)
+            }
         }
-        let tmp = root.disks.appendingPathComponent(".tmp-\(name.rawValue)-\(UUID().uuidString.prefix(8)).ext4")
-        defer { try? FileManager.default.removeItem(at: tmp) }
-        try clone(paths.rootfs, to: tmp)
-        // The reset runs coop-built tools against the disk as data, so the
-        // guest's own binaries cannot interfere with it. It removes only the
-        // identity left on disk: a guest that authored the disk can still
-        // re-create its old identity when a clone boots.
-        let tools = try await Disks.toolsDisk(root: root, preferring: record.imageDigest)
-        _ = try await Maintenance.resetIdentity(root: root, scratch: root.disks, tools: tools, disk: tmp)
-        let meta = DiskMetadata(
-            imageReference: record.imageReference, imageDigest: record.imageDigest, environment: record.environment,
-            diskBytes: record.diskBytes, committedFrom: id, createdAt: Date())
-        // Disk first, then its metadata: a disk without metadata is unusable
-        // (and reconcile removes it), never paired with another disk's metadata.
-        try? FileManager.default.removeItem(at: metadataURL(root: root, name: name))
-        guard rename(tmp.path, target.path) == 0 else { throw SandboxError("rename: errno \(errno)") }
-        try JSONEncoder.pretty.encode(meta).write(to: metadataURL(root: root, name: name), options: .atomic)
-        let (logical, allocated) = Disks.sizes(target)
-        return DiskSummary(name: name.rawValue, logicalBytes: logical, allocatedBytes: allocated)
     }
 
     /// Replace a stopped sandbox's disk with a clone of committed disk `name`
     /// or a fresh copy of an image, grown back to the sandbox's size if that
     /// is larger. The new disk has no host keys, so the next boot generates
     /// new ones.
-    public static func restore(root: SandboxRoot, id: SandboxID, source: SandboxSource) async throws -> SandboxRecord {
-        let operation = try OperationLock.shared(root)
-        defer { withExtendedLifetime(operation) {} }
+    public static func restore(root: SandboxRoot, id: SandboxID, source: SandboxSource, operation: OperationID? = nil) async throws
+        -> SandboxRecord
+    {
+        let lock = try OperationLock.shared(root)
+        defer { withExtendedLifetime(lock) {} }
         let paths = root.sandbox(id)
-        try requireStopped(paths, id)
-        var record = try paths.loadRecord()
-        let sourceURL: URL
-        let sourceBytes: UInt64
-        switch source {
-        case .disk(let name):
-            let meta = try loadDiskMetadata(root: root, name: name)
-            sourceURL = root.disk(name)
-            sourceBytes = meta.diskBytes
-            record.imageReference = meta.imageReference
-            record.imageDigest = meta.imageDigest
-            record.environment = meta.environment
-            record.baseDisk = name.rawValue
-        case .image(let reference):
-            let store = try ImageStore(path: root.imageStore)
-            let image = try await store.get(reference: reference)
-            sourceURL = try await Disks.base(root: root, image: image, bytes: record.diskBytes)
-            sourceBytes = record.diskBytes
-            record.imageReference = reference
-            record.imageDigest = image.digest
-            record.environment = try await image.config(for: .current).config?.env ?? ["PATH=\(LinuxProcessConfiguration.defaultPath)"]
-            record.baseDisk = nil
+        return try await mutating(paths) {
+            try requireStopped(paths, id)
+            var record = try paths.loadRecord()
+            let op = operation ?? .random()
+            let work = DiskUpdate.workDisk(paths, op)
+            try? FileManager.default.removeItem(at: work)
+            defer { try? FileManager.default.removeItem(at: work) }
+            let sourceBytes: UInt64
+            switch source {
+            case .disk(let name):
+                let meta = try await cloneCommitted(root: root, name: name, to: work)
+                sourceBytes = meta.diskBytes
+                record.imageReference = meta.imageReference
+                record.imageDigest = meta.imageDigest
+                record.environment = meta.environment
+                record.baseDisk = name.rawValue
+            case .image(let reference):
+                let store = try ImageStore(path: root.imageStore)
+                let image = try await store.get(reference: reference)
+                try clone(try await Disks.base(root: root, image: image, bytes: record.diskBytes), to: work)
+                sourceBytes = record.diskBytes
+                record.imageReference = reference
+                record.imageDigest = image.digest
+                record.environment = try await image.config(for: .current).config?.env ?? ["PATH=\(LinuxProcessConfiguration.defaultPath)"]
+                record.baseDisk = nil
+            }
+            if record.diskBytes > sourceBytes {
+                try await growScratch(root: root, scratch: paths.dir, disk: work, to: record.diskBytes)
+            } else {
+                record.diskBytes = sourceBytes
+            }
+            record.diskGeneration += 1
+            record.lastOperation = op
+            try DiskUpdate.publish(paths, kind: .restore, operation: op, work: work, record: record)
+            return record
         }
-        // Everything that can fail happens on a scratch copy; the swap is the
-        // last step. The new record is staged first, so a crash right after
-        // the swap still commits the new generation (see settlePendingRestore).
-        let work = paths.restoreWork
-        try? FileManager.default.removeItem(at: work)
-        defer { try? FileManager.default.removeItem(at: work) }
-        try clone(sourceURL, to: work)
-        if record.diskBytes > sourceBytes {
-            try await grow(root: root, scratch: paths.dir, disk: work, to: record.diskBytes, imageDigest: record.imageDigest)
-        } else {
-            record.diskBytes = sourceBytes
-        }
-        record.diskGeneration += 1
-        try paths.writePendingRestore(record, disk: work)
-        guard rename(work.path, paths.rootfs.path) == 0 else {
-            try? FileManager.default.removeItem(at: paths.pendingRestore)
-            throw SandboxError("rename: errno \(errno)")
-        }
-        try paths.save(record)
-        try? FileManager.default.removeItem(at: paths.pendingRestore)
-        return record
     }
 
-    public static func deleteDisk(root: SandboxRoot, name: SandboxID) throws {
-        try FileManager.default.removeItem(at: root.disk(name))
-        try? FileManager.default.removeItem(at: metadataURL(root: root, name: name))
+    public static func deleteDisk(root: SandboxRoot, name: SandboxID) async throws {
+        let lock = try OperationLock.shared(root)
+        defer { withExtendedLifetime(lock) {} }
+        try await withDisk(root, name, .exclusive) {
+            try FileManager.default.removeItem(at: root.disk(name))
+            try? FileManager.default.removeItem(at: metadataURL(root: root, name: name))
+        }
     }
 
     static func metadataURL(root: SandboxRoot, name: SandboxID) -> URL {
@@ -357,21 +412,28 @@ public enum Sandboxes {
 
     // MARK: delete / reconcile
 
-    public static func delete(root: SandboxRoot, id: SandboxID, owner: String) throws {
+    /// Does not settle a staged disk update first: deleting must stay
+    /// possible even when that state is unreadable.
+    public static func delete(root: SandboxRoot, id: SandboxID, owner: String) async throws {
+        let lock = try OperationLock.shared(root)
+        defer { withExtendedLifetime(lock) {} }
         let paths = root.sandbox(id)
-        try requireStopped(paths, id)
-        let record = try paths.loadRecord()
-        guard record.owner == owner else { throw SandboxError("\(id) belongs to owner \(record.owner), not \(owner)") }
-        Launchd.bootout(paths.launchdLabel)
-        // Rename first so an interrupted delete never leaves a half-removed
-        // sandbox that still looks valid; reconcile finishes the removal.
-        let tomb = root.sandboxes.appendingPathComponent(".deleting-\(id.rawValue)-\(UUID().uuidString.prefix(8))")
-        guard rename(paths.dir.path, tomb.path) == 0 else { throw SandboxError("rename: errno \(errno)") }
-        try FileManager.default.removeItem(at: tomb)
+        try await mutating(paths, settle: false) {
+            try requireStopped(paths, id)
+            let record = try paths.readRecordFile()
+            guard record.owner == owner else { throw SandboxError("\(id) belongs to owner \(record.owner), not \(owner)") }
+            Launchd.bootout(paths.launchdLabel)
+            // Rename first so an interrupted delete never leaves a half-removed
+            // sandbox that still looks valid; reconcile finishes the removal.
+            let tomb = root.sandboxes.appendingPathComponent(".deleting-\(id.rawValue)-\(UUID().uuidString.prefix(8))")
+            guard rename(paths.dir.path, tomb.path) == 0 else { throw SandboxError("rename: errno \(errno)") }
+            try FileManager.default.removeItem(at: tomb)
+        }
     }
 
-    /// Clear crashed owners' state, finish interrupted deletes, and remove
-    /// uncommitted creates and leftover scratch files.
+    /// Clear crashed owners' state, finish interrupted disk updates and
+    /// deletes, and remove uncommitted creates and leftover scratch files. A
+    /// sandbox whose guard is held is left for a later run.
     public static func reconcile(root: SandboxRoot) throws -> [ReconcileAction] {
         var out: [ReconcileAction] = []
         // The sweep below must not race an in-flight create, grow, commit, or
@@ -380,15 +442,27 @@ public enum Sandboxes {
         defer { withExtendedLifetime(sweep) {} }
         for record in try root.allRecords() {
             let paths = root.sandbox(record.id)
+            guard let guarded = try FileLock.attempt(paths.mutationLock, .exclusive) else {
+                out.append(.init(id: record.id.rawValue, status: "busy", action: "skipped-mutation-in-progress"))
+                continue
+            }
             let s = status(paths)
-            var action = "none"
+            var actions: [String] = []
             if s == .crashed {
                 Launchd.bootout(paths.launchdLabel)
                 try? FileManager.default.removeItem(at: paths.live)
                 unlink(paths.control.path)
-                action = "cleared-crashed-owner"
+                actions.append("cleared-crashed-owner")
             }
-            out.append(.init(id: record.id.rawValue, status: s.rawValue, action: action))
+            if s == .stopped || s == .crashed {
+                do {
+                    if try DiskUpdate.settle(paths) { actions.append("settled-disk-update") }
+                } catch {
+                    actions.append("unresolved-disk-update: \(error)")
+                }
+            }
+            withExtendedLifetime(guarded) {}
+            out.append(.init(id: record.id.rawValue, status: s.rawValue, action: actions.isEmpty ? "none" : actions.joined(separator: ",")))
         }
         guard sweep != nil else {
             out.append(.init(id: "-", status: "busy", action: "sweep-skipped-operation-in-progress"))
@@ -407,15 +481,17 @@ public enum Sandboxes {
                 out.append(.init(id: name, status: "incomplete", action: "removed-uncommitted-create"))
             }
         }
-        var scratchDirs = [root.bases, root.disks]
+        var scratchDirs = [root.bases, root.disks, root.maintenance]
         scratchDirs += try root.allRecords().map { root.sandbox($0.id).dir }
         for dir in scratchDirs {
             // Scratch files come only from offline operations on a stopped
-            // sandbox; any other sandbox is left for a later sweep.
-            if dir.deletingLastPathComponent() == root.sandboxes,
-                let id = try? SandboxID(dir.lastPathComponent), status(root.sandbox(id)) != .stopped
-            {
-                continue
+            // sandbox; any other sandbox is left for a later sweep, as is one
+            // whose staged disk update is still unresolved.
+            if dir.deletingLastPathComponent() == root.sandboxes, let id = try? SandboxID(dir.lastPathComponent) {
+                let paths = root.sandbox(id)
+                let unresolved: Bool
+                do { unresolved = try DiskUpdate.loadPending(paths) != nil } catch { unresolved = true }
+                if status(paths) != .stopped || unresolved { continue }
             }
             for name in (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
             where isScratch(name) {
@@ -435,7 +511,7 @@ public enum Sandboxes {
 
     /// Scratch files left by an interrupted offline operation.
     static func isScratch(_ name: String) -> Bool {
-        [".tmp-", ".grow-", ".restore-", ".maintenance-"].contains { name.hasPrefix($0) }
+        [".tmp-", ".update-", ".grow-", ".restore-", ".maintenance-"].contains { name.hasPrefix($0) }
     }
 
     // MARK: logs

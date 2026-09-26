@@ -112,7 +112,8 @@ The `apple-container` feature builds only on macOS. Its unit tests replace the
 `coop-sandbox` runtime (and the stock `container` builder) with a scripted
 executor, so they run without either installed. The runtime itself is a Swift
 package with its own unit tests (IDs, records, subnet allocation, the control
-protocol, reconcile); none of them boots a VM:
+protocol, reconcile, and in `TransactionTests.swift` disk-update failure
+injection and same-sandbox locking); none of them boots a VM:
 
 ```bash
 cargo clippy --all-targets --features apple-container -- -D warnings
@@ -136,7 +137,9 @@ what unit tests cannot:
 - pinned SSH over the native channel;
 - stop/start persistence, CPU/memory changes, disk sizes and offline growth,
   commit/restore (including a guest that disables its own `rm`), crash
-  recovery with launchd respawn, and concurrent sandboxes.
+  recovery with launchd respawn, and concurrent sandboxes;
+- the maintenance image (install, and survival after its store image is
+  deleted) and same-sandbox races (concurrent grows, start against grow).
 
 It builds the runtime and a small test image (`tests/fixtures/apple-sandbox/`)
 and touches only its own temporary state root and image tag:
@@ -149,7 +152,9 @@ and touches only its own temporary state root and image tag:
 Run it before changing the `containerization` pin, the runtime's VM
 configuration, or the isolation gate, and whenever the macOS major version
 changes. [`design/apple-sandbox-runtime.md`](design/apple-sandbox-runtime.md)
-records why this runtime was chosen.
+records why this runtime was chosen;
+[`design/apple-sandbox-transactions.md`](design/apple-sandbox-transactions.md)
+lists the mutation invariants these tests defend and what is still untested.
 
 ## Mutation testing
 

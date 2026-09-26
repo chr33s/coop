@@ -1,4 +1,4 @@
-//! Typed parsers for `coop-sandbox` JSON output (protocol 1).
+//! Typed parsers for `coop-sandbox` JSON output (protocol 2).
 //!
 //! Runtime output is untrusted input: every record is parsed into a closed
 //! type, identifiers are checked against what coop asked for, and the
@@ -63,6 +63,24 @@ pub(crate) struct SandboxRecord {
     pub(crate) memory_bytes: u64,
     pub(crate) disk_bytes: u64,
     pub(crate) disk_generation: u64,
+    /// The last `set`, `grow`, or `restore` the runtime committed, by the
+    /// `--operation` id its caller passed. Absent before the first one.
+    #[serde(default)]
+    pub(crate) last_operation: Option<String>,
+}
+
+impl SandboxRecord {
+    /// Whether the runtime's last committed operation is `op`.
+    pub(crate) fn committed(&self, op: &super::state::OperationId) -> bool {
+        self.last_operation.as_deref() == Some(op.as_str())
+    }
+
+    pub(crate) fn resources(&self) -> super::state::Resources {
+        super::state::Resources {
+            cpus: self.cpus,
+            memory_bytes: self.memory_bytes,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -231,6 +249,23 @@ pub(crate) fn parse_disk(json: &str) -> Result<DiskEntry> {
     })
 }
 
+/// The disk maintenance VMs boot from, as `coop-sandbox maintenance
+/// inspect` and `maintenance install` report it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MaintenanceArtifact {
+    pub(crate) version: String,
+    pub(crate) reference: String,
+    pub(crate) digest: String,
+}
+
+/// `coop-sandbox maintenance inspect`: `null` when none is installed.
+pub(crate) fn parse_maintenance(json: &str) -> Result<Option<MaintenanceArtifact>> {
+    serde_json::from_str(json).map_err(|e| {
+        AppleError::RuntimeUnqualified(format!("`coop-sandbox maintenance` output: {e}")).into()
+    })
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
@@ -247,10 +282,22 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_artifact_parses_or_is_absent() {
+        assert_eq!(parse_maintenance("null").unwrap(), None);
+        let installed = parse_maintenance(
+            r#"{"version":"1","reference":"local/m:1","digest":"sha256:ab","capacityBytes":1,"installedAt":"2026-09-26T00:00:00Z","disk":"tools-ab-1.ext4"}"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(installed.version, "1");
+        assert!(parse_maintenance("{}").is_err());
+    }
+
+    #[test]
     fn version_parses() {
         let v = parse_version(&fixture("version.json")).unwrap();
         assert_eq!(v.name, "coop-sandbox");
-        assert_eq!(v.protocol, 1);
+        assert_eq!(v.protocol, 2);
         assert_eq!(v.containerization, "0.45.0");
         assert!(parse_version("{\"name\":\"x\"}").is_err());
     }

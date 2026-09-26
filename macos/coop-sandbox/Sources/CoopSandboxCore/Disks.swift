@@ -68,21 +68,6 @@ public enum Disks {
         return url
     }
 
-    /// Size of the scratch rootfs maintenance VMs boot from.
-    static let toolsBytes: UInt64 = 4 * 1024 * 1024 * 1024
-
-    /// A disk to boot maintenance VMs from: an image coop built and imported
-    /// (never a guest's own disk, whose tools a root guest could replace),
-    /// preferring `digest`. The init image is not a candidate.
-    public static func toolsDisk(root: SandboxRoot, preferring digest: String?) async throws -> URL {
-        let store = try ImageStore(path: root.imageStore)
-        let candidates = try await store.list().filter { !$0.reference.hasPrefix(initImagePrefix) }
-        guard let image = candidates.first(where: { $0.digest == digest }) ?? candidates.first else {
-            throw SandboxError("no image in the runtime store to run disk maintenance from; import one first")
-        }
-        return try await base(root: root, image: image, bytes: toolsBytes)
-    }
-
     static let initImagePrefix = "ghcr.io/apple/containerization/vminit"
 
     public static func listDisks(root: SandboxRoot) -> [DiskSummary] {

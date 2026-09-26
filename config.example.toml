@@ -154,14 +154,18 @@
 # mode = "notify"                # off | notify (default: notify)
 # check_interval_hours = 24      # minimum age before background re-check
 
-# Apple Container backend — read only by builds made with
+# Apple sandbox backend — read only by builds made with
 # `--features apple-container` (macOS). See docs/backends.md.
 # [apple_container]
-# binary = "/absolute/path/to/container"  # default: /usr/local/bin/container,
-#                                         # then /opt/homebrew/bin/container
-# probe_timeout_seconds = 10     # version/help/inspect/list (1–86400)
-# operation_timeout_seconds = 60 # network create/delete, machine set, image delete
-# create_timeout_seconds = 600   # machine create (unpacks the image)
+# binary = "/absolute/path/to/coop-sandbox"  # default: ~/.local/opt/coop-sandbox/bin/coop-sandbox,
+#                                            # then /usr/local/bin, /opt/homebrew/bin
+# builder = "/absolute/path/to/container"    # stock Apple `container`, image builds only;
+#                                            # default: /usr/local/bin, then /opt/homebrew/bin
+# kernel = "/absolute/path/to/vmlinux"       # default: the kernel `container` installs;
+#                                            # must match a sha256 the runtime pins
+# probe_timeout_seconds = 10     # version/inspect/list (1–86400)
+# operation_timeout_seconds = 60 # resource changes, deletes, guest commands
+# create_timeout_seconds = 600   # create (first image unpack), grow, commit, restore
 # boot_timeout_seconds = 120     # boot until SSH is ready
-# stop_timeout_seconds = 60      # stop confirmation (the runtime stops machines one at a time)
+# stop_timeout_seconds = 90      # clean systemd shutdown
 # build_timeout_seconds = 3600   # image build (`setup --builder-timeout` overrides)

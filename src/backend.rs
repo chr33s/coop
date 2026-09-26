@@ -1226,7 +1226,7 @@ pub trait VmBackend: std::fmt::Display {
     /// How the guest reaches a server running on the host, for local-model
     /// endpoints (see [`plan_local_endpoint`]). Firecracker guests route
     /// through the TAP gateway (`network.host_ip`); Lima injects
-    /// `host.lima.internal`; Apple Container guests get a reverse tunnel.
+    /// `host.lima.internal`; Apple sandbox guests get a reverse tunnel.
     fn local_endpoint_route(&self, network: &NetworkConfig) -> LocalEndpointRoute;
     /// Whether mounts use live filesystem sharing (Lima/virtiofs)
     /// vs one-time sync (Firecracker/rsync).

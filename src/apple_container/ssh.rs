@@ -1,8 +1,8 @@
 //! First-boot host-key enrollment and pinned SSH targets.
 //!
 //! The guest's Ed25519 host public key is read over the runtime's native
-//! control channel (`machine run --root`, addressed to the exact owned
-//! machine) — never over the network with `ssh-keyscan` — and written to a
+//! control channel (`coop-sandbox exec` over vsock, addressed to the exact
+//! owned sandbox) — never over the network with `ssh-keyscan` — and written to a
 //! per-instance known-hosts file under a stable alias. Every later connection
 //! verifies against that pin; a missing or changed key is a hard error.
 
@@ -98,8 +98,23 @@ pub(crate) fn enroll(inst: &Instance, machine: &MachineName, key: &HostPublicKey
             path.display()
         )));
     }
+    write_pin(inst, machine, key)
+}
+
+/// Replace the pin after coop itself replaced the instance's disk (`coop
+/// restore`), which removes the guest's host keys. The caller must only
+/// reach this on that path — never because a guest presented a new key.
+pub(crate) fn reenroll_after_disk_replacement(
+    inst: &Instance,
+    machine: &MachineName,
+    key: &HostPublicKey,
+) -> Result<()> {
+    write_pin(inst, machine, key)
+}
+
+fn write_pin(inst: &Instance, machine: &MachineName, key: &HostPublicKey) -> Result<()> {
     crate::fs_util::atomic_write_with_mode(
-        &path,
+        &super::state::known_hosts_path(inst),
         &key.known_hosts_line(&host_key_alias(machine)?),
         0o600,
     )
@@ -274,6 +289,28 @@ mod tests {
                 .iter()
                 .any(|o| o == "StrictHostKeyChecking=yes")
         );
+    }
+
+    /// The known-hosts path goes into ssh options and `~/.ssh/config`, so a
+    /// data directory whose path could change how ssh parses it is refused.
+    #[test]
+    fn pinned_target_refuses_unsafe_data_dir() {
+        let cfg = CoopConfig::default();
+        let user = crate::guest::GuestUser::default();
+        let key = HostPublicKey::parse(KEY).unwrap();
+        for bad in ["dq\"x", "sq'x", "nl\nx"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join(bad);
+            std::fs::create_dir(&dir).unwrap();
+            let inst = inst(&dir);
+            enroll(&inst, &machine(), &key).unwrap();
+            let err = pinned_target(&cfg, &inst, &machine(), Ipv4Addr::new(10, 0, 0, 2), &user)
+                .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("quote or control"),
+                "{bad:?}: {err:#}"
+            );
+        }
     }
 
     #[test]

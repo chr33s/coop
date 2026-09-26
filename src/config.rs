@@ -763,7 +763,7 @@ pub struct CoopConfig {
     #[serde(default)]
     pub updates: crate::update::UpdateConfig,
 
-    /// Apple Container backend settings. Parsed by every build so one
+    /// Apple sandbox backend settings. Parsed by every build so one
     /// `config.toml` stays portable; only the `apple-container` build reads it.
     #[serde(default)]
     pub apple_container: AppleContainerConfig,
@@ -798,7 +798,7 @@ impl<'de> Deserialize<'de> for TimeoutSecs {
     }
 }
 
-/// `[apple_container]` — settings for the Apple Container backend.
+/// `[apple_container]` — settings for the Apple sandbox backend.
 ///
 /// Deliberately small: there is no knob to mount the host home, forward the
 /// host SSH agent, share a network between instances, or skip the runtime
@@ -806,26 +806,35 @@ impl<'de> Deserialize<'de> for TimeoutSecs {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppleContainerConfig {
-    /// Absolute path to a qualified `container` runtime binary. When unset,
-    /// the backend searches a fixed list of host-owned install locations,
-    /// never `PATH` entries inside the project directory.
+    /// Absolute path to the `coop-sandbox` runtime binary. When unset, the
+    /// backend searches a fixed list of host-owned install locations, never
+    /// `PATH` entries inside the project directory.
     #[serde(default)]
     pub binary: Option<ConfigPath>,
-    /// Deadline for read-only runtime probes (version, help, inspect).
+    /// Absolute path to the stock Apple `container` CLI, used only to build
+    /// images. Searched in fixed install locations when unset.
+    #[serde(default)]
+    pub builder: Option<ConfigPath>,
+    /// Guest kernel for the runtime. Defaults to the kernel stock Apple
+    /// `container` installs; the runtime accepts only kernels it was
+    /// validated with, whatever this points at.
+    #[serde(default)]
+    pub kernel: Option<ConfigPath>,
+    /// Deadline for read-only runtime probes (version, inspect, list).
     #[serde(default = "default_apple_probe_timeout")]
     pub probe_timeout_seconds: TimeoutSecs,
-    /// Deadline for other state-changing runtime calls: network create and
-    /// delete, `machine set`, image delete, and fixed root commands.
+    /// Deadline for other state-changing runtime calls: resource changes,
+    /// image and disk deletion, delete, and fixed guest commands.
     #[serde(default = "default_apple_operation_timeout")]
     pub operation_timeout_seconds: TimeoutSecs,
-    /// Deadline for `machine create`, which unpacks the image into a new
-    /// machine disk.
+    /// Deadline for creating a sandbox disk (unpacking an image on first
+    /// use), growing, committing, or restoring one, and for runtime setup.
     #[serde(default = "default_apple_create_timeout")]
     pub create_timeout_seconds: TimeoutSecs,
-    /// Deadline for a machine to boot and report a guest address.
+    /// Deadline for a sandbox to boot and report a guest address.
     #[serde(default = "default_apple_boot_timeout")]
     pub boot_timeout_seconds: TimeoutSecs,
-    /// Deadline for a machine to confirm it stopped.
+    /// Deadline for a sandbox to halt cleanly and confirm it stopped.
     #[serde(default = "default_apple_stop_timeout")]
     pub stop_timeout_seconds: TimeoutSecs,
     /// Deadline for building the machine image. Package installation is slow,
@@ -839,6 +848,8 @@ impl Default for AppleContainerConfig {
     fn default() -> Self {
         Self {
             binary: None,
+            builder: None,
+            kernel: None,
             probe_timeout_seconds: default_apple_probe_timeout(),
             operation_timeout_seconds: default_apple_operation_timeout(),
             create_timeout_seconds: default_apple_create_timeout(),
@@ -865,10 +876,9 @@ fn default_apple_boot_timeout() -> TimeoutSecs {
     TimeoutSecs(120)
 }
 
-/// The runtime stops one machine at a time (each waits up to 10 s for a
-/// clean shutdown), so a stop queued behind others needs headroom.
+/// systemd's full shutdown; the runtime forces the VM down after 60 s.
 fn default_apple_stop_timeout() -> TimeoutSecs {
-    TimeoutSecs(60)
+    TimeoutSecs(90)
 }
 
 fn default_apple_build_timeout() -> TimeoutSecs {
@@ -876,7 +886,7 @@ fn default_apple_build_timeout() -> TimeoutSecs {
 }
 
 /// Subdirectory of the configured `data_dir` that this build's backend owns,
-/// if any: the Apple Container build keeps everything under
+/// if any: the Apple sandbox build keeps everything under
 /// `backends/apple-container-v1`; the default backends use `data_dir` itself.
 /// See [`CoopConfig::state_root`].
 const BACKEND_ROOT: Option<&str> = if cfg!(feature = "apple-container") {
@@ -2085,7 +2095,7 @@ impl CoopConfig {
 
     /// Root of this build's persistent state: `data_dir` itself for the
     /// default backends, `data_dir/backends/apple-container-v1` for the
-    /// Apple Container build. Images, instances, the VM key, and stored
+    /// Apple sandbox build. Images, instances, the VM key, and stored
     /// secrets all live beneath it; `data_dir` keeps its configured meaning.
     pub fn state_root(&self) -> PathBuf {
         BACKEND_ROOT.map_or_else(
@@ -2799,7 +2809,7 @@ fn is_firecracker_process(pid: u32) -> bool {
 /// `~/.coop`, or `~/.coop-apple` for the `apple-container` build. The feature
 /// build gets its own application directory so an older default build's
 /// `uninstall --purge` (which removes its whole `data_dir`) cannot reach
-/// Apple Container state.
+/// Apple sandbox state.
 fn default_data_dir() -> ConfigPath {
     let dir = if cfg!(feature = "apple-container") {
         ".coop-apple"
@@ -4801,7 +4811,7 @@ skip = ["not-a-slug"]
     #[test]
     fn apple_container_section_parses_and_rejects_unknown_keys() {
         let cfg: CoopConfig = toml::from_str(
-            "[apple_container]\nbinary = \"/opt/container/bin/container\"\nboot_timeout_seconds = 60\n",
+            "[apple_container]\nbinary = \"/opt/coop-sandbox/bin/coop-sandbox\"\nbuilder = \"/opt/homebrew/bin/container\"\nkernel = \"/opt/k/vmlinux\"\nboot_timeout_seconds = 60\n",
         )
         .unwrap();
         assert_eq!(cfg.apple_container.boot_timeout_seconds, TimeoutSecs(60));

@@ -35,7 +35,7 @@ mod secret_store;
 mod sha256_hash;
 #[cfg(all(feature = "apple-container", not(target_os = "macos")))]
 compile_error!(
-    "the `apple-container` feature selects the Apple Container backend, which exists only on \
+    "the `apple-container` feature selects the Apple sandbox backend, which exists only on \
      macOS; build without it on this target (Linux uses Firecracker)"
 );
 // Lima is an interactive CLI workflow — stderr output is intentional user communication.

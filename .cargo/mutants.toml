@@ -38,13 +38,6 @@ exclude_globs = [
   "src/vm.rs",
   # Thin binary shim: `fn main() { coop::run() }`. All logic is in the lib.
   "src/main.rs",
-  # Apple Container backend (`apple-container` feature): the VmBackend impl
-  # and runtime orchestration drive the `container` CLI and SSH. Its tests use
-  # a scripted runtime, but they only compile with the feature on, and the
-  # default mutation sweep builds without it. The pure parsers and gates
-  # (protocol.rs, security.rs, state.rs, ssh.rs, image.rs) stay in scope for
-  # a `--features apple-container` sweep.
-  "src/apple_container/mod.rs",
   # Interactive y/N + free-form line prompts (confirm / confirm_default_yes /
   # read_line). Every function short-circuits to Ok(false)/Ok(None) off a TTY
   # and otherwise reads stdin; the trailing match on the reply is only
@@ -158,8 +151,23 @@ exclude_re = [
   "\\bstore_keychain\\b",
   "find-generic-password",
 
+  # apple_container/mod.rs — the backend's calls to the real system (platform
+  # probe, key generation, default install/kernel paths, instance-dir removal).
+  # Everything else there runs against the scripted runtime in its tests, so it
+  # stays in scope for the `--features apple-container` sweep (docs/testing.md).
+  "\\bcheck_platform\\b",
+  "apple_container.*\\bensure_ssh_key\\b",
+  "\\bdefault_runtimes\\b",
+  "apple_container.*\\bdefault_kernel\\b",
+  "\\bremove_instance_dir\\b",
+  # `status` is its tested describe_sandbox text plus guest usage over real SSH.
+  "AppleContainerBackend>::status ->",
+  # Equivalent: the comparison only picks the wording of a reconcile warning.
+  "replace == with != in AppleContainerBackend::recover_journal",
+  # Equivalent: `acc << 6` has zero low bits, so `| v` and `^ v` agree.
+  "replace \\| with \\^ in decode_base64",
   # apple_container/cli.rs — process spawning, deadline polling, and log IO
-  # for the real `container` binary. read_bounded, apply_sanitized_env, and
+  # for the real runtime binaries. read_bounded, apply_sanitized_env, and
   # sanitize_for_display stay in scope.
   "RealExec::",
   "\\bwait_with_deadline\\b",

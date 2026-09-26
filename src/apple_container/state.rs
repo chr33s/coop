@@ -19,8 +19,12 @@ use crate::config::{CoopConfig, Instance};
 
 /// Literal backend tag stored in every record.
 pub(crate) const BACKEND_TAG: &str = "apple-container";
-/// Current schema of every record in this module.
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+/// Schema of the instance record, journal, and image manifest. Version 1 was
+/// the `container machine` backend; its records are refused (see
+/// [`legacy_machine`]).
+pub(crate) const SCHEMA_VERSION: u32 = 2;
+/// Schema of `owner.json`, unchanged since version 1.
+const OWNER_SCHEMA_VERSION: u32 = 1;
 
 const OWNER_FILE: &str = "owner.json";
 const MACHINE_FILE: &str = "apple-machine.json";
@@ -38,9 +42,8 @@ const FOREIGN_BACKEND_ARTIFACTS: &[&str] = &[
     "firecracker",
 ];
 
-/// Longest machine name the pinned runtime accepts: `LinuxContainer.maxIDLength`
-/// (64) minus the 6-character container suffix and its separator.
-const MAX_MACHINE_NAME: usize = 57;
+/// Longest sandbox id `coop-sandbox` accepts.
+const MAX_MACHINE_NAME: usize = 48;
 
 // ── Names ─────────────────────────────────────────────────────
 
@@ -50,9 +53,6 @@ const MAX_MACHINE_NAME: usize = 57;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub(crate) struct MachineName(String);
-
-/// Networks share the machine naming rule; one network per machine.
-pub(crate) type NetworkName = MachineName;
 
 impl MachineName {
     pub(crate) fn new(name: impl Into<String>) -> Result<Self> {
@@ -125,6 +125,11 @@ impl OwnerId {
     pub(crate) fn short(&self) -> &str {
         &self.0[..8]
     }
+
+    /// The full id, passed to the runtime as each sandbox's owner tag.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl TryFrom<String> for OwnerId {
@@ -181,16 +186,24 @@ pub(crate) fn ensure_private_dir(dir: &Path) -> Result<()> {
         .with_context(|| format!("Failed to restrict {}", dir.display()))
 }
 
-fn check_header(schema_version: u32, backend: &str, path: &Path) -> Result<()> {
+fn check_header(schema_version: u32, backend: &str, path: &Path, want: u32) -> Result<()> {
     if backend != BACKEND_TAG {
         bail!(AppleError::IdentityConflict(format!(
             "{} belongs to backend {backend:?}, not {BACKEND_TAG}; refusing to use it",
             path.display()
         )));
     }
-    if schema_version != SCHEMA_VERSION {
+    if schema_version == 1 && want == SCHEMA_VERSION {
         bail!(AppleError::IdentityConflict(format!(
-            "{} has schema version {schema_version}; this build understands {SCHEMA_VERSION}",
+            "{} was written by the retired `container machine` backend; `coop destroy` \
+             removes the instance's local state (its machine and network stay in the Apple \
+             Container runtime until you delete them there)",
+            path.display()
+        )));
+    }
+    if schema_version != want {
+        bail!(AppleError::IdentityConflict(format!(
+            "{} has schema version {schema_version}; this build understands {want}",
             path.display()
         )));
     }
@@ -217,13 +230,18 @@ impl Owner {
         let path = Self::path(cfg);
         let content = read_control_file(&path)?.ok_or_else(|| {
             anyhow::anyhow!(
-                "No Apple Container backend state at {}. Run `coop setup` first.",
+                "No Apple sandbox backend state at {}. Run `coop setup` first.",
                 cfg.state_root().display()
             )
         })?;
         let owner: Self = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse {}", path.display()))?;
-        check_header(owner.schema_version, &owner.backend, &path)?;
+        check_header(
+            owner.schema_version,
+            &owner.backend,
+            &path,
+            OWNER_SCHEMA_VERSION,
+        )?;
         Ok(owner)
     }
 
@@ -253,7 +271,7 @@ impl Owner {
             return Self::load(cfg);
         }
         let owner = Self {
-            schema_version: SCHEMA_VERSION,
+            schema_version: OWNER_SCHEMA_VERSION,
             backend: BACKEND_TAG.into(),
             id: OwnerId::generate()?,
         };
@@ -283,8 +301,8 @@ pub(crate) struct MachineSidecar {
     pub(crate) backend: String,
     pub(crate) owner_id: OwnerId,
     pub(crate) instance_id: String,
+    /// `coop-sandbox` id; its vmnet network is internal to the sandbox.
     pub(crate) machine_id: MachineName,
-    pub(crate) network_id: NetworkName,
     pub(crate) image_ref: String,
     pub(crate) image_digest: String,
     pub(crate) image_manifest_id: String,
@@ -292,8 +310,12 @@ pub(crate) struct MachineSidecar {
     pub(crate) requested_cpus: u32,
     pub(crate) requested_memory_bytes: u64,
     pub(crate) host_key_fingerprint: String,
-    pub(crate) last_observed_container_id: Option<String>,
+    pub(crate) last_observed_owner_pid: Option<i32>,
     pub(crate) last_observed_ip: Option<std::net::Ipv4Addr>,
+    /// Set once coop itself replaced the disk (`restore`): the next start
+    /// enrolls the new host key instead of requiring the old pin. Never set
+    /// in response to anything the guest did.
+    pub(crate) reenroll_host_key: bool,
     pub(crate) creation_state: CreationState,
     pub(crate) created_at: String,
     pub(crate) runtime_identity: String,
@@ -309,16 +331,16 @@ impl MachineSidecar {
         let Some(content) = read_control_file(&path)? else {
             return Ok(None);
         };
+        check_raw_header(&content, &path)?;
         let rec: Self = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse {}", path.display()))?;
-        check_header(rec.schema_version, &rec.backend, &path)?;
         Ok(Some(rec))
     }
 
     pub(crate) fn load(inst: &Instance) -> Result<Self> {
         Self::try_load(inst)?.ok_or_else(|| {
             anyhow::anyhow!(
-                "Instance '{}' has no Apple Container machine record at {}",
+                "Instance '{}' has no Apple sandbox record at {}",
                 inst.name,
                 Self::path(inst).display()
             )
@@ -332,10 +354,7 @@ impl MachineSidecar {
     /// Refuse to act on a record that is not this installation's, or whose
     /// runtime names were not generated for it.
     pub(crate) fn check_owner(&self, owner: &Owner) -> Result<()> {
-        if self.owner_id != owner.id
-            || !self.machine_id.belongs_to(&owner.id)
-            || !self.network_id.belongs_to(&owner.id)
-        {
+        if self.owner_id != owner.id || !self.machine_id.belongs_to(&owner.id) {
             bail!(AppleError::IdentityConflict(format!(
                 "machine {} is not owned by this installation",
                 self.machine_id
@@ -352,24 +371,52 @@ impl MachineSidecar {
 pub(crate) enum Operation {
     Create,
     SetResources,
+    /// Disk replaced by `coop restore`.
+    RestoreDisk,
     Destroy,
+}
+
+/// A journaled operation with what reconciling it needs, so an operation
+/// cannot be recorded without its prior state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JournalOp {
+    Create,
+    /// CPU count and memory committed before the change, read when
+    /// reconciling an interrupted resize.
+    SetResources {
+        prior: (u32, u64),
+    },
+    /// The runtime's disk generation before the restore: a higher value
+    /// afterwards proves the disk was replaced.
+    RestoreDisk {
+        prior_generation: u64,
+    },
+    Destroy,
+}
+
+impl JournalOp {
+    pub(crate) fn kind(self) -> Operation {
+        match self {
+            Self::Create => Operation::Create,
+            Self::SetResources { .. } => Operation::SetResources,
+            Self::RestoreDisk { .. } => Operation::RestoreDisk,
+            Self::Destroy => Operation::Destroy,
+        }
+    }
 }
 
 /// Completed side effects of a journaled operation, in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum Stage {
-    /// Names reserved; nothing exists in the runtime yet.
+    /// Name reserved; nothing exists in the runtime yet.
     Reserved,
-    /// About to create the network (outcome may be unknown after a crash).
-    CreatingNetwork,
-    NetworkCreated,
-    /// About to create the machine (outcome may be unknown after a crash).
+    /// About to create the sandbox (outcome may be unknown after a crash).
     CreatingMachine,
     MachineCreated,
-    /// About to change machine resources.
+    /// About to change resources or replace the disk.
     Applying,
-    /// About to delete the machine.
+    /// About to delete the sandbox.
     DeletingMachine,
     MachineDeleted,
 }
@@ -377,17 +424,72 @@ pub(crate) enum Stage {
 /// `operation.json` — present only while a mutation or its recovery is
 /// pending. Written before each mutating runtime call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "JournalRecord", into = "JournalRecord")]
 pub(crate) struct Journal {
     pub(crate) schema_version: u32,
     pub(crate) backend: String,
     pub(crate) owner_id: OwnerId,
-    pub(crate) operation: Operation,
+    pub(crate) op: JournalOp,
     pub(crate) stage: Stage,
     pub(crate) machine_id: MachineName,
-    pub(crate) network_id: NetworkName,
-    /// CPU count and memory committed before a `SetResources` change, read
-    /// when reconciling an interrupted resize.
-    pub(crate) prior_resources: Option<(u32, u64)>,
+}
+
+/// The on-disk layout of [`Journal`]: the operation's prior state is stored
+/// in optional fields beside it.
+#[derive(Serialize, Deserialize)]
+struct JournalRecord {
+    schema_version: u32,
+    backend: String,
+    owner_id: OwnerId,
+    operation: Operation,
+    stage: Stage,
+    machine_id: MachineName,
+    prior_resources: Option<(u32, u64)>,
+    prior_disk_generation: Option<u64>,
+}
+
+impl TryFrom<JournalRecord> for Journal {
+    type Error = String;
+
+    fn try_from(r: JournalRecord) -> std::result::Result<Self, String> {
+        let op = match (r.operation, r.prior_resources, r.prior_disk_generation) {
+            (Operation::Create, None, None) => JournalOp::Create,
+            (Operation::Destroy, None, None) => JournalOp::Destroy,
+            (Operation::SetResources, Some(prior), None) => JournalOp::SetResources { prior },
+            (Operation::RestoreDisk, None, Some(prior_generation)) => {
+                JournalOp::RestoreDisk { prior_generation }
+            }
+            (op, ..) => return Err(format!("{op:?} journal has mismatched prior state")),
+        };
+        Ok(Self {
+            schema_version: r.schema_version,
+            backend: r.backend,
+            owner_id: r.owner_id,
+            op,
+            stage: r.stage,
+            machine_id: r.machine_id,
+        })
+    }
+}
+
+impl From<Journal> for JournalRecord {
+    fn from(j: Journal) -> Self {
+        let (prior_resources, prior_disk_generation) = match j.op {
+            JournalOp::SetResources { prior } => (Some(prior), None),
+            JournalOp::RestoreDisk { prior_generation } => (None, Some(prior_generation)),
+            JournalOp::Create | JournalOp::Destroy => (None, None),
+        };
+        Self {
+            schema_version: j.schema_version,
+            backend: j.backend,
+            owner_id: j.owner_id,
+            operation: j.op.kind(),
+            stage: j.stage,
+            machine_id: j.machine_id,
+            prior_resources,
+            prior_disk_generation,
+        }
+    }
 }
 
 impl Journal {
@@ -398,19 +500,16 @@ impl Journal {
     pub(crate) fn begin(
         inst: &Instance,
         owner: &Owner,
-        operation: Operation,
+        op: JournalOp,
         machine_id: MachineName,
-        network_id: NetworkName,
     ) -> Result<Self> {
         let journal = Self {
             schema_version: SCHEMA_VERSION,
             backend: BACKEND_TAG.into(),
             owner_id: owner.id.clone(),
-            operation,
+            op,
             stage: Stage::Reserved,
             machine_id,
-            network_id,
-            prior_resources: None,
         };
         journal.save(inst)?;
         Ok(journal)
@@ -421,9 +520,9 @@ impl Journal {
         let Some(content) = read_control_file(&path)? else {
             return Ok(None);
         };
+        check_raw_header(&content, &path)?;
         let journal: Self = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse {}", path.display()))?;
-        check_header(journal.schema_version, &journal.backend, &path)?;
         Ok(Some(journal))
     }
 
@@ -443,6 +542,44 @@ impl Journal {
             Err(e) => Err(e).context("Failed to clear operation journal"),
         }
     }
+}
+
+/// Check a record's header before parsing the rest, so a record from
+/// another schema fails with its own explanation rather than a field error.
+fn check_raw_header(content: &str, path: &Path) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Header {
+        schema_version: u32,
+        backend: String,
+    }
+    let header: Header = serde_json::from_str(content)
+        .with_context(|| format!("Failed to parse {}", path.display()))?;
+    check_header(header.schema_version, &header.backend, path, SCHEMA_VERSION)
+}
+
+/// A schema-1 instance record or journal from the retired `container
+/// machine` backend: its machine and network names, so `destroy` can name
+/// what it leaves in that runtime.
+pub(crate) fn legacy_machine(inst: &Instance) -> Result<Option<(String, String)>> {
+    #[derive(Deserialize)]
+    struct Legacy {
+        schema_version: u32,
+        backend: String,
+        machine_id: String,
+        network_id: String,
+    }
+    for path in [MachineSidecar::path(inst), Journal::path(inst)] {
+        let Some(content) = read_control_file(&path)? else {
+            continue;
+        };
+        if let Some(l) = serde_json::from_str::<Legacy>(&content)
+            .ok()
+            .filter(|l| l.schema_version == 1 && l.backend == BACKEND_TAG)
+        {
+            return Ok(Some((l.machine_id, l.network_id)));
+        }
+    }
+    Ok(None)
 }
 
 /// Per-instance known-hosts file for the pinned guest host key.
@@ -476,11 +613,11 @@ mod tests {
             "semi;colon",
             "a b",
             "../x",
-            &"a".repeat(58),
+            &"a".repeat(49),
         ] {
             assert!(MachineName::new(bad).is_err(), "accepted {bad:?}");
         }
-        assert!(MachineName::new("a".repeat(57)).is_ok());
+        assert!(MachineName::new("a".repeat(48)).is_ok());
     }
 
     #[test]
@@ -567,8 +704,174 @@ mod tests {
 
     #[test]
     fn stages_are_ordered() {
-        assert!(Stage::Reserved < Stage::NetworkCreated);
-        assert!(Stage::NetworkCreated < Stage::MachineCreated);
+        assert!(Stage::Reserved < Stage::CreatingMachine);
         assert!(Stage::CreatingMachine < Stage::MachineCreated);
+        assert!(Stage::DeletingMachine < Stage::MachineDeleted);
+    }
+
+    fn test_inst(cfg: &CoopConfig) -> Instance {
+        let dir = cfg.instances_dir().join("t");
+        fs::create_dir_all(&dir).unwrap();
+        Instance {
+            name: crate::config::InstanceName::new("t").unwrap(),
+            index: crate::config::InstanceIndex::new(0).unwrap(),
+            dir,
+            image: crate::config::ImageName::new("default").unwrap(),
+        }
+    }
+
+    fn sidecar(owner_id: OwnerId, machine_id: MachineName) -> MachineSidecar {
+        MachineSidecar {
+            schema_version: SCHEMA_VERSION,
+            backend: BACKEND_TAG.into(),
+            owner_id,
+            instance_id: "00112233445566ff".into(),
+            machine_id,
+            image_ref: "local/coop-0a1b2c3d:x".into(),
+            image_digest: "sha256:x".into(),
+            image_manifest_id: "m".into(),
+            guest_user: crate::guest::GuestUser::default(),
+            requested_cpus: 2,
+            requested_memory_bytes: 1 << 30,
+            host_key_fingerprint: "SHA256:x".into(),
+            last_observed_owner_pid: None,
+            last_observed_ip: None,
+            reenroll_host_key: false,
+            creation_state: CreationState::Ready,
+            created_at: "now".into(),
+            runtime_identity: "test".into(),
+        }
+    }
+
+    /// A record is acted on only when both its owner field and its machine
+    /// name belong to this installation.
+    #[test]
+    fn check_owner_requires_owner_and_name() {
+        let me = Owner {
+            schema_version: OWNER_SCHEMA_VERSION,
+            backend: BACKEND_TAG.into(),
+            id: owner(),
+        };
+        let other = OwnerId::try_from("ffffffff00112233445566778899aabb".to_string()).unwrap();
+        let mine = MachineName::generate(&me.id).unwrap();
+        let theirs = MachineName::generate(&other).unwrap();
+        assert!(sidecar(owner(), mine.clone()).check_owner(&me).is_ok());
+        for record in [
+            sidecar(other.clone(), mine),
+            sidecar(owner(), theirs.clone()),
+            sidecar(other, theirs),
+        ] {
+            let err = record.check_owner(&me).unwrap_err();
+            assert!(matches!(
+                err.downcast_ref::<AppleError>(),
+                Some(AppleError::IdentityConflict(_))
+            ));
+        }
+        assert_eq!(me.id.as_str(), "0a1b2c3d00112233445566778899aabb");
+    }
+
+    #[test]
+    fn journal_complete_is_idempotent_but_reports_real_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(tmp.path());
+        let inst = test_inst(&cfg);
+        let me = Owner {
+            schema_version: OWNER_SCHEMA_VERSION,
+            backend: BACKEND_TAG.into(),
+            id: owner(),
+        };
+        let name = MachineName::generate(&me.id).unwrap();
+        Journal::begin(&inst, &me, JournalOp::Create, name).unwrap();
+        Journal::complete(&inst).unwrap();
+        assert!(Journal::try_load(&inst).unwrap().is_none());
+        Journal::complete(&inst).unwrap();
+
+        // Something that cannot be removed as a file is not "already gone".
+        fs::create_dir(Journal::path(&inst)).unwrap();
+        assert!(Journal::complete(&inst).is_err());
+    }
+
+    /// The journal keeps its flat on-disk layout, and an operation stored
+    /// without its prior state (or with another operation's) is refused.
+    #[test]
+    fn journal_prior_state_matches_its_operation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(tmp.path());
+        let inst = test_inst(&cfg);
+        let me = Owner {
+            schema_version: OWNER_SCHEMA_VERSION,
+            backend: BACKEND_TAG.into(),
+            id: owner(),
+        };
+        let name = MachineName::generate(&me.id).unwrap();
+        let op = JournalOp::RestoreDisk {
+            prior_generation: 7,
+        };
+        Journal::begin(&inst, &me, op, name.clone()).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(Journal::path(&inst)).unwrap()).unwrap();
+        assert_eq!(raw["operation"], "restore-disk");
+        assert_eq!(raw["prior_disk_generation"], 7);
+        assert!(raw["prior_resources"].is_null());
+        assert_eq!(Journal::try_load(&inst).unwrap().unwrap().op, op);
+
+        for (operation, resources, generation) in [
+            ("set-resources", "null", "null"),
+            ("restore-disk", "null", "null"),
+            ("create", "[1,2]", "null"),
+            ("set-resources", "[1,2]", "3"),
+        ] {
+            fs::write(
+                Journal::path(&inst),
+                format!(
+                    r#"{{"schema_version":2,"backend":"apple-container","owner_id":"{}","operation":"{operation}","stage":"applying","machine_id":"{name}","prior_resources":{resources},"prior_disk_generation":{generation}}}"#,
+                    me.id.as_str()
+                ),
+            )
+            .unwrap();
+            assert!(
+                Journal::try_load(&inst).is_err(),
+                "{operation} {resources} {generation}"
+            );
+        }
+    }
+
+    /// Only a schema-1 record from this backend is legacy; a current record
+    /// or another backend's schema-1 record is not.
+    #[test]
+    fn legacy_machine_needs_old_schema_and_this_backend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(tmp.path());
+        let inst = test_inst(&cfg);
+        for record in [
+            r#"{"schema_version":2,"backend":"apple-container","machine_id":"a","network_id":"b"}"#,
+            r#"{"schema_version":1,"backend":"lima","machine_id":"a","network_id":"b"}"#,
+        ] {
+            fs::write(MachineSidecar::path(&inst), record).unwrap();
+            assert_eq!(legacy_machine(&inst).unwrap(), None, "{record}");
+        }
+    }
+
+    /// Records from the retired `container machine` backend are refused with
+    /// an explanation, and `legacy_machine` names what they point at.
+    #[test]
+    fn schema_one_records_are_legacy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(tmp.path());
+        let inst = test_inst(&cfg);
+        fs::write(
+            MachineSidecar::path(&inst),
+            r#"{"schema_version":1,"backend":"apple-container","machine_id":"coop-0a1b2c3d-1","network_id":"coop-0a1b2c3d-1"}"#,
+        )
+        .unwrap();
+        let err = MachineSidecar::try_load(&inst).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("retired `container machine` backend"),
+            "{err:#}"
+        );
+        assert_eq!(
+            legacy_machine(&inst).unwrap(),
+            Some(("coop-0a1b2c3d-1".into(), "coop-0a1b2c3d-1".into()))
+        );
     }
 }

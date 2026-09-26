@@ -1,257 +1,276 @@
 //! Runtime qualification and the isolation gate.
 //!
-//! Stock Apple Container 1.4.1 attaches every machine to the built-in shared
-//! network and forwards the caller's SSH agent into it. coop therefore
-//! requires a runtime extension (a per-machine `--network` and
-//! `--no-ssh-agent`, reported back by `machine inspect`), provided by the
-//! fork vendored at `vendor/container`, and fails closed without it. No flag or config key relaxes these checks.
+//! coop drives `coop-sandbox` (`macos/coop-sandbox`), a runtime built for it
+//! on `apple/containerization`: one VM per sandbox, each on its own vmnet
+//! network, with no host mounts, socket relays, published ports, or SSH-agent
+//! forwarding. Its record type cannot express those, but coop still verifies
+//! the *effective* configuration the running VM's owner reports before every
+//! hand-out, and refuses a runtime whose protocol it does not know. No flag or
+//! config key relaxes these checks.
+
+use std::net::Ipv4Addr;
+use std::path::Path;
 
 use anyhow::{Result, bail};
 
 use super::AppleError;
-use super::protocol::{ContainerRecord, HomeMount, MachineRecord, MachineStatus};
-use super::state::{MachineName, NetworkName};
+use super::protocol::{Effective, EffectiveMount, Inspect, SandboxStatus, VersionInfo};
+use super::state::MachineName;
 
-/// Mounts the runtime itself adds to every machine and that are allowed to
-/// exist, as (guest destination, file name inside the machine's own runtime
-/// bundle, required mode): a read-only helper directory holding the machine
-/// init binary, and a writable first-boot marker file. The source must be
-/// exactly `…/machines/<machine-id>/<file name>`, so a host directory mounted
-/// at an allowed destination still fails. Anything else — the host home, a
-/// workspace, a socket — fails the gate.
-const RUNTIME_BOOTSTRAP_MOUNTS: &[(&str, &str, &str)] = &[
-    ("/sbin.machine", "sbin.machine", "ro"),
-    ("/etc/.machine.initialized", "machine.initialized", "rw"),
+/// The protocol and containerization release this build was validated with.
+pub(crate) const PROTOCOL: u32 = 1;
+pub(crate) const CONTAINERIZATION: &str = "0.45.0";
+
+/// Kernel pseudo-filesystems a sandbox may mount, as (type, source,
+/// destination). Nothing else — no share, bind, or block device from the host.
+const ALLOWED_MOUNTS: &[(&str, &str, &str)] = &[
+    ("proc", "proc", "/proc"),
+    ("sysfs", "sysfs", "/sys"),
+    ("devtmpfs", "none", "/dev"),
+    ("mqueue", "mqueue", "/dev/mqueue"),
+    ("tmpfs", "tmpfs", "/dev/shm"),
+    ("cgroup2", "none", "/sys/fs/cgroup"),
+    ("devpts", "devpts", "/dev/pts"),
 ];
-
-/// Whether `source` is `<abs>/machines/<machine>/<file>` with no `.`/`..`
-/// components.
-fn is_bundle_path(source: &str, machine: &MachineName, file: &str) -> bool {
-    use std::path::Component;
-    let path = std::path::Path::new(source);
-    let normal = path.is_absolute()
-        && path
-            .components()
-            .all(|c| matches!(c, Component::RootDir | Component::Normal(_)));
-    let tail: Vec<&str> = source.rsplitn(4, '/').collect();
-    normal
-        && tail.len() == 4
-        && tail[0] == file
-        && tail[1] == machine.as_str()
-        && tail[2] == "machines"
-}
 
 /// What `qualify` learned about the runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct QualifiedRuntime {
-    /// Full `container --version` line, recorded for diagnostics.
+    /// `coop-sandbox <version> (containerization <version>)`, for diagnostics.
     pub(crate) identity: String,
 }
 
-/// Oldest runtime whose machine CLI and JSON schema the parsers were written
-/// against.
-const MIN_VERSION: semver::Version = semver::Version::new(1, 4, 1);
-
-/// Decide from `container --version` and `container machine create --help`
-/// output whether the runtime can run coop machines safely. Version alone is
-/// not proof: the required isolation flags must be advertised too.
-pub(crate) fn qualify(version_text: &str, create_help: &str) -> Result<QualifiedRuntime> {
-    let (identity, version) = super::protocol::parse_version(version_text)?;
-    if version < MIN_VERSION {
+/// Accept only the runtime protocol and containerization release coop was
+/// validated against.
+pub(crate) fn qualify(info: &VersionInfo) -> Result<QualifiedRuntime> {
+    let identity = format!(
+        "{} {} (containerization {}, protocol {})",
+        info.name, info.version, info.containerization, info.protocol
+    );
+    if info.name != "coop-sandbox" {
         bail!(AppleError::RuntimeUnqualified(format!(
-            "{identity} is older than the minimum supported {MIN_VERSION}"
+            "{identity} is not coop-sandbox; `[apple_container] binary` must point at the \
+             runtime built by scripts/build-coop-sandbox.sh"
         )));
     }
-    let missing: Vec<&str> = ["--network", "--no-ssh-agent", "--home-mount", "--no-boot"]
-        .into_iter()
-        .filter(|flag| !super::protocol::help_lists_flag(create_help, flag))
-        .collect();
-    if !missing.is_empty() {
+    if info.protocol != PROTOCOL || info.containerization != CONTAINERIZATION {
         bail!(AppleError::RuntimeUnqualified(format!(
-            "{identity} lacks the per-machine isolation controls coop requires \
-             (`container machine create` has no {}). Stock Apple Container attaches \
-             every machine to one shared network and forwards the host SSH agent, \
-             so coop will not start agents, copy workspaces, or pass credentials on \
-             it. A runtime build with the machine network/SSH-agent extension is \
-             required; see docs/backends.md.",
-            missing.join(", ")
+            "{identity} is not the qualified runtime (protocol {PROTOCOL}, containerization \
+             {CONTAINERIZATION}); rebuild it from this checkout with scripts/build-coop-sandbox.sh"
         )));
     }
     Ok(QualifiedRuntime { identity })
 }
 
-/// Pre-boot check of a machine's persisted configuration.
-pub(crate) fn verify_machine_config(record: &MachineRecord, network: &NetworkName) -> Result<()> {
-    if record.home_mount != HomeMount::None {
-        bail!(AppleError::HostExposure(format!(
-            "machine {} would mount the host home directory",
-            record.id
+/// What the gate compares the runtime's report against: the values coop
+/// recorded when it created the sandbox.
+pub(crate) struct Expected<'a> {
+    pub(crate) sandbox: &'a MachineName,
+    pub(crate) owner: &'a str,
+    pub(crate) runtime_root: &'a Path,
+    pub(crate) cpus: u32,
+    pub(crate) memory_bytes: u64,
+}
+
+/// Where the runtime keeps `sandbox`'s disk under its (canonical) root.
+pub(crate) fn rootfs_path(runtime_root: &Path, sandbox: &MachineName) -> std::path::PathBuf {
+    runtime_root
+        .join("sandboxes")
+        .join(sandbox.as_str())
+        .join("rootfs.ext4")
+}
+
+/// Pre-boot check of the runtime's persisted record.
+pub(crate) fn verify_record(inspect: &Inspect, expected: &Expected<'_>) -> Result<()> {
+    let r = &inspect.record;
+    if r.id != expected.sandbox.as_str() || r.owner != expected.owner {
+        bail!(AppleError::IdentityConflict(format!(
+            "sandbox {} is recorded for owner {:?}, not this installation",
+            expected.sandbox,
+            super::cli::sanitize_for_display(&r.owner)
         )));
     }
-    let Some(policy) = &record.policy else {
-        bail!(AppleError::RuntimeUnqualified(format!(
-            "machine {} does not report its network/SSH-agent policy",
-            record.id
-        )));
-    };
-    if policy.ssh_agent_forwarding {
-        bail!(AppleError::HostExposure(format!(
-            "machine {} has host SSH-agent forwarding enabled",
-            record.id
-        )));
-    }
-    if policy.network.as_deref() != Some(network.as_str()) {
-        let configured = policy.network.as_deref().map_or_else(
-            || "the built-in network".to_owned(),
-            |n| format!("network {n:?}"),
-        );
-        bail!(AppleError::NetworkIsolation(format!(
-            "machine {} is configured for {configured}, expected its dedicated network {network}",
-            record.id
+    if r.cpus != expected.cpus || r.memory_bytes != expected.memory_bytes {
+        bail!(AppleError::IdentityConflict(format!(
+            "sandbox {} records {} vCPUs / {} bytes, expected {} / {}",
+            expected.sandbox, r.cpus, r.memory_bytes, expected.cpus, expected.memory_bytes
         )));
     }
     Ok(())
 }
 
-/// Process-local proof that a machine's *current* backing container passed the
-/// isolation gate: dedicated network only, no SSH-agent forwarding, and only
-/// the runtime's own bootstrap mounts. Fields are private and it is neither
-/// serializable nor cloneable, so it cannot be persisted or forged; it is
-/// re-established after every boot and before every SSH target is handed out.
+/// Process-local proof that a sandbox's *current* boot passed the isolation
+/// gate. Fields are private and it is neither serializable nor cloneable, so
+/// it cannot be persisted or forged; it is re-established after every boot
+/// and before every SSH target is handed out.
 #[derive(Debug)]
 pub(crate) struct SecurityReady {
-    machine: MachineName,
-    container_id: String,
+    sandbox: MachineName,
+    owner_pid: i32,
+    ip: Ipv4Addr,
 }
 
 impl SecurityReady {
-    pub(crate) fn machine(&self) -> &MachineName {
-        &self.machine
+    pub(crate) fn sandbox(&self) -> &MachineName {
+        &self.sandbox
     }
 
-    pub(crate) fn container_id(&self) -> &str {
-        &self.container_id
+    /// PID of the owner process that holds this boot's VM; a different PID
+    /// later means the sandbox restarted.
+    pub(crate) fn owner_pid(&self) -> i32 {
+        self.owner_pid
+    }
+
+    pub(crate) fn ip(&self) -> Ipv4Addr {
+        self.ip
     }
 }
 
-/// Post-boot check of the effective runtime state. `record` must be a fresh
-/// inspection showing the machine running on `container.id`.
+/// Post-boot check of the effective configuration the owner reports.
 pub(crate) fn verify_effective(
-    record: &MachineRecord,
-    container: &ContainerRecord,
-    network: &NetworkName,
+    inspect: &Inspect,
+    expected: &Expected<'_>,
 ) -> Result<SecurityReady> {
-    verify_machine_config(record, network)?;
-    if record.status != MachineStatus::Running {
+    verify_record(inspect, expected)?;
+    let name = expected.sandbox;
+    if inspect.status != SandboxStatus::Running {
         bail!(AppleError::OperationUncertain(format!(
-            "machine {} is {}, not running",
-            record.id,
-            record.status.label()
+            "sandbox {name} is {}, not running",
+            inspect.status.label()
         )));
     }
-    // The runtime names each boot's container `<machine>-<suffix>`.
-    let owned_container = container
-        .id
-        .strip_prefix(record.id.as_str())
-        .is_some_and(|rest| rest.starts_with('-'));
-    if !owned_container || record.container_id.as_deref() != Some(container.id.as_str()) {
-        bail!(AppleError::IdentityConflict(format!(
-            "machine {} is backed by {:?}, but the inspected container is {}",
-            record.id, record.container_id, container.id
+    let (Some(live), Some(eff)) = (&inspect.live, &inspect.effective) else {
+        bail!(AppleError::RuntimeUnqualified(format!(
+            "running sandbox {name} reports no live state or effective configuration"
         )));
-    }
-    if container.ssh_agent_forwarding {
-        bail!(AppleError::HostExposure(format!(
-            "backing container {} forwards the host SSH agent",
-            container.id
-        )));
-    }
-    let only_dedicated =
-        |nets: &[String]| nets.len() == 1 && nets.first().is_some_and(|n| n == network.as_str());
-    if !only_dedicated(&container.configured_networks)
-        || !only_dedicated(&container.attached_networks)
-    {
+    };
+    let Some(ip) = live.ipv4 else {
         bail!(AppleError::NetworkIsolation(format!(
-            "backing container {} is attached to {:?} (configured {:?}); expected only {network}",
-            container.id, container.attached_networks, container.configured_networks
+            "sandbox {name} reports no address"
+        )));
+    };
+    if eff.cpus != expected.cpus || eff.memory_bytes != expected.memory_bytes {
+        bail!(AppleError::IdentityConflict(format!(
+            "sandbox {name} runs with {} vCPUs / {} bytes, expected {} / {}",
+            eff.cpus, eff.memory_bytes, expected.cpus, expected.memory_bytes
         )));
     }
-    for mount in &container.mounts {
-        let allowed = RUNTIME_BOOTSTRAP_MOUNTS.iter().any(|(dest, file, mode)| {
-            mount.destination == *dest
-                && is_bundle_path(&mount.source, &record.id, file)
-                && mount.options.iter().any(|o| o == mode)
-                && (*mode == "rw" || !mount.options.iter().any(|o| o == "rw"))
-        });
-        if !allowed {
+    if eff.image_digest != inspect.record.image_digest {
+        bail!(AppleError::IdentityConflict(format!(
+            "sandbox {name} booted {} but records {}",
+            eff.image_digest, inspect.record.image_digest
+        )));
+    }
+    verify_host_exposure(name, eff, expected.runtime_root)?;
+    verify_network(name, eff, ip)?;
+    if eff.init_argv != ["/sbin/init"] || eff.virtualization {
+        bail!(AppleError::HostExposure(format!(
+            "sandbox {name} runs {:?} with nested virtualization {}; expected /sbin/init without it",
+            eff.init_argv, eff.virtualization
+        )));
+    }
+    Ok(SecurityReady {
+        sandbox: name.clone(),
+        owner_pid: live.pid,
+        ip,
+    })
+}
+
+fn verify_host_exposure(name: &MachineName, eff: &Effective, runtime_root: &Path) -> Result<()> {
+    if eff.ssh_agent_forwarding {
+        bail!(AppleError::HostExposure(format!(
+            "sandbox {name} forwards the host SSH agent"
+        )));
+    }
+    if eff.socket_relays != 0 || eff.published_ports != 0 {
+        bail!(AppleError::HostExposure(format!(
+            "sandbox {name} relays {} sockets and publishes {} ports; expected none",
+            eff.socket_relays, eff.published_ports
+        )));
+    }
+    let expected_rootfs = rootfs_path(runtime_root, name);
+    if eff.rootfs.kind != "ext4" || Path::new(&eff.rootfs.source) != expected_rootfs {
+        bail!(AppleError::HostExposure(format!(
+            "sandbox {name} boots from {} ({}), not its own disk {}",
+            super::cli::sanitize_for_display(&eff.rootfs.source),
+            super::cli::sanitize_for_display(&eff.rootfs.kind),
+            expected_rootfs.display()
+        )));
+    }
+    for mount in &eff.mounts {
+        if !is_allowed_mount(mount) {
             bail!(AppleError::HostExposure(format!(
-                "backing container {} mounts host path at {} ({:?}); only the runtime's \
-                 bootstrap mounts are allowed",
-                container.id,
-                super::cli::sanitize_for_display(&mount.destination),
-                mount.options
+                "sandbox {name} mounts {} from {} at {}; only kernel pseudo-filesystems are allowed",
+                super::cli::sanitize_for_display(&mount.kind),
+                super::cli::sanitize_for_display(&mount.source),
+                super::cli::sanitize_for_display(&mount.destination)
             )));
         }
     }
-    Ok(SecurityReady {
-        machine: record.id.clone(),
-        container_id: container.id.clone(),
+    Ok(())
+}
+
+fn is_allowed_mount(mount: &EffectiveMount) -> bool {
+    ALLOWED_MOUNTS.iter().any(|(kind, source, dest)| {
+        mount.kind == *kind && mount.source == *source && mount.destination == *dest
     })
+}
+
+/// Exactly one interface, on a per-sandbox vmnet network, carrying the
+/// address the owner reports.
+fn verify_network(name: &MachineName, eff: &Effective, ip: Ipv4Addr) -> Result<()> {
+    let [iface] = eff.interfaces.as_slice() else {
+        bail!(AppleError::NetworkIsolation(format!(
+            "sandbox {name} has {} network interfaces; expected exactly one",
+            eff.interfaces.len()
+        )));
+    };
+    let addr = iface
+        .ipv4
+        .split('/')
+        .next()
+        .and_then(|a| a.parse::<Ipv4Addr>().ok());
+    let subnet_ok = iface
+        .network
+        .strip_prefix("vmnet-shared:10.231.")
+        .and_then(|rest| rest.strip_suffix(".0/24"))
+        .and_then(|n| n.parse::<u8>().ok())
+        .is_some_and(|n| addr.is_some_and(|a| a.octets()[..3] == [10, 231, n]));
+    if addr != Some(ip) || !subnet_ok {
+        bail!(AppleError::NetworkIsolation(format!(
+            "sandbox {name} interface {} on {} does not match its dedicated network address {ip}",
+            super::cli::sanitize_for_display(&iface.ipv4),
+            super::cli::sanitize_for_display(&iface.network)
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
-    use crate::apple_container::protocol::{MachinePolicy, MountRecord};
+    use crate::apple_container::protocol::{parse_inspect, parse_version};
 
-    const FIXTURES: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/apple-container"
-    );
+    const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/coop-sandbox");
+    const OWNER: &str = "0a1b2c3d00112233445566778899aabb";
+    const ROOT: &str = "/Users/me/.coop-apple/backends/apple-container-v1/runtime";
 
     fn fixture(name: &str) -> String {
         std::fs::read_to_string(format!("{FIXTURES}/{name}")).unwrap()
     }
 
-    fn net() -> NetworkName {
-        NetworkName::new("coop-0a1b2c3d-00112233445566ff").unwrap()
+    fn sandbox() -> MachineName {
+        MachineName::new("coop-0a1b2c3d-00112233445566ff").unwrap()
     }
 
-    fn record() -> MachineRecord {
-        MachineRecord {
-            id: net(),
-            status: MachineStatus::Running,
-            container_id: Some("coop-0a1b2c3d-00112233445566ff-abc123".into()),
-            ip: Some(std::net::Ipv4Addr::new(192, 168, 70, 2)),
-            home_mount: HomeMount::None,
+    fn expected(name: &MachineName) -> Expected<'_> {
+        Expected {
+            sandbox: name,
+            owner: OWNER,
+            runtime_root: Path::new(ROOT),
             cpus: 2,
-            memory_bytes: 1 << 32,
-            policy: Some(MachinePolicy {
-                network: Some(net().to_string()),
-                ssh_agent_forwarding: false,
-            }),
-        }
-    }
-
-    fn container() -> ContainerRecord {
-        ContainerRecord {
-            id: "coop-0a1b2c3d-00112233445566ff-abc123".into(),
-            mounts: vec![
-                MountRecord {
-                    source: "/Users/u/Library/Application Support/com.apple.container/machines/coop-0a1b2c3d-00112233445566ff/sbin.machine".into(),
-                    destination: "/sbin.machine".into(),
-                    options: vec!["ro".into()],
-                },
-                MountRecord {
-                    source: "/Users/u/Library/Application Support/com.apple.container/machines/coop-0a1b2c3d-00112233445566ff/machine.initialized".into(),
-                    destination: "/etc/.machine.initialized".into(),
-                    options: vec!["rw".into()],
-                },
-            ],
-            configured_networks: vec![net().to_string()],
-            attached_networks: vec![net().to_string()],
-            ssh_agent_forwarding: false,
+            memory_bytes: 2048 * 1024 * 1024,
         }
     }
 
@@ -259,148 +278,177 @@ mod tests {
         err.downcast_ref::<AppleError>().unwrap()
     }
 
-    #[test]
-    fn stock_runtime_is_unqualified() {
-        let err = qualify(
-            &fixture("version-1.4.1.txt"),
-            &fixture("machine-create-help-1.4.1.txt"),
-        )
-        .unwrap_err();
-        assert!(matches!(kind(&err), AppleError::RuntimeUnqualified(_)));
-        let msg = err.to_string();
-        assert!(
-            msg.contains("--network") && msg.contains("--no-ssh-agent"),
-            "{msg}"
-        );
+    type Mutation = fn(&mut serde_json::Value);
+    /// (label, mutation of the running fixture, expected error class).
+    type Case = (&'static str, Mutation, fn(&AppleError) -> bool);
+
+    fn gate(json: &str) -> Result<SecurityReady> {
+        let name = sandbox();
+        let inspect = parse_inspect(json, &name)?;
+        verify_effective(&inspect, &expected(&name))
     }
 
     #[test]
-    fn extended_runtime_qualifies() {
-        let q = qualify(
-            &fixture("version-coop-fdddb59.txt"),
-            &fixture("machine-create-help-coop-fdddb59.txt"),
-        )
-        .unwrap();
-        assert!(q.identity.contains("1.4.1+coop.fdddb59"));
-        let help = fixture("machine-create-help-coop-fdddb59.txt");
-        assert!(qualify("container CLI version 1.3.0 (build: release)", &help).is_err());
-    }
-
-    #[test]
-    fn gate_accepts_only_the_expected_shape() {
-        let ready = verify_effective(&record(), &container(), &net()).unwrap();
-        assert_eq!(
-            ready.container_id(),
-            "coop-0a1b2c3d-00112233445566ff-abc123"
-        );
-        assert_eq!(ready.machine(), &net());
-    }
-
-    #[test]
-    fn gate_rejects_home_agent_network_and_mount_exposure() {
-        let mut r = record();
-        r.home_mount = HomeMount::ReadOnly;
-        assert!(matches!(
-            kind(&verify_machine_config(&r, &net()).unwrap_err()),
-            AppleError::HostExposure(_)
-        ));
-
-        let mut r = record();
-        r.policy = None;
-        assert!(matches!(
-            kind(&verify_machine_config(&r, &net()).unwrap_err()),
-            AppleError::RuntimeUnqualified(_)
-        ));
-
-        for network in [Some("default".to_owned()), None] {
-            let mut r = record();
-            r.policy = Some(MachinePolicy {
-                network,
-                ssh_agent_forwarding: false,
-            });
-            assert!(matches!(
-                kind(&verify_machine_config(&r, &net()).unwrap_err()),
-                AppleError::NetworkIsolation(_)
-            ));
-        }
-
-        let mut c = container();
-        c.ssh_agent_forwarding = true;
-        assert!(matches!(
-            kind(&verify_effective(&record(), &c, &net()).unwrap_err()),
-            AppleError::HostExposure(_)
-        ));
-
-        let mut c = container();
-        c.attached_networks.push("default".into());
-        assert!(matches!(
-            kind(&verify_effective(&record(), &c, &net()).unwrap_err()),
-            AppleError::NetworkIsolation(_)
-        ));
-
-        let mut c = container();
-        c.mounts.push(MountRecord {
-            source: "/Users/me".into(),
-            destination: "/Users/me".into(),
-            options: vec!["ro".into()],
-        });
-        assert!(matches!(
-            kind(&verify_effective(&record(), &c, &net()).unwrap_err()),
-            AppleError::HostExposure(_)
-        ));
-
-        // A host directory at an allowed destination is still exposure.
-        for bad_source in [
-            "/Users/me",
-            "/Users/u/machines/other-machine/machine.initialized",
-            "/x/machines/coop-0a1b2c3d-00112233445566ff/../../../Users/me/machine.initialized",
-            "machines/coop-0a1b2c3d-00112233445566ff/machine.initialized",
+    fn qualifies_only_the_validated_runtime() {
+        let v = parse_version(&fixture("version.json")).unwrap();
+        assert!(qualify(&v).unwrap().identity.contains("coop-sandbox 0.1.0"));
+        for (field, value) in [
+            ("protocol", "2"),
+            ("containerization", "\"0.47.0\""),
+            ("name", "\"container\""),
         ] {
-            let mut c = container();
-            c.mounts[1].source = bad_source.into();
+            let mut j: serde_json::Value = serde_json::from_str(&fixture("version.json")).unwrap();
+            j[field] = serde_json::from_str(value).unwrap();
+            let err = qualify(&parse_version(&j.to_string()).unwrap()).unwrap_err();
             assert!(
-                matches!(
-                    kind(&verify_effective(&record(), &c, &net()).unwrap_err()),
-                    AppleError::HostExposure(_)
-                ),
-                "{bad_source}"
+                matches!(kind(&err), AppleError::RuntimeUnqualified(_)),
+                "{field}"
             );
         }
-
-        // A container that is not this machine's boot is not trusted.
-        let mut r = record();
-        let mut c = container();
-        r.container_id = Some("foreign-container".into());
-        c.id = "foreign-container".into();
-        assert!(verify_effective(&r, &c, &net()).is_err());
-
-        // The helper directory must stay read-only.
-        let mut c = container();
-        c.mounts[0].options = vec!["rw".into()];
-        assert!(verify_effective(&record(), &c, &net()).is_err());
-
-        // A stale container id (restart raced the inspection) is not ready.
-        let mut c = container();
-        c.id = "coop-0a1b2c3d-00112233445566ff-000000".into();
-        assert!(matches!(
-            kind(&verify_effective(&record(), &c, &net()).unwrap_err()),
-            AppleError::IdentityConflict(_)
-        ));
-
-        let mut r = record();
-        r.status = MachineStatus::Stopping;
-        assert!(verify_effective(&r, &container(), &net()).is_err());
     }
 
     #[test]
-    fn stock_default_machine_fails_every_gate() {
-        let c = crate::apple_container::protocol::parse_container_inspect(
-            &fixture("container-inspect-1.4.1.json"),
-            "a1b2c3d4-e5f6",
-        )
-        .unwrap();
-        let mut r = record();
-        r.container_id = Some(c.id.clone());
-        assert!(verify_effective(&r, &c, &net()).is_err());
+    fn gate_accepts_the_real_running_shape() {
+        let ready = gate(&fixture("inspect-running.json")).unwrap();
+        assert_eq!(ready.ip(), Ipv4Addr::new(10, 231, 2, 2));
+        assert_eq!(ready.sandbox(), &sandbox());
+    }
+
+    #[test]
+    fn gate_rejects_a_stopped_sandbox() {
+        let err = gate(&fixture("inspect-stopped.json")).unwrap_err();
+        assert!(matches!(kind(&err), AppleError::OperationUncertain(_)));
+    }
+
+    fn host_exposure_cases() -> Vec<Case> {
+        vec![
+            (
+                "agent",
+                |j| j["effective"]["sshAgentForwarding"] = true.into(),
+                |e| matches!(e, AppleError::HostExposure(_)),
+            ),
+            (
+                "relay",
+                |j| j["effective"]["socketRelays"] = 1.into(),
+                |e| matches!(e, AppleError::HostExposure(_)),
+            ),
+            (
+                "port",
+                |j| j["effective"]["publishedPorts"] = 1.into(),
+                |e| matches!(e, AppleError::HostExposure(_)),
+            ),
+            (
+                "virtiofs",
+                |j| {
+                    j["effective"]["mounts"].as_array_mut().unwrap().push(serde_json::json!({
+                        "type": "virtiofs", "source": "/Users/me", "destination": "/proc", "options": []
+                    }));
+                },
+                |e| matches!(e, AppleError::HostExposure(_)),
+            ),
+            (
+                "host path at allowed destination",
+                |j| j["effective"]["mounts"][0]["source"] = "/Users/me".into(),
+                |e| matches!(e, AppleError::HostExposure(_)),
+            ),
+            (
+                "foreign rootfs",
+                |j| j["effective"]["rootfs"]["source"] = "/Users/me/disk.img".into(),
+                |e| matches!(e, AppleError::HostExposure(_)),
+            ),
+            (
+                "init",
+                |j| j["effective"]["initArgv"] = serde_json::json!(["/bin/sh"]),
+                |e| matches!(e, AppleError::HostExposure(_)),
+            ),
+            (
+                "nested virt",
+                |j| j["effective"]["virtualization"] = true.into(),
+                |e| matches!(e, AppleError::HostExposure(_)),
+            ),
+        ]
+    }
+
+    fn network_and_identity_cases() -> Vec<Case> {
+        vec![
+            (
+                "second interface",
+                |j| {
+                    let first = j["effective"]["interfaces"][0].clone();
+                    j["effective"]["interfaces"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(first);
+                },
+                |e| matches!(e, AppleError::NetworkIsolation(_)),
+            ),
+            (
+                "shared network",
+                |j| {
+                    j["effective"]["interfaces"][0]["network"] =
+                        "vmnet-shared:192.168.64.0/24".into();
+                },
+                |e| matches!(e, AppleError::NetworkIsolation(_)),
+            ),
+            (
+                "rootfs kind",
+                |j| j["effective"]["rootfs"]["type"] = "none".into(),
+                |e| matches!(e, AppleError::HostExposure(_)),
+            ),
+            (
+                "address outside subnet",
+                |j| {
+                    j["live"]["ipv4"] = "10.231.9.2".into();
+                    j["effective"]["interfaces"][0]["ipv4"] = "10.231.9.2/24".into();
+                },
+                |e| matches!(e, AppleError::NetworkIsolation(_)),
+            ),
+            (
+                "no live state",
+                |j| j["live"] = serde_json::Value::Null,
+                |e| matches!(e, AppleError::RuntimeUnqualified(_)),
+            ),
+            (
+                "record memory",
+                |j| j["record"]["memoryBytes"] = 1.into(),
+                |e| matches!(e, AppleError::IdentityConflict(_)),
+            ),
+            (
+                "address mismatch",
+                |j| j["live"]["ipv4"] = "10.231.2.9".into(),
+                |e| matches!(e, AppleError::NetworkIsolation(_)),
+            ),
+            (
+                "owner",
+                |j| j["record"]["owner"] = "ffffffffffffffffffffffffffffffff".into(),
+                |e| matches!(e, AppleError::IdentityConflict(_)),
+            ),
+            (
+                "cpus",
+                |j| j["effective"]["cpus"] = 8.into(),
+                |e| matches!(e, AppleError::IdentityConflict(_)),
+            ),
+            (
+                "image",
+                |j| j["effective"]["imageDigest"] = format!("sha256:{}", "f".repeat(64)).into(),
+                |e| matches!(e, AppleError::IdentityConflict(_)),
+            ),
+        ]
+    }
+
+    /// Each mutation of the real running shape must fail with its class.
+    #[test]
+    fn gate_rejects_host_exposure_network_and_identity_changes() {
+        let base: serde_json::Value =
+            serde_json::from_str(&fixture("inspect-running.json")).unwrap();
+        for (label, mutate, expect) in host_exposure_cases()
+            .into_iter()
+            .chain(network_and_identity_cases())
+        {
+            let mut j = base.clone();
+            mutate(&mut j);
+            let err = gate(&j.to_string()).unwrap_err();
+            assert!(expect(kind(&err)), "{label}: {err:#}");
+        }
     }
 }

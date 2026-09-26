@@ -1064,7 +1064,7 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
     crate::fs_util::atomic_write_ssh(path, content)
 }
 
-// The Apple Container build keeps its own marker and alias namespace so it
+// The Apple sandbox build keeps its own marker and alias namespace so it
 // can share `~/.ssh/config` with a default build: neither build's cleanup
 // matches the other's blocks, and same-named instances do not collide.
 #[cfg(not(feature = "apple-container"))]

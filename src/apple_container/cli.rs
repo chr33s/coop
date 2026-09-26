@@ -1,4 +1,5 @@
-//! Typed, bounded adapter over the Apple `container` CLI.
+//! Typed, bounded adapter over the `coop-sandbox` runtime CLI (and the stock
+//! `container` CLI, used only to build images).
 //!
 //! Every runtime call goes through [`Exec`], so it gets an argument vector
 //! (never a host shell), an explicit deadline, bounded captured output, and a
@@ -145,7 +146,7 @@ pub(crate) trait Exec {
     ) -> Result<Output>;
 }
 
-/// Executes the real `container` binary.
+/// Executes a real runtime binary.
 pub(crate) struct RealExec {
     binary: PathBuf,
 }
@@ -153,6 +154,13 @@ pub(crate) struct RealExec {
 impl RealExec {
     pub(crate) fn new(binary: PathBuf) -> Self {
         Self { binary }
+    }
+
+    /// The binary's file name, for diagnostics.
+    fn program(&self) -> String {
+        self.binary
+            .file_name()
+            .map_or_else(|| "runtime".into(), |n| n.to_string_lossy().into_owned())
     }
 
     fn command(&self, args: &[String]) -> Command {
@@ -182,7 +190,7 @@ impl Exec for RealExec {
     fn run(&self, req: &Request) -> Result<Output> {
         let mut cmd = self.command(&req.args);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        tracing::debug!("container {}", req.describe());
+        tracing::debug!("{} {}", self.program(), req.describe());
         let mut child = cmd
             .spawn()
             .with_context(|| format!("Failed to run {}", self.binary.display()))?;
@@ -192,12 +200,13 @@ impl Exec for RealExec {
         let out_reader = std::thread::spawn(move || read_bounded(stdout, limit));
         let err_reader = std::thread::spawn(move || read_bounded(stderr, MAX_TEXT_OUTPUT));
 
-        let status = wait_with_deadline(&mut child, req)?;
+        let status = wait_with_deadline(&mut child, req, &self.program())?;
         let (stdout, out_overflow) = join_reader(out_reader)?;
         let (stderr, _) = join_reader(err_reader)?;
         if out_overflow {
             return Err(AppleError::OperationUncertain(format!(
-                "`container {}` produced more than {limit} bytes of output",
+                "`{} {}` produced more than {limit} bytes of output",
+                self.program(),
                 req.describe()
             ))
             .into());
@@ -218,11 +227,16 @@ impl Exec for RealExec {
         let err_file = file.try_clone().context("Failed to clone build log")?;
         let mut cmd = self.command(&req.args);
         cmd.stdout(Stdio::from(file)).stderr(Stdio::from(err_file));
-        tracing::debug!("container {} (logged to {})", req.describe(), log.display());
+        tracing::debug!(
+            "{} {} (logged to {})",
+            self.program(),
+            req.describe(),
+            log.display()
+        );
         let mut child = cmd
             .spawn()
             .with_context(|| format!("Failed to run {}", self.binary.display()))?;
-        let status = wait_with_deadline(&mut child, req)?;
+        let status = wait_with_deadline(&mut child, req, &self.program())?;
         Ok(Output {
             code: status.code(),
             ..Output::default()
@@ -284,6 +298,7 @@ impl Exec for RealExec {
 fn wait_with_deadline(
     child: &mut std::process::Child,
     req: &Request,
+    program: &str,
 ) -> Result<std::process::ExitStatus> {
     let deadline = Instant::now() + req.timeout;
     loop {
@@ -300,7 +315,7 @@ fn wait_with_deadline(
                 format!("did not finish within {:?}", req.timeout)
             };
             return Err(AppleError::OperationUncertain(format!(
-                "`container {}` {why}; its effect is unknown and will be reconciled on retry",
+                "`{program} {}` {why}; its effect is unknown and will be reconciled on retry",
                 req.describe()
             ))
             .into());
@@ -416,6 +431,47 @@ mod tests {
         assert!(!overflow);
     }
 
+    /// Each bound admits the largest legitimate response of its kind and
+    /// stays small enough to hold in memory.
+    #[test]
+    fn output_bounds_fit_real_responses() {
+        let bounds = [
+            (MAX_JSON_OUTPUT, 512 * 1024, 4 * 1024 * 1024),
+            (MAX_PUBKEY_OUTPUT, 8 * 1024, 64 * 1024),
+            (MAX_TEXT_OUTPUT, 128 * 1024, 1024 * 1024),
+        ];
+        for (bound, fits, ceiling) in bounds {
+            let data = vec![b'x'; fits];
+            assert!(
+                !read_bounded(&data[..], bound).unwrap().1,
+                "{bound} < {fits}"
+            );
+            assert!(bound <= ceiling, "{bound} > {ceiling}");
+        }
+    }
+
+    #[test]
+    fn output_reports_success_and_sanitized_stderr() {
+        let out = Output {
+            code: Some(0),
+            stdout: Vec::new(),
+            stderr: b"  bad\x1b[2J name \n".to_vec(),
+        };
+        assert!(out.success());
+        assert_eq!(out.stderr_summary(), "bad?[2J name");
+        for code in [Some(1), None] {
+            assert!(
+                !Output {
+                    code,
+                    ..out.clone()
+                }
+                .success()
+            );
+        }
+        let req = Request::new(["image", "delete", "x"], Duration::from_secs(1), 1);
+        assert_eq!(req.describe(), "image delete x");
+    }
+
     #[test]
     fn sanitize_strips_terminal_controls() {
         assert_eq!(sanitize_for_display("ok\x1b[2Jdone\n"), "ok?[2Jdone");
@@ -433,6 +489,26 @@ mod tests {
             .unwrap();
         assert!(out.success());
         assert_eq!(lines, ["a", "b"]);
+    }
+
+    /// Logged runs append both streams to the log and report the exit code.
+    #[test]
+    fn real_exec_logs_both_streams_and_the_exit_code() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("build.log");
+        std::fs::write(&log, "earlier\n").unwrap();
+        let exec = RealExec::new(PathBuf::from("/bin/sh"));
+        let req = Request::new(
+            ["-c", "echo out; echo err >&2; exit 3"],
+            Duration::from_secs(10),
+            0,
+        );
+        let out = exec.run_logged(&req, &log).unwrap();
+        assert_eq!(out.code, Some(3));
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "earlier\nout\nerr\n"
+        );
     }
 
     #[test]

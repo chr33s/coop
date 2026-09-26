@@ -279,7 +279,6 @@ fn recovery_hint_names_the_command_for_each_operation() {
     let set = JournalOp::SetResources {
         operation: None,
         prior: resources,
-        target: None,
     };
     let restore = JournalOp::RestoreDisk {
         operation: None,
@@ -360,6 +359,7 @@ fn probe_running_distinguishes_unknown_from_stopped() {
     );
     let err = be.probe_running(&inst).unwrap_err();
     assert!(matches!(kind(&err), AppleError::OperationUncertain(_)));
+    assert!(format!("{err:#}").contains("unfinished create"), "{err:#}");
 }
 
 #[test]
@@ -732,7 +732,6 @@ fn interrupted_resource_change_is_reconciled_from_runtime() {
             JournalOp::SetResources {
                 operation: journaled.map(op),
                 prior,
-                target: journaled.map(|_| target),
             },
             sandbox_name(&owner),
         )
@@ -766,7 +765,6 @@ fn interrupted_resource_change_is_reconciled_from_runtime() {
         JournalOp::SetResources {
             operation: Some(op("coop-a")),
             prior,
-            target: Some(target),
         },
         sandbox_name(&owner),
     )
@@ -808,7 +806,8 @@ fn interrupted_restore_reenrolls_only_for_coops_own_replacement() {
             sandbox_name(&owner),
         )
         .unwrap();
-        let stopped = with_generation(&inspect_json(&cfg, &owner, "stopped"), generation);
+        let stopped = with_generation(&inspect_json(&cfg, &owner, "stopped"), generation)
+            .replace("local/coop-exp:fx", "local/restored:1");
         let json = committed.map_or(stopped.clone(), |c| with_last_operation(&stopped, &op(c)));
         let (be, _) = backend(
             &cfg,
@@ -816,11 +815,18 @@ fn interrupted_restore_reenrolls_only_for_coops_own_replacement() {
         );
         AppleContainerBackend::recover_journal(be.runtime().unwrap(), &cfg, &inst).unwrap();
         assert!(Journal::try_load(&inst).unwrap().is_none());
+        let after = MachineSidecar::load(&inst).unwrap();
         assert_eq!(
-            MachineSidecar::load(&inst).unwrap().reenroll_host_key,
-            reenroll,
+            after.reenroll_host_key, reenroll,
             "{journaled:?} {generation} {committed:?}"
         );
+        // The restored image identity is taken only with the restore.
+        let want = if reenroll {
+            "local/restored:1"
+        } else {
+            "local/coop-exp:fx"
+        };
+        assert_eq!(after.image_ref, want);
     }
 }
 
@@ -1472,7 +1478,6 @@ fn resource_change_that_does_not_apply_is_uncertain() {
         JournalOp::SetResources {
             operation: Some(op(&flag(&set, "--operation"))),
             prior,
-            target: Some(Resources { cpus: 6, ..prior }),
         }
     );
 }
@@ -1545,6 +1550,9 @@ enum Fault {
     ChangedDuringStart,
     /// `stop` leaves the sandbox running.
     StopIgnored,
+    MaintenanceInstallFails,
+    /// `maintenance install` reports an image other than the one given.
+    MaintenanceReportsOtherImage,
     LogsFail,
 }
 
@@ -1694,9 +1702,15 @@ impl Sim {
                 None => ok("null"),
             },
             ("maintenance", Some("install")) => {
-                let reference = flag("--image");
+                let mut reference = flag("--image");
                 if !self.images.iter().any(|(r, _)| *r == reference) {
                     return fail("no such image");
+                }
+                if self.has(Fault::MaintenanceInstallFails) {
+                    return fail("install failed");
+                }
+                if self.has(Fault::MaintenanceReportsOtherImage) {
+                    reference = "local/someone-else:1".into();
                 }
                 let version = flag("--version");
                 self.maintenance = Some(version.clone());
@@ -2268,11 +2282,10 @@ fn rollback_never_overwrites_a_newer_change() {
         "{:#}",
         f.err
     );
-    assert!(
-        format!("{:#}", f.err).contains("newer change"),
-        "{:#}",
-        f.err
-    );
+    let text = format!("{:#}", f.err);
+    assert!(text.contains("newer change"), "{text}");
+    // The message names what superseded the change.
+    assert!(text.contains("last operation coop-elsewhere"), "{text}");
     assert_eq!(set_calls(&f.calls).len(), 1, "no rollback was sent");
     assert_eq!(f.sim.borrow().sandboxes.values().next().unwrap().cpus, 7);
     assert!(Journal::try_load(&f.inst).unwrap().is_none());
@@ -2317,16 +2330,337 @@ fn interrupted_rollback_is_reconciled_from_its_journal() {
         cpus: 2,
         memory_bytes: 2048 * 1024 * 1024,
     };
-    assert!(matches!(
+    // The rollback's own journal: its prior is the forward change.
+    assert_eq!(
         Journal::try_load(&f.inst).unwrap().unwrap().op,
-        JournalOp::SetResources { target: Some(t), .. } if t == prior
-    ));
+        JournalOp::SetResources {
+            operation: Some(op(&sets[1].0)),
+            prior: Resources {
+                cpus: 6,
+                memory_bytes: 6144 * 1024 * 1024
+            },
+        }
+    );
     assert_eq!(MachineSidecar::load(&f.inst).unwrap().requested_cpus, 6);
     let (be, calls) = sim_backend(&f.cfg, &f.sim);
     AppleContainerBackend::recover_journal(be.runtime().unwrap(), &f.cfg, &f.inst).unwrap();
     assert_eq!(MachineSidecar::load(&f.inst).unwrap().resources(), prior);
     assert!(Journal::try_load(&f.inst).unwrap().is_none());
     assert!(mutations(&calls).is_empty());
+}
+/// The runtime refuses to inspect a sandbox whose staged disk update is
+/// unreadable; destroying it still works, from the listing's status.
+#[test]
+fn destroy_does_not_need_inspect() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_cfg(tmp.path());
+    let owner = Owner::load_or_init(&cfg).unwrap();
+    let inst = test_inst(&cfg);
+    write_sidecar(&inst, &owner);
+    let deleted = Rc::new(RefCell::new(false));
+    let d = Rc::clone(&deleted);
+    let (name, owner_id) = (sandbox_name(&owner), owner.id.as_str().to_string());
+    let (be, calls) = backend(
+        &cfg,
+        Box::new(move |args| {
+            if let Some(o) = version(args, true) {
+                return o;
+            }
+            if starts(args, &["list"]) {
+                return ok(&if *d.borrow() {
+                    "[]".into()
+                } else {
+                    format!(r#"[{{"id":"{name}","status":"stopped","owner":"{owner_id}"}}]"#)
+                });
+            }
+            if starts(args, &["inspect"]) {
+                return fail("unreadable staged disk update");
+            }
+            if starts(args, &["delete"]) {
+                *d.borrow_mut() = true;
+                return ok("");
+            }
+            if starts(args, &["reconcile"]) {
+                return ok("[]");
+            }
+            fail("unexpected")
+        }),
+    );
+    be.destroy_instance(&cfg, &inst).unwrap();
+    assert_eq!(mutations(&calls), ["delete"]);
+    assert!(!inst.dir.exists());
+}
+
+/// A journal naming another sandbox than the instance record is an
+/// identity conflict: nothing is reconciled, and the journal stays.
+#[test]
+fn recovery_refuses_a_journal_for_another_sandbox() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_cfg(tmp.path());
+    let owner = Owner::load_or_init(&cfg).unwrap();
+    let inst = test_inst(&cfg);
+    let before = write_sidecar(&inst, &owner);
+    Journal::begin(
+        &inst,
+        &owner,
+        JournalOp::RestoreDisk {
+            operation: Some(op("coop-r")),
+            prior_generation: 0,
+        },
+        MachineName::generate(&owner.id).unwrap(),
+    )
+    .unwrap();
+    let json = with_last_operation(
+        &with_generation(&inspect_json(&cfg, &owner, "stopped"), 1),
+        &op("coop-r"),
+    );
+    let (be, calls) = backend(
+        &cfg,
+        Box::new(move |args| version(args, true).unwrap_or_else(|| ok(&json))),
+    );
+    let err =
+        AppleContainerBackend::recover_journal(be.runtime().unwrap(), &cfg, &inst).unwrap_err();
+    assert!(
+        matches!(kind(&err), AppleError::IdentityConflict(_)),
+        "{err:#}"
+    );
+    assert!(Journal::try_load(&inst).unwrap().is_some());
+    assert_eq!(MachineSidecar::load(&inst).unwrap(), before);
+    assert!(mutations(&calls).is_empty());
+}
+
+/// Each term of the rollback precondition refuses on its own: the runtime's
+/// last operation, its resources, and the sidecar's resources must all still
+/// be the forward change's. When all hold, the rollback is sent conditional
+/// on that operation.
+#[test]
+fn rollback_precondition_terms_each_refuse() {
+    let applied = Resources {
+        cpus: 2,
+        memory_bytes: 2048 * 1024 * 1024,
+    };
+    let prior = Resources { cpus: 4, ..applied };
+    // (runtime's last operation, runtime cpus, sidecar cpus, refused)
+    for (last, runtime_cpus, sidecar_cpus, refused) in [
+        ("coop-other", 2, 2, true),
+        ("coop-fwd", 5, 2, true),
+        ("coop-fwd", 2, 5, true),
+        ("coop-fwd", 2, 2, false),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(tmp.path());
+        let owner = Owner::load_or_init(&cfg).unwrap();
+        let inst = test_inst(&cfg);
+        let mut sidecar = write_sidecar(&inst, &owner);
+        sidecar.requested_cpus = sidecar_cpus;
+        sidecar.save(&inst).unwrap();
+        let sim = Sim::new(&cfg, &owner);
+        sim_sandbox(&sim, &owner, SandboxStatus::Stopped);
+        {
+            let mut s = sim.borrow_mut();
+            let b = s.sandboxes.values_mut().next().unwrap();
+            b.cpus = runtime_cpus;
+            b.last_operation = Some(last.into());
+        }
+        let (be, calls) = sim_backend(&cfg, &sim);
+        let undo = ResourceUpdate {
+            operation: op("coop-fwd"),
+            prior,
+            applied,
+        };
+        let result = AppleContainerBackend::update_resources(
+            be.runtime().unwrap(),
+            &cfg,
+            &inst,
+            &owner,
+            |_| prior,
+            Some(&undo),
+        );
+        let case = format!("{last} {runtime_cpus} {sidecar_cpus}");
+        assert!(Journal::try_load(&inst).unwrap().is_none(), "{case}");
+        if refused {
+            let err = result.err().unwrap();
+            assert!(
+                matches!(kind(&err), AppleError::OperationUncertain(_)),
+                "{case}: {err:#}"
+            );
+            assert!(set_calls(&calls).is_empty(), "{case}");
+        } else {
+            result.unwrap();
+            assert_eq!(set_calls(&calls).len(), 1, "{case}");
+            assert_eq!(set_calls(&calls)[0].1, "coop-fwd");
+            assert_eq!(MachineSidecar::load(&inst).unwrap().resources(), prior);
+        }
+    }
+}
+
+/// A grow the runtime reports as done is accepted only when its record
+/// shows both this operation and the new size.
+#[test]
+fn grow_requires_its_own_committed_operation() {
+    // (report this grow's operation, report the grown size)
+    for (ours, grown) in [(false, true), (true, false)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(tmp.path());
+        let owner = Owner::load_or_init(&cfg).unwrap();
+        let inst = test_inst(&cfg);
+        write_sidecar(&inst, &owner);
+        let sent: Rc<RefCell<Option<OperationId>>> = Rc::new(RefCell::new(None));
+        let s = Rc::clone(&sent);
+        let stopped = inspect_json(&cfg, &owner, "stopped");
+        let (be, _) = backend(
+            &cfg,
+            Box::new(move |args| {
+                if let Some(o) = version(args, true) {
+                    return o;
+                }
+                if starts(args, &["inspect"]) {
+                    let Some(sent) = &*s.borrow() else {
+                        return ok(&stopped);
+                    };
+                    let bytes = if grown { 32u64 << 30 } else { 8u64 << 30 };
+                    let json = stopped.replace(
+                        "\"diskBytes\" : 8589934592",
+                        &format!("\"diskBytes\" : {bytes}"),
+                    );
+                    let reported = if ours { sent.clone() } else { op("coop-other") };
+                    return ok(&with_last_operation(&json, &reported));
+                }
+                if starts(args, &["grow"]) {
+                    *s.borrow_mut() = Some(op(&flag(args, "--operation")));
+                    return ok("{}");
+                }
+                fail("unexpected")
+            }),
+        );
+        let err = be
+            .resize_disk(
+                &cfg,
+                &StoppedInstance::new(inst.clone()),
+                GiB::new(32).unwrap(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(kind(&err), AppleError::OperationUncertain(_)),
+            "{ours} {grown}: {err:#}"
+        );
+    }
+}
+
+/// A restore is taken as done only when the runtime shows both a higher
+/// generation and this restore's operation; otherwise the journal stays and
+/// no new host key is authorized.
+#[test]
+fn restore_requires_its_own_committed_operation() {
+    // (report this restore's operation, raise the generation)
+    for (ours, raised) in [(false, true), (true, false)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(tmp.path());
+        let owner = Owner::load_or_init(&cfg).unwrap();
+        let inst = test_inst(&cfg);
+        write_sidecar(&inst, &owner);
+        let image = ImageName::new("default").unwrap();
+        manifest("local/coop-exp:fx", None)
+            .save(&cfg, &image)
+            .unwrap();
+        let sent: Rc<RefCell<Option<OperationId>>> = Rc::new(RefCell::new(None));
+        let s = Rc::clone(&sent);
+        let stopped = inspect_json(&cfg, &owner, "stopped");
+        let listed = format!(
+            r#"[{{"reference":"local/coop-exp:fx","digest":"sha256:{}"}}]"#,
+            "a".repeat(64)
+        );
+        let (be, _) = backend(
+            &cfg,
+            Box::new(move |args| {
+                if let Some(o) = version(args, true) {
+                    return o;
+                }
+                if starts(args, &["image", "list"]) {
+                    return ok(&listed);
+                }
+                if starts(args, &["inspect"]) {
+                    let Some(sent) = &*s.borrow() else {
+                        return ok(&stopped);
+                    };
+                    let json = with_generation(&stopped, u64::from(raised));
+                    let reported = if ours { sent.clone() } else { op("coop-other") };
+                    return ok(&with_last_operation(&json, &reported));
+                }
+                if starts(args, &["restore"]) {
+                    *s.borrow_mut() = Some(op(&flag(args, "--operation")));
+                    return ok("{}");
+                }
+                fail("unexpected")
+            }),
+        );
+        let err = be
+            .restore_disk(&cfg, &StoppedInstance::new(inst.clone()), &image)
+            .unwrap_err();
+        let case = format!("{ours} {raised}");
+        assert!(
+            matches!(kind(&err), AppleError::OperationUncertain(_)),
+            "{case}: {err:#}"
+        );
+        assert!(Journal::try_load(&inst).unwrap().is_some(), "{case}");
+        assert!(
+            !MachineSidecar::load(&inst).unwrap().reenroll_host_key,
+            "{case}"
+        );
+    }
+}
+
+/// Setup reinstalls a maintenance image of another version, and removes
+/// the store copy whether the install succeeds, fails, or reports
+/// something other than what was installed.
+#[test]
+fn setup_installs_the_current_maintenance_image() {
+    type Prepare = fn(&mut Sim);
+    let cases: [(Prepare, Option<&str>); 3] = [
+        (|s| s.maintenance = Some("0".into()), None),
+        (
+            |s| s.faults.push(Fault::MaintenanceInstallFails),
+            Some("install failed"),
+        ),
+        (
+            |s| s.faults.push(Fault::MaintenanceReportsOtherImage),
+            Some("APPLE_RUNTIME_UNQUALIFIED"),
+        ),
+    ];
+    for (prepare, error) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cfg, owner, opts) = setup_env(tmp.path());
+        let sim = Sim::new(&cfg, &owner);
+        prepare(&mut sim.borrow_mut());
+        let (be, calls) = sim_backend(&cfg, &sim);
+        let result = be.setup(&cfg, &opts);
+        let installs = calls
+            .borrow()
+            .iter()
+            .filter(|c| starts(c, &["maintenance", "install"]))
+            .count();
+        assert_eq!(installs, 1, "{error:?}");
+        let s = sim.borrow();
+        assert!(
+            !s.images.iter().any(|(r, _)| r.contains("-maintenance:")),
+            "{error:?}: store copy left behind"
+        );
+        match error {
+            None => {
+                result.unwrap();
+                assert_eq!(s.maintenance.as_deref(), Some(image::MAINTENANCE_VERSION));
+            }
+            Some(want) => {
+                let err = result.unwrap_err();
+                assert!(format!("{err:#}").contains(want), "{err:#}");
+                assert!(
+                    ImageManifest::try_load(&cfg, &opts.image)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+    }
 }
 #[test]
 fn destroying_images_releases_owned_content() {

@@ -39,7 +39,8 @@ public enum Maintenance {
     /// Programs the maintenance scripts run; `install` refuses an image
     /// without them.
     static let requiredPrograms = ["/bin/sh", "/bin/rm", "/bin/sync", "/sbin/e2fsck", "/sbin/resize2fs"]
-    /// Larger compressed layers than this are not a small maintenance image.
+    /// Caps the image's compressed layers, and so the capacity
+    /// ``capacity(packedBytes:)`` gives its disk.
     static let maxPackedBytes: UInt64 = 512 * 1024 * 1024
 
     static func artifactURL(_ root: SandboxRoot) -> URL { root.maintenance.appendingPathComponent("tools.json") }
@@ -55,6 +56,14 @@ public enum Maintenance {
         let step: UInt64 = 64 * 1024 * 1024
         let wanted = packed * 4 + 512 * 1024 * 1024
         return (wanted + step - 1) / step * step
+    }
+
+    /// Total of `sizes` (layer sizes from a manifest), saturating just past
+    /// ``maxPackedBytes`` so an absurd manifest is refused, not overflowed.
+    static func packedBytes(_ sizes: [Int64]) -> UInt64 {
+        sizes.reduce(UInt64(0)) { sum, size in
+            min(sum + min(UInt64(max(0, size)), maxPackedBytes + 1), maxPackedBytes + 1)
+        }
     }
 
     public static func installed(root: SandboxRoot) throws -> MaintenanceArtifact? {
@@ -77,8 +86,7 @@ public enum Maintenance {
         let store = try ImageStore(path: root.imageStore)
         let image = try await store.get(reference: reference)
         let manifest = try await image.manifest(for: .current)
-        let packed = manifest.layers.reduce(UInt64(0)) { $0 + UInt64(max(0, $1.size)) }
-        let capacity = try capacity(packedBytes: packed)
+        let capacity = try capacity(packedBytes: packedBytes(manifest.layers.map(\.size)))
 
         let tmp = root.maintenance.appendingPathComponent(".tmp-\(UUID().uuidString).ext4")
         defer { try? FileManager.default.removeItem(at: tmp) }

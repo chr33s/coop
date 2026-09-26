@@ -37,7 +37,11 @@ let package = Package(
         ),
         .testTarget(
             name: "CoopSandboxTests",
-            dependencies: ["CoopSandboxCore"]
+            dependencies: [
+                "CoopSandboxCore",
+                .product(name: "ContainerizationEXT4", package: "containerization"),
+                .product(name: "SystemPackage", package: "swift-system"),
+            ]
         ),
     ]
 )

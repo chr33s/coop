@@ -95,13 +95,10 @@ public enum Owner {
         try? await Task.sleep(for: .milliseconds(200))
     }
 
-    /// Take ownership of `id`: its owner lock, held for the owner's whole
-    /// life. Taken under the sandbox's mutation guard, however the owner was
-    /// launched (`start`, or launchd respawning it), so an owner never starts
-    /// while an offline operation is replacing its disk, and an operation
-    /// that begins later sees the owner and refuses. A disk update a crash
-    /// interrupted is settled before the VM reads the disk. The guard is
-    /// released on return: nothing waits on the owner while holding it.
+    /// Take `id`'s owner lock for the owner's whole life, under the mutation
+    /// guard, however the owner was launched: an owner never starts
+    /// mid-update, and later mutations see it and refuse. An interrupted disk
+    /// update is settled first. The guard is released on return.
     static func claim(root: SandboxRoot, id: SandboxID) async throws -> Int32 {
         let paths = root.sandbox(id)
         let guarded = try await FileLock.acquire(paths.mutationLock, .exclusive, polling: .milliseconds(50))

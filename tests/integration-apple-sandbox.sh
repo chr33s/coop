@@ -101,7 +101,7 @@ summary() {
 # ── Runtime helpers ───────────────────────────────────────────
 
 sbx() { "$SANDBOX" "$1" --root "$ROOT" "${@:2}"; }
-# For two-word commands (`image import`, `maintenance install`).
+# Two-word subcommands take --root after both words.
 sbx2() { "$SANDBOX" "$1" "$2" --root "$ROOT" "${@:3}"; }
 name() { echo "coop-test-$1-$RUN"; }
 create() { sbx create "$1" --image "$IMAGE" --cpus "${2:-2}" --memory-mib "${3:-2048}" --disk-gib "${4:-8}" --owner "$RUN" >/dev/null; }
@@ -203,7 +203,8 @@ imported="$("$SANDBOX" image import --root "$ROOT" --oci-tar "$WORK/image.tar")"
 # shellcheck disable=SC2016 # jq program text.
 check "image imports into the private store" jq -e --arg r "$IMAGE" 'any(.reference == $r)' <<<"$imported"
 rm -f "$WORK/image.tar"
-# The maintenance image: a shell and e2fsprogs, the same recipe coop builds.
+# A maintenance image equivalent to the one coop builds
+# (image.rs maintenance_dockerfile): Ubuntu with e2fsprogs.
 mkdir -p "$WORK/maintenance"
 printf '%s\n' 'FROM docker.io/library/ubuntu:24.04' \
     'RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends e2fsprogs && rm -rf /var/lib/apt/lists/*' \

@@ -12,7 +12,7 @@ use anyhow::{Result, bail};
 use serde::Deserialize;
 
 use super::AppleError;
-use super::state::MachineName;
+use super::state::{MachineName, OperationId};
 
 /// Sandbox state as `coop-sandbox` reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -66,13 +66,20 @@ pub(crate) struct SandboxRecord {
     /// The last `set`, `grow`, or `restore` the runtime committed, by the
     /// `--operation` id its caller passed. Absent before the first one.
     #[serde(default)]
-    pub(crate) last_operation: Option<String>,
+    pub(crate) last_operation: Option<OperationId>,
 }
 
 impl SandboxRecord {
     /// Whether the runtime's last committed operation is `op`.
-    pub(crate) fn committed(&self, op: &super::state::OperationId) -> bool {
-        self.last_operation.as_deref() == Some(op.as_str())
+    pub(crate) fn committed(&self, op: &OperationId) -> bool {
+        self.last_operation.as_ref() == Some(op)
+    }
+
+    /// The last committed operation, for messages.
+    pub(crate) fn last_operation_label(&self) -> &str {
+        self.last_operation
+            .as_ref()
+            .map_or("none", OperationId::as_str)
     }
 
     pub(crate) fn resources(&self) -> super::state::Resources {
@@ -259,7 +266,8 @@ pub(crate) struct MaintenanceArtifact {
     pub(crate) digest: String,
 }
 
-/// `coop-sandbox maintenance inspect`: `null` when none is installed.
+/// Output of `coop-sandbox maintenance inspect` or `install`; `null` means
+/// none is installed.
 pub(crate) fn parse_maintenance(json: &str) -> Result<Option<MaintenanceArtifact>> {
     serde_json::from_str(json).map_err(|e| {
         AppleError::RuntimeUnqualified(format!("`coop-sandbox maintenance` output: {e}")).into()

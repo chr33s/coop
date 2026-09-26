@@ -21,10 +21,8 @@ public struct SubnetAllocator: Sendable {
 
     /// Runs `body` under an exclusive lock on the allocation state.
     func locked<T>(_ body: (inout State) throws -> T) throws -> T {
-        let fd = open(root.allocationLock.path, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
-        guard fd >= 0 else { throw SandboxError("open \(root.allocationLock.path): errno \(errno)") }
-        defer { close(fd) }
-        guard flock(fd, LOCK_EX) == 0 else { throw SandboxError("flock: errno \(errno)") }
+        let lock = try FileLock.acquire(root.allocationLock, .exclusive)
+        defer { withExtendedLifetime(lock) {} }
         var state = (try? JSONDecoder.iso.decode(State.self, from: Data(contentsOf: root.subnetState))) ?? State()
         let result = try body(&state)
         try JSONEncoder.pretty.encode(state).write(to: root.subnetState, options: .atomic)

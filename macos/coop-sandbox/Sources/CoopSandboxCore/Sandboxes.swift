@@ -293,7 +293,7 @@ public enum Sandboxes {
             try await growScratch(root: root, scratch: paths.dir, disk: work, to: diskBytes)
             record.diskBytes = diskBytes
             record.lastOperation = op
-            try DiskUpdate.publish(paths, kind: .grow, operation: op, work: work, record: record)
+            try DiskUpdate.publish(paths, work: work, record: record)
             return record
         }
     }
@@ -387,7 +387,7 @@ public enum Sandboxes {
             }
             record.diskGeneration += 1
             record.lastOperation = op
-            try DiskUpdate.publish(paths, kind: .restore, operation: op, work: work, record: record)
+            try DiskUpdate.publish(paths, work: work, record: record)
             return record
         }
     }
@@ -436,8 +436,9 @@ public enum Sandboxes {
     /// sandbox whose guard is held is left for a later run.
     public static func reconcile(root: SandboxRoot) throws -> [ReconcileAction] {
         var out: [ReconcileAction] = []
-        // The sweep below must not race an in-flight create, grow, commit, or
-        // restore; when one is running, only crashed owners are cleared.
+        // The sweep below must not race an in-flight offline operation; while
+        // one runs, only per-sandbox recovery (crashed owners, staged disk
+        // updates) happens.
         let sweep = OperationLock.tryExclusive(root)
         defer { withExtendedLifetime(sweep) {} }
         for record in try root.allRecords() {

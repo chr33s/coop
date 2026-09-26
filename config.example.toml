@@ -165,7 +165,7 @@
 #                                            # must match a sha256 the runtime pins
 # probe_timeout_seconds = 10     # version/inspect/list (1–86400)
 # operation_timeout_seconds = 60 # resource changes, deletes, guest commands
-# create_timeout_seconds = 600   # create (first image unpack), grow, commit, restore
+# create_timeout_seconds = 600   # create (first image unpack), grow, commit, restore, maintenance install
 # boot_timeout_seconds = 120     # boot until SSH is ready
 # stop_timeout_seconds = 90      # clean systemd shutdown
 # build_timeout_seconds = 3600   # image build (`setup --builder-timeout` overrides)

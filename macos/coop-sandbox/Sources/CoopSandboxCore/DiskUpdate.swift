@@ -16,13 +16,7 @@ import Foundation
 /// makes no claim about sudden power loss: each rename is atomic, but the
 /// steps are not synced to disk as a group.
 public enum DiskUpdate {
-    public enum Kind: String, Codable, Sendable {
-        case grow, restore
-    }
-
     struct Pending: Codable {
-        var kind: Kind
-        var operation: String
         /// Basename of the prepared disk in the sandbox directory.
         var work: String
         var inode: UInt64
@@ -36,24 +30,21 @@ public enum DiskUpdate {
 
     struct InjectedFault: Error {}
 
-    /// The scratch disk an update prepares. Named per operation, so two
-    /// operations' scratch files never collide.
+    /// The scratch disk an update prepares.
     public static func workDisk(_ paths: SandboxPaths, _ operation: OperationID) -> URL {
         paths.dir.appendingPathComponent(".update-\(operation.rawValue).ext4")
     }
 
     /// Install the prepared disk `work` as `paths`' disk, described by
     /// `record`. Caller holds the sandbox's mutation guard.
-    static func publish(
-        _ paths: SandboxPaths, kind: Kind, operation: OperationID, work: URL, record: SandboxRecord, fault: Fault? = nil
-    ) throws {
+    static func publish(_ paths: SandboxPaths, work: URL, record: SandboxRecord, fault: Fault? = nil) throws {
         func inject(_ point: Fault) throws { if fault == point { throw InjectedFault() } }
         guard work.deletingLastPathComponent().standardizedFileURL == paths.dir.standardizedFileURL else {
             throw SandboxError("prepared disk \(work.path) is not in \(paths.dir.path)")
         }
         try inject(.beforeStaging)
         guard let inode = SandboxPaths.inode(work) else { throw SandboxError("stat \(work.path): errno \(errno)") }
-        let pending = Pending(kind: kind, operation: operation.rawValue, work: work.lastPathComponent, inode: inode, record: record)
+        let pending = Pending(work: work.lastPathComponent, inode: inode, record: record)
         try JSONEncoder.pretty.encode(pending).write(to: paths.pendingDiskUpdate, options: .atomic)
         try inject(.afterStaging)
         guard rename(work.path, paths.rootfs.path) == 0 else {
@@ -70,7 +61,7 @@ public enum DiskUpdate {
     }
 
     /// Finish or discard an interrupted publication; `true` if there was one.
-    /// Caller holds the sandbox's mutation guard (or is its claiming owner).
+    /// Caller holds the sandbox's mutation guard.
     @discardableResult
     static func settle(_ paths: SandboxPaths) throws -> Bool {
         guard let (pending, file) = try loadPending(paths) else { return false }
@@ -114,8 +105,7 @@ public enum DiskUpdate {
             }
             do {
                 let old = try JSONDecoder.iso.decode(Legacy.self, from: data)
-                let pending = Pending(
-                    kind: .restore, operation: "legacy", work: ".restore-rootfs.ext4", inode: old.inode, record: old.record)
+                let pending = Pending(work: ".restore-rootfs.ext4", inode: old.inode, record: old.record)
                 return (pending, paths.legacyPendingRestore)
             } catch {
                 throw unreadable(paths.legacyPendingRestore, error)

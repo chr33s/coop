@@ -2,8 +2,8 @@
 
 Output of `coop-sandbox` (containerization 0.45.0), captured from one
 sandbox on macOS 27 and used by the `apple_container` unit tests. The inspect
-records were captured from 0.1.0 (protocol 1); protocol 2 only adds the
-optional `record.lastOperation`, absent until a sandbox's first `set`, `grow`,
+records were captured from 0.1.0 (protocol 1); in inspect output, protocol 2
+only adds the optional `record.lastOperation`, absent until a sandbox's first `set`, `grow`,
 or `restore`, so they are unchanged, and `version.json` was updated to 0.2.0:
 
 - `version.json` — `coop-sandbox version`

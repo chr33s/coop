@@ -401,12 +401,6 @@ impl From<OperationId> for String {
     }
 }
 
-impl std::fmt::Display for OperationId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
 /// A sandbox's CPU count and memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Resources {
@@ -420,7 +414,7 @@ impl std::fmt::Display for Resources {
             f,
             "{} vCPUs / {} MiB",
             self.cpus,
-            self.memory_bytes / (1024 * 1024)
+            self.memory_bytes / super::MIB
         )
     }
 }
@@ -453,22 +447,17 @@ pub(crate) enum JournalOp {
     Create {
         stage: CreateStage,
     },
-    /// A CPU/memory change, forward or rolled back: the runtime was about
-    /// to be asked for `target`, tagged `operation`.
+    /// A CPU/memory change, forward or rolled back, tagged `operation`.
     SetResources {
-        /// Absent in journals written before operation ids; reconciling one
-        /// then compares the runtime's values with `prior`.
-        #[serde(default)]
+        /// `None` only for a journal converted by [`legacy::convert`].
         operation: Option<OperationId>,
+        /// The runtime's resources before the change.
         prior: Resources,
-        #[serde(default)]
-        target: Option<Resources>,
     },
     /// Disk replaced by `coop restore`.
     RestoreDisk {
-        /// Absent in journals written before operation ids; a higher disk
-        /// generation alone then proves the restore applied.
-        #[serde(default)]
+        /// `None` only for a journal converted by [`legacy::convert`]; a
+        /// higher disk generation alone then proves the restore applied.
         operation: Option<OperationId>,
         /// The runtime's disk generation before the restore.
         prior_generation: u64,
@@ -504,8 +493,9 @@ impl JournalOp {
     }
 }
 
-/// `operation.json` — present only while a mutation or its recovery is
-/// pending. Written before each mutating runtime call.
+/// `operation.json` — present only while a journaled instance mutation
+/// (create, resource change, restore, destroy) or its recovery is pending.
+/// Written before each of that mutation's runtime calls.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Journal {
     pub(crate) schema_version: u32,
@@ -623,6 +613,16 @@ mod legacy {
         prior_disk_generation: Option<u64>,
     }
 
+    /// The flat layout's rule: each operation carries exactly its own
+    /// prior state.
+    fn priors_fit(operation: Operation, res: Option<(u32, u64)>, generation: Option<u64>) -> bool {
+        match operation {
+            Operation::Create | Operation::Destroy => res.is_none() && generation.is_none(),
+            Operation::SetResources => res.is_some() && generation.is_none(),
+            Operation::RestoreDisk => res.is_none() && generation.is_some(),
+        }
+    }
+
     pub(super) fn convert(r: Record) -> Result<Journal> {
         use Operation as O;
         use Stage as S;
@@ -641,13 +641,22 @@ mod legacy {
             (O::Create, S::MachineCreated, None, None) => JournalOp::Create {
                 stage: CreateStage::MachineCreated,
             },
-            // `destroy` advanced an unfinished create's journal in place.
-            (O::Create | O::Destroy, S::DeletingMachine, None, None) => JournalOp::Destroy {
-                stage: DestroyStage::DeletingMachine,
-            },
-            (O::Create | O::Destroy, S::MachineDeleted, None, None) => JournalOp::Destroy {
-                stage: DestroyStage::MachineDeleted,
-            },
+            // `destroy` advanced whatever journal it found in place, keeping
+            // that operation's name and prior state.
+            (operation, S::DeletingMachine, res, generation)
+                if priors_fit(operation, res, generation) =>
+            {
+                JournalOp::Destroy {
+                    stage: DestroyStage::DeletingMachine,
+                }
+            }
+            (operation, S::MachineDeleted, res, generation)
+                if priors_fit(operation, res, generation) =>
+            {
+                JournalOp::Destroy {
+                    stage: DestroyStage::MachineDeleted,
+                }
+            }
             (O::Destroy, S::Reserved, None, None) => JournalOp::Destroy {
                 stage: DestroyStage::Reserved,
             },
@@ -655,7 +664,6 @@ mod legacy {
                 JournalOp::SetResources {
                     operation: None,
                     prior: Resources { cpus, memory_bytes },
-                    target: None,
                 }
             }
             (O::RestoreDisk, S::Reserved | S::Applying, None, Some(prior_generation)) => {
@@ -967,10 +975,6 @@ mod tests {
             JournalOp::SetResources {
                 operation: Some(OperationId::generate().unwrap()),
                 prior: resources,
-                target: Some(Resources {
-                    cpus: 4,
-                    ..resources
-                }),
             },
             JournalOp::RestoreDisk {
                 operation: Some(OperationId::generate().unwrap()),
@@ -1018,7 +1022,6 @@ mod tests {
                     cpus: 8,
                     memory_bytes: 1 << 30
                 },
-                target: None,
             }
         );
         write("restore-disk", "applying", "null", "3");
@@ -1058,6 +1061,125 @@ mod tests {
                 format!("{err:#}").contains("coop destroy"),
                 "{operation} {stage}: {err:#}"
             );
+        }
+    }
+
+    /// Every combination the flat layout could hold converts to the
+    /// operation it describes, including a destroy that took over another
+    /// operation's journal; a stage its operation never reached is refused.
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one row per flat-layout combination")]
+    fn legacy_flat_journal_conversion_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(tmp.path());
+        let inst = test_inst(&cfg);
+        let me = me();
+        let name = MachineName::generate(&me.id).unwrap();
+        let set = JournalOp::SetResources {
+            operation: None,
+            prior: Resources {
+                cpus: 1,
+                memory_bytes: 2,
+            },
+        };
+        let restore = JournalOp::RestoreDisk {
+            operation: None,
+            prior_generation: 3,
+        };
+        let create = |stage| Some(JournalOp::Create { stage });
+        let destroy = |stage| Some(JournalOp::Destroy { stage });
+        let (none, res, generation) = (("null", "null"), ("[1,2]", "null"), ("null", "3"));
+        let both = ("[1,2]", "3");
+        for (operation, stage, (resources, gen_field), want) in [
+            ("create", "reserved", none, create(CreateStage::Reserved)),
+            (
+                "create",
+                "creating-machine",
+                none,
+                create(CreateStage::CreatingMachine),
+            ),
+            (
+                "create",
+                "machine-created",
+                none,
+                create(CreateStage::MachineCreated),
+            ),
+            ("destroy", "reserved", none, destroy(DestroyStage::Reserved)),
+            ("set-resources", "reserved", res, Some(set.clone())),
+            ("set-resources", "applying", res, Some(set.clone())),
+            (
+                "restore-disk",
+                "reserved",
+                generation,
+                Some(restore.clone()),
+            ),
+            (
+                "restore-disk",
+                "applying",
+                generation,
+                Some(restore.clone()),
+            ),
+            // `destroy` advanced whatever journal it found.
+            (
+                "create",
+                "deleting-machine",
+                none,
+                destroy(DestroyStage::DeletingMachine),
+            ),
+            (
+                "destroy",
+                "deleting-machine",
+                none,
+                destroy(DestroyStage::DeletingMachine),
+            ),
+            (
+                "destroy",
+                "machine-deleted",
+                none,
+                destroy(DestroyStage::MachineDeleted),
+            ),
+            (
+                "create",
+                "machine-deleted",
+                none,
+                destroy(DestroyStage::MachineDeleted),
+            ),
+            (
+                "set-resources",
+                "deleting-machine",
+                res,
+                destroy(DestroyStage::DeletingMachine),
+            ),
+            (
+                "restore-disk",
+                "machine-deleted",
+                generation,
+                destroy(DestroyStage::MachineDeleted),
+            ),
+            // Stages the operation never reached, or another's prior state.
+            ("destroy", "creating-machine", none, None),
+            ("set-resources", "machine-created", res, None),
+            ("restore-disk", "creating-machine", generation, None),
+            ("set-resources", "deleting-machine", none, None),
+            ("restore-disk", "deleting-machine", res, None),
+            ("destroy", "deleting-machine", res, None),
+            ("set-resources", "deleting-machine", both, None),
+            ("restore-disk", "deleting-machine", both, None),
+            ("create", "machine-deleted", res, None),
+        ] {
+            fs::write(
+                Journal::path(&inst),
+                format!(
+                    r#"{{"schema_version":2,"backend":"apple-container","owner_id":"{}","operation":"{operation}","stage":"{stage}","machine_id":"{name}","prior_resources":{resources},"prior_disk_generation":{gen_field}}}"#,
+                    me.id.as_str()
+                ),
+            )
+            .unwrap();
+            let got = Journal::try_load(&inst).map(|j| j.unwrap().op);
+            match want {
+                Some(want) => assert_eq!(got.unwrap(), want, "{operation} {stage}"),
+                None => assert!(got.is_err(), "{operation} {stage}"),
+            }
         }
     }
 

@@ -218,8 +218,8 @@ pub(crate) fn maintenance_context() -> Result<tempfile::TempDir> {
     Ok(dir)
 }
 
-/// Owned tag for a maintenance build; deleted from the store once the
-/// runtime has unpacked it.
+/// Owned tag for a maintenance build; deleted from the store after the
+/// install attempt.
 pub(crate) fn maintenance_ref(owner: &Owner, build_id: &str) -> String {
     format!(
         "local/coop-{}-maintenance:{MAINTENANCE_VERSION}-{build_id}",

@@ -451,14 +451,22 @@ impl Runtime {
     /// Whether the runtime lists `name`. A failed listing is an error, never
     /// "absent".
     fn exists(&self, name: &MachineName) -> Result<bool> {
+        Ok(self.listed(name)?.is_some())
+    }
+
+    /// `name`'s status from the runtime's listing, or `None` if it is not
+    /// listed. Unlike `inspect`, the listing never reads a staged disk
+    /// update, so it works on a sandbox whose staged state is unreadable.
+    fn listed(&self, name: &MachineName) -> Result<Option<SandboxStatus>> {
         let json = self.text(
             self.args(&["list"], &[]),
             self.settings.probe,
             MAX_JSON_OUTPUT,
         )?;
         Ok(protocol::parse_list(&json)?
-            .iter()
-            .any(|s| s.id == name.as_str()))
+            .into_iter()
+            .find(|s| s.id == name.as_str())
+            .map(|s| s.status))
     }
 
     fn create(
@@ -1066,7 +1074,7 @@ impl AppleContainerBackend {
     /// Finish an interrupted resource change or restore once the sandbox is
     /// confirmed stopped: the runtime's record is authoritative, and its last
     /// committed operation says whether coop's own change applied.
-    /// Idempotent: nothing is sent to the runtime. Other journaled
+    /// Idempotent: it only inspects the runtime, never changes it. Other journaled
     /// operations are left for `destroy`. Caller holds the lock.
     fn recover_journal(rt: &Runtime, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         let Some(journal) = Journal::try_load(inst)? else {
@@ -1097,21 +1105,11 @@ impl AppleContainerBackend {
             )));
         }
         match &journal.op {
-            JournalOp::SetResources {
-                operation, prior, ..
-            } => {
-                let applied = match operation {
-                    Some(op) => rec.record.committed(op),
-                    None => rec.record.resources() != *prior,
-                };
+            JournalOp::SetResources { operation, prior } => {
                 tracing::warn!(
                     "Reconciling an interrupted resource change of '{}' ({}): runtime reports {}",
                     inst.name,
-                    if applied {
-                        "the change applied"
-                    } else {
-                        "the change did not apply"
-                    },
+                    resource_change_outcome(operation.as_ref(), &rec.record, *prior),
                     rec.record.resources()
                 );
                 sidecar.requested_cpus = rec.record.cpus;
@@ -1122,8 +1120,9 @@ impl AppleContainerBackend {
                 prior_generation,
             } => {
                 // Only coop's own restore, identified by its operation id,
-                // authorizes a new host key; a higher generation alone does
-                // not (journals from before operation ids have only that).
+                // authorizes a new host key. A journal converted from the
+                // layout before operation ids has only the generation; that
+                // is still coop's own journaled restore (see trust-model.md).
                 let replaced = rec.record.disk_generation > *prior_generation;
                 let applied = match operation {
                     Some(op) => replaced && rec.record.committed(op),
@@ -1317,13 +1316,12 @@ impl AppleContainerBackend {
     }
 
     /// Change a stopped instance's CPU/memory to `target` under the instance
-    /// lock, journaled first: the one path for both a forward change and its
-    /// rollback. With `undo`, only if the runtime's last committed operation
-    /// is still `undo.operation` with `undo.applied` resources (checked by
-    /// coop and again by the runtime under its own guard), so a rollback
-    /// never overwrites a newer change. The sandbox must be confirmed stopped
-    /// first. A change whose outcome cannot be confirmed keeps its journal,
-    /// which the next start reconciles, and is reported as uncertain.
+    /// lock, journaled first; used for both a forward change and its
+    /// rollback. With `undo`, refuses unless the runtime's last committed
+    /// operation is still `undo.operation` with `undo.applied` resources
+    /// (checked here and again by the runtime), so a rollback never
+    /// overwrites a newer change. An unconfirmed outcome keeps the journal
+    /// for the next start and is reported as uncertain.
     fn update_resources(
         rt: &Runtime,
         cfg: &CoopConfig,
@@ -1347,34 +1345,24 @@ impl AppleContainerBackend {
                 "sandbox {machine} changed after the update to {} (now {prior}, last operation \
                  {}); not rolling back over the newer change",
                 undo.applied,
-                rec.record.last_operation.as_deref().unwrap_or("none")
+                rec.record.last_operation_label()
             )));
         }
         let target = target(prior);
         let operation = OperationId::generate()?;
-        Journal::begin(
-            inst,
-            owner,
-            JournalOp::SetResources {
-                operation: Some(operation.clone()),
-                prior,
-                target: Some(target),
-            },
-            machine.clone(),
-        )?;
+        let journaled = JournalOp::SetResources {
+            operation: Some(operation.clone()),
+            prior,
+        };
+        Journal::begin(inst, owner, journaled.clone(), machine.clone())?;
         rt.set_resources(&machine, target, &operation, undo.map(|u| &u.operation))?;
         let after = rt.inspect(&machine)?;
         if !after.record.committed(&operation) || after.record.resources() != target {
             bail!(AppleError::OperationUncertain(format!(
                 "sandbox {machine} reports {} (last operation {}) after the update to {target}; {}",
                 after.record.resources(),
-                after.record.last_operation.as_deref().unwrap_or("none"),
-                JournalOp::SetResources {
-                    operation: None,
-                    prior,
-                    target: None
-                }
-                .recovery_hint(&inst.name)
+                after.record.last_operation_label(),
+                journaled.recovery_hint(&inst.name)
             )));
         }
         sidecar.requested_cpus = target.cpus;
@@ -1386,6 +1374,24 @@ impl AppleContainerBackend {
             prior,
             applied: target,
         })
+    }
+}
+
+/// How an interrupted resource change ended, for the reconcile warning only:
+/// the sidecar takes the runtime's values either way.
+fn resource_change_outcome(
+    operation: Option<&OperationId>,
+    record: &protocol::SandboxRecord,
+    prior: Resources,
+) -> &'static str {
+    let applied = match operation {
+        Some(op) => record.committed(op),
+        None => record.resources() != prior,
+    };
+    if applied {
+        "the change applied"
+    } else {
+        "the change did not apply"
     }
 }
 
@@ -1606,9 +1612,11 @@ impl VmBackend for AppleContainerBackend {
             }
             let rt = self.runtime()?;
             let _lock = state::lock_instance(inst)?;
-            if rt.exists(&machine)? {
-                let rec = rt.inspect(&machine)?;
-                if rec.status != SandboxStatus::Stopped {
+            // The listing, not `inspect`: the runtime refuses to inspect a
+            // sandbox whose staged disk update is unreadable, and destroying
+            // one must still work.
+            if let Some(status) = rt.listed(&machine)? {
+                if status != SandboxStatus::Stopped {
                     rt.stop_and_confirm(&machine)?;
                 }
                 let mut j = match journal {
@@ -1730,7 +1738,7 @@ impl VmBackend for AppleContainerBackend {
             bail!(AppleError::OperationUncertain(format!(
                 "sandbox {machine} reports a {} byte disk (last operation {}) after growing to {wanted}",
                 after.record.disk_bytes,
-                after.record.last_operation.as_deref().unwrap_or("none")
+                after.record.last_operation_label()
             )));
         }
         tracing::info!("Grew instance '{}' disk to {new_size} GiB", inst.name);

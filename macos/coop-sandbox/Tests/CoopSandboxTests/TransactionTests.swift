@@ -1,4 +1,6 @@
+import ContainerizationEXT4
 import Foundation
+import SystemPackage
 import Testing
 
 @testable import CoopSandboxCore
@@ -49,9 +51,9 @@ import Testing
         String(decoding: try Data(contentsOf: paths.rootfs), as: UTF8.self)
     }
 
-    /// Interrupt a grow's publication at each boundary. Reopening (a read,
-    /// then the next guarded operation's settle, twice) always yields the old
-    /// disk with the old record or the new disk with the new record.
+    /// Interrupt a grow's publication at each boundary; reads, repeated
+    /// settles, and reconcile always see the old disk with the old record or
+    /// the new disk with the new record.
     @Test(arguments: DiskUpdate.Fault.allCases)
     func interruptedPublicationRecoversToOneSide(_ fault: DiskUpdate.Fault) throws {
         let r = try root()
@@ -64,7 +66,7 @@ import Testing
         next.lastOperation = op
 
         #expect(throws: DiskUpdate.InjectedFault.self) {
-            try DiskUpdate.publish(paths, kind: .grow, operation: op, work: work, record: next, fault: fault)
+            try DiskUpdate.publish(paths, work: work, record: next, fault: fault)
         }
         let applied = fault == .afterRename || fault == .afterRecord
         func consistent() throws {
@@ -89,8 +91,8 @@ import Testing
         try consistent()
     }
 
-    /// Commit's metadata comes from the settled record, so a disk committed
-    /// after an interrupted grow records the grown size.
+    /// A guarded operation settles an interrupted grow into record.json
+    /// before its body runs.
     @Test func interruptedGrowSettlesBeforeTheNextOperationReadsTheRecord() async throws {
         let r = try root()
         let paths = try stoppedSandbox(r, "a")
@@ -100,7 +102,7 @@ import Testing
         var next = try paths.loadRecord()
         next.diskBytes = 16 << 30
         #expect(throws: DiskUpdate.InjectedFault.self) {
-            try DiskUpdate.publish(paths, kind: .grow, operation: op, work: work, record: next, fault: .afterRename)
+            try DiskUpdate.publish(paths, work: work, record: next, fault: .afterRename)
         }
         let seen = try await Sandboxes.mutating(paths) { try paths.readRecordFile().diskBytes }
         #expect(seen == 16 << 30)
@@ -129,7 +131,7 @@ import Testing
         let work = DiskUpdate.workDisk(paths, op)
         try Data("new".utf8).write(to: work)
         #expect(throws: DiskUpdate.InjectedFault.self) {
-            try DiskUpdate.publish(paths, kind: .grow, operation: op, work: work, record: try paths.loadRecord(), fault: .afterStaging)
+            try DiskUpdate.publish(paths, work: work, record: try paths.loadRecord(), fault: .afterStaging)
         }
         try FileManager.default.removeItem(at: work)
         try Data("other".utf8).write(to: work)
@@ -216,7 +218,7 @@ import Testing
         var next = try paths.loadRecord()
         next.diskGeneration = 5
         #expect(throws: DiskUpdate.InjectedFault.self) {
-            try DiskUpdate.publish(paths, kind: .restore, operation: op, work: work, record: next, fault: .afterRename)
+            try DiskUpdate.publish(paths, work: work, record: next, fault: .afterRename)
         }
         let fd = try await Owner.claim(root: r, id: try SandboxID("a"))
         defer { close(fd) }
@@ -346,5 +348,150 @@ import Testing
             #expect(throws: SandboxError.self) { try OperationID(bad) }
         }
         #expect(try OperationID(OperationID.random().rawValue).rawValue.count == 36)
+    }
+
+    /// A staged update, interrupted at `fault`, of `paths`' disk to 16 GiB.
+    func interruptedGrow(_ paths: SandboxPaths, at fault: DiskUpdate.Fault) throws -> URL {
+        let work = DiskUpdate.workDisk(paths, OperationID.random())
+        try Data("new".utf8).write(to: work)
+        var next = try paths.loadRecord()
+        next.diskBytes = 16 << 30
+        #expect(throws: DiskUpdate.InjectedFault.self) {
+            try DiskUpdate.publish(paths, work: work, record: next, fault: fault)
+        }
+        return work
+    }
+
+    /// Reconcile alone settles a staged update left at any boundary, into
+    /// whichever side the rename decided.
+    @Test(arguments: DiskUpdate.Fault.allCases)
+    func reconcileSettlesAStagedUpdate(_ fault: DiskUpdate.Fault) throws {
+        let r = try root()
+        let paths = try stoppedSandbox(r, "a")
+        let work = try interruptedGrow(paths, at: fault)
+        let actions = try Sandboxes.reconcile(root: r).filter { $0.id == "a" }.map(\.action)
+        #expect(actions == [fault == .beforeStaging ? "none" : "settled-disk-update"], "\(fault)")
+        let applied = fault == .afterRename || fault == .afterRecord
+        #expect(try paths.readRecordFile().diskBytes == (applied ? 16 << 30 : 8 << 30), "\(fault)")
+        #expect(try rootfs(paths) == (applied ? "new" : "old"), "\(fault)")
+        #expect(!FileManager.default.fileExists(atPath: paths.pendingDiskUpdate.path))
+        #expect(!FileManager.default.fileExists(atPath: work.path))
+    }
+
+    /// Reconcile leaves a sandbox whose guard is held alone, mid-publication
+    /// included, and settles it on a later run.
+    @Test func reconcileSkipsAGuardedSandbox() throws {
+        let r = try root()
+        let paths = try stoppedSandbox(r, "a")
+        let work = try interruptedGrow(paths, at: .afterStaging)
+        var held: FileLock? = try FileLock.acquire(paths.mutationLock, .exclusive)
+        let busy = try Sandboxes.reconcile(root: r).filter { $0.id == "a" }
+        #expect(busy.map(\.action) == ["skipped-mutation-in-progress"])
+        #expect(FileManager.default.fileExists(atPath: paths.pendingDiskUpdate.path))
+        #expect(FileManager.default.fileExists(atPath: work.path), "a guarded sandbox's scratch disk is kept")
+        held = nil
+        #expect(held == nil)
+        let later = try Sandboxes.reconcile(root: r).filter { $0.id == "a" }
+        #expect(later.map(\.action) == ["settled-disk-update"])
+        #expect(!FileManager.default.fileExists(atPath: work.path))
+    }
+
+    /// The scratch sweep keeps the prepared disk of an update it could not
+    /// resolve: removing it would be a guess.
+    @Test func reconcileKeepsTheScratchOfAnUnresolvedUpdate() throws {
+        let r = try root()
+        let paths = try stoppedSandbox(r, "a")
+        let work = try interruptedGrow(paths, at: .afterStaging)
+        try Data("{".utf8).write(to: paths.pendingDiskUpdate)
+        let actions = try Sandboxes.reconcile(root: r).filter { $0.id == "a" }.map(\.action)
+        #expect(actions.count == 1 && actions[0].hasPrefix("unresolved-disk-update"), "\(actions)")
+        #expect(FileManager.default.fileExists(atPath: work.path))
+    }
+
+    /// Staged state that contradicts itself or the sandbox is an error.
+    @Test func contradictoryStagedStatesAreErrors() throws {
+        struct Legacy: Codable {
+            var inode: UInt64
+            var record: SandboxRecord
+        }
+        let r = try root()
+        // Both a current and a legacy staged update.
+        let a = try stoppedSandbox(r, "a")
+        _ = try interruptedGrow(a, at: .afterStaging)
+        try JSONEncoder.pretty.encode(Legacy(inode: 1, record: try a.readRecordFile())).write(to: a.legacyPendingRestore)
+        #expect(throws: SandboxError.self) { try a.loadRecord() }
+        #expect(throws: SandboxError.self) { try DiskUpdate.settle(a) }
+        #expect(FileManager.default.fileExists(atPath: a.pendingDiskUpdate.path))
+        // A staged update for another sandbox.
+        let b = try stoppedSandbox(r, "b")
+        _ = try interruptedGrow(b, at: .afterStaging)
+        try FileManager.default.copyItem(at: a.legacyPendingRestore, to: b.legacyPendingRestore)
+        try FileManager.default.removeItem(at: b.pendingDiskUpdate)
+        #expect(throws: SandboxError.self) { try b.loadRecord() }
+        // A staged update without an installed disk.
+        let c = try stoppedSandbox(r, "c")
+        _ = try interruptedGrow(c, at: .afterStaging)
+        try FileManager.default.removeItem(at: c.rootfs)
+        #expect(throws: SandboxError.self) { try DiskUpdate.settle(c) }
+        #expect(FileManager.default.fileExists(atPath: c.pendingDiskUpdate.path))
+    }
+
+    /// A publication whose rename fails leaves nothing staged, and the old
+    /// disk and record stand.
+    @Test func failedRenameStagesNothing() throws {
+        let r = try root()
+        let paths = try stoppedSandbox(r, "a")
+        try FileManager.default.removeItem(at: paths.rootfs)
+        try FileManager.default.createDirectory(at: paths.rootfs.appendingPathComponent("occupied"), withIntermediateDirectories: true)
+        let work = DiskUpdate.workDisk(paths, OperationID.random())
+        try Data("new".utf8).write(to: work)
+        var next = try paths.readRecordFile()
+        next.diskBytes = 16 << 30
+        #expect(throws: SandboxError.self) { try DiskUpdate.publish(paths, work: work, record: next) }
+        #expect(!FileManager.default.fileExists(atPath: paths.pendingDiskUpdate.path))
+        #expect(FileManager.default.fileExists(atPath: work.path))
+        #expect(try paths.readRecordFile().diskBytes == 8 << 30)
+    }
+
+    /// `install` refuses a bad version or the init image before touching
+    /// `maintenance/`.
+    @Test func maintenanceInstallRefusesBadInputs() async throws {
+        let r = try initializedRoot()
+        for (reference, version) in [
+            ("local/m:1", ""), ("local/m:1", String(repeating: "a", count: 65)), (Disks.initImagePrefix + ":0.45.0", "1"),
+        ] {
+            do {
+                _ = try await Maintenance.install(root: r, reference: reference, version: version)
+                Issue.record("installed \(reference) \(version)")
+            } catch let error as SandboxError {
+                #expect(error.description.hasPrefix("invalid maintenance image"), "\(error)")
+            }
+        }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: r.maintenance.path).isEmpty)
+    }
+
+    /// The program check reads the unpacked image, following merged-/usr
+    /// symlinks, and names each program it lacks.
+    @Test func maintenanceProgramCheckFollowsMergedUsr() throws {
+        let r = try root()
+        let disk = r.root.appendingPathComponent("tools.ext4")
+        let fs = try EXT4.Formatter(FilePath(disk.path), minDiskSize: 32 * 1024 * 1024)
+        for dir in ["/usr", "/usr/bin", "/usr/sbin"] {
+            try fs.create(path: FilePath(dir), mode: EXT4.Inode.Mode(.S_IFDIR, 0o755))
+        }
+        try fs.create(path: FilePath("/bin"), link: FilePath("usr/bin"), mode: EXT4.Inode.Mode(.S_IFLNK, 0o777))
+        try fs.create(path: FilePath("/sbin"), link: FilePath("usr/sbin"), mode: EXT4.Inode.Mode(.S_IFLNK, 0o777))
+        for file in ["/usr/bin/sh", "/usr/bin/rm", "/usr/bin/sync", "/usr/sbin/e2fsck"] {
+            try fs.create(path: FilePath(file), mode: EXT4.Inode.Mode(.S_IFREG, 0o755))
+        }
+        try fs.close()
+        #expect(try Maintenance.missingPrograms(in: disk) == ["/sbin/resize2fs"])
+    }
+
+    @Test func layerSizesSaturateInsteadOfOverflowing() throws {
+        #expect(Maintenance.packedBytes([10, -5, 20]) == 30)
+        let absurd = Maintenance.packedBytes([Int64.max, Int64.max, Int64.max])
+        #expect(absurd == Maintenance.maxPackedBytes + 1)
+        #expect(throws: SandboxError.self) { try Maintenance.capacity(packedBytes: absurd) }
     }
 }

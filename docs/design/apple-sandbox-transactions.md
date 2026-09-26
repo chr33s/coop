@@ -37,7 +37,7 @@ lifecycle, disks, resources, or recovery is reviewed against them.
 | INV-04 | An interrupted forward update or rollback stays recoverable; neither silently leaves Rust and Swift records inconsistent. |
 | INV-05 | A rollback never overwrites a newer successful operation. |
 | INV-06 | Mutations of one sandbox serialize at the runtime boundary; mutations of different sandboxes stay concurrent. |
-| INV-07 | A new SSH host key is enrolled only on first provisioning or after a correlated, coop-authorized restore. A disk-generation increase alone is not authorization. |
+| INV-07 | A new SSH host key is enrolled only on first provisioning or after a correlated, coop-authorized restore. A disk-generation increase alone is not authorization, except for a restore journal written before operation ids (§3.4). |
 | INV-08 | Runtime qualification, effective-configuration verification, and SSH readiness stay separate checks. |
 | INV-09 | Maintenance runs trusted tools from a separate boot image, never programs from the guest-controlled target disk. |
 | INV-10 | Cleanup and stopping remain available when qualification or safe SSH hand-out fails, subject to ownership checks. |
@@ -70,7 +70,7 @@ operation (`.update-<op>.ext4`). They then publish through one path:
 2. Rename the disk over `rootfs.ext4`. This is the commit point.
 3. Write `record.json` and drop the staged copy.
 
-Recovery (`DiskUpdate.settle`) runs from four places: the next guarded
+Recovery (`DiskUpdate.settle`) runs from three places: the next guarded
 operation on the sandbox, the owner's claim, or `reconcile`.
 
 - **Staged inode installed:** it finishes step 3.
@@ -135,7 +135,7 @@ One function carries both the forward change and the rollback:
 
 1. Takes the instance lock and reconciles any earlier journal.
 2. Confirms the sandbox is stopped.
-3. Journals a `SetResources` entry (operation id, prior values, target values).
+3. Journals a `SetResources` entry (operation id and prior values).
 4. Sends `coop-sandbox set --operation <id>`.
 5. Requires the read-back to show both the target values and
    `lastOperation == id`.
@@ -157,8 +157,10 @@ runtime checks it again under its guard (`--expect-operation`).
 
 **Restore.** `restore` journals an operation id. coop re-pins the host key
 after an interrupted restore only when the runtime's last operation is that
-id and the generation rose. Journals written before operation ids fall back
-to the generation check.
+id and the generation rose. A journal written before operation ids (left
+by a crash under an earlier build) falls back to the generation check alone.
+That fallback is still coop's own journaled restore, and the guest cannot
+cause it.
 
 **Grow.** `grow` also passes an id and checks it on read-back. coop keeps no
 grow journal: the runtime's disk update is self-recovering, and nothing coop
@@ -198,7 +200,7 @@ instead of parallel `Operation`/`JournalOp`/`Stage` types. Journals in the
 earlier flat layout are converted by a narrow adapter (`state::legacy`).
 Contradictory combinations are refused with a recovery hint, never dropped.
 
-**Sidecar.** `CreationState` is gone. Old sidecars carrying
+**Sidecar.** There is no creation-state field. Old sidecars carrying
 `"creation_state": "ready"` still load, because the field is ignored.
 
 **Boot sequence.**
@@ -238,15 +240,24 @@ mutation/recovery paths.
   - delete waiting for an in-flight mutation;
   - a clone waiting for a committed-disk publication;
   - the `--expect-operation` precondition;
-  - growth without a maintenance image failing before publication.
+  - growth without a maintenance image failing before publication;
+  - reconcile settling a staged update at each boundary, skipping a guarded
+    sandbox, and keeping the scratch disk of an unresolved update;
+  - maintenance install input checks, the merged-/usr program check, and
+    saturating layer sizes.
 - **Adapter (`tests.rs`, `state.rs`):**
   - resource-change recovery on both sides of the runtime update and the
     sidecar write;
   - rollback refused over a newer change;
   - no rollback without a confirmed stop;
   - an interrupted rollback reconciled from its journal;
+  - each rollback precondition term refusing on its own;
+  - grow and restore accepted only with their own committed operation;
   - restore re-pinning only for coop's own operation;
-  - legacy journal and sidecar compatibility.
+  - destroy working when the runtime cannot inspect the sandbox;
+  - maintenance install, reinstall, and failure cleanup in setup;
+  - legacy journal (every flat-layout combination) and sidecar
+    compatibility.
 - **Real hardware (`tests/integration-apple-sandbox.sh`):**
   - maintenance install, and survival after its store image is deleted;
   - two concurrent grows of one sandbox applying once;
@@ -259,11 +270,11 @@ mutation/recovery paths.
   (covered at unit level by failure injection);
 - sudden power loss.
 
-**Recorded run.** The only real-hardware run of this design so far:
+**Recorded run.** The latest real-hardware run of this design:
 
 | Field | Value |
 | --- | --- |
-| Tree | uncommitted working tree on `ad7f9fe` |
+| Tree | `c1b1b80` plus its closeout-review fixes (uncommitted when run); `c1b1b80` itself also passed |
 | Hardware | Apple M5 Max |
 | OS | macOS 27.0 (26A428) |
 | Toolchain | `container` 1.4.1, `containerization` 0.45.0, Swift 6.4 |

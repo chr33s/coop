@@ -80,7 +80,7 @@ It builds the Swift package in release mode, signs it ad hoc with its one entitl
 | coop-sandbox | containerization | macOS | Hardware | Evidence |
 |---|---|---|---|---|
 | 0.2.0 (protocol 2) | 0.45.0 | 27.0 | Apple Silicon | [`tests/integration-apple-sandbox.sh`](../tests/integration-apple-sandbox.sh) (all phases, including maintenance install and same-sandbox races): 76 passed, 1 skipped by design ([run record](design/apple-sandbox-transactions.md#4-validation)); coop end to end not yet re-run |
-| 0.1.0 (protocol 1) | 0.45.0 | 27.0 | Apple Silicon | [`tests/integration-apple-sandbox.sh`](../tests/integration-apple-sandbox.sh) (isolation, host exposure, canary, pinning, persistence, resources, growth, commit/restore, crash recovery, concurrency), coop `setup`/`up`/`exec`/`stop`/`resize`/`commit`/`restore`/`destroy` end to end |
+| 0.1.0 (protocol 1), refused since protocol 2 | 0.45.0 | 27.0 | Apple Silicon | [`tests/integration-apple-sandbox.sh`](../tests/integration-apple-sandbox.sh) (isolation, host exposure, canary, pinning, persistence, resources, growth, commit/restore, crash recovery, concurrency), coop `setup`/`up`/`exec`/`stop`/`resize`/`commit`/`restore`/`destroy` end to end |
 
 The runtime also pins its guest kernel by sha256 (`vmlinux-6.18.15-186`, the kernel `container` 1.4.1 installs) and its init image (`vminit:0.45.0` by digest). `coop setup` fails with `APPLE_RUNTIME_UNAVAILABLE` on any other kernel.
 
@@ -93,7 +93,7 @@ The runtime also pins its guest kernel by sha256 (`vmlinux-6.18.15-186`, the ker
 # kernel = "/absolute/path/to/vmlinux"   # must be a kernel the runtime pins
 probe_timeout_seconds = 10     # version, inspect, list
 operation_timeout_seconds = 60 # resource changes, deletes, guest commands
-create_timeout_seconds = 600   # create (first unpack of an image), grow, commit, restore, init
+create_timeout_seconds = 600   # create (first unpack of an image), grow, commit, restore, init, maintenance install
 boot_timeout_seconds = 120     # boot to SSH-ready
 stop_timeout_seconds = 90      # clean systemd shutdown
 build_timeout_seconds = 3600   # image build; `setup --builder-timeout` overrides
@@ -108,7 +108,7 @@ The feature build defaults to `~/.coop-apple` for its config file and data direc
 - `owner.json` (installation owner ID) and `vm_key`
 - `images/<name>/`: `template-config.json`, `apple-image.json`, and `build.log`
 - `instances/<name>/`: `apple-machine.json`, `known_hosts`, `operation.json` while a mutation is pending, and the shared sidecars
-- `runtime/`, the coop-sandbox state root: kernel, init filesystem, private OCI store, cached base disks, committed disks, and one directory per sandbox (disk, record, console and owner logs, launchd plist)
+- `runtime/`, the coop-sandbox state root: kernel, init filesystem, private OCI store, cached base disks, committed disks, the maintenance boot disk (`maintenance/`), lock files (`locks/`), and one directory per sandbox (disk, record, console and owner logs, launchd plist)
 
 Control files are `0600`, directories `0700`. `uninstall --purge` destroys every instance, then removes all of `~/.coop-apple` when that is the data directory, and otherwise only `backends/apple-container-v1/`. Workspace copies always skip `.coop-apple/`. Editor `~/.ssh/config` entries use `coop-apple-<name>` aliases inside `# coop-apple START/END` markers, so the two builds never touch each other's entries. Because a default-build instance named `apple-<x>` has the same alias as this build's `<x>`, each build refuses to write an alias the other already manages. The data directory path may contain spaces (SSH options are quoted) but not quote or control characters.
 
@@ -164,7 +164,7 @@ All three need the instance stopped.
 - **`coop resize --size`** grows the disk offline. The runtime clones the disk, extends it, and runs `e2fsck`/`resize2fs` in a short maintenance VM, with the instance's disk attached as data. It then publishes the grown disk and its new size as one recoverable update (a crash between the two is finished by the runtime's next operation on the sandbox), so this takes about a second. Shrinking is refused.
 - **Maintenance image.** Maintenance VMs boot their own small image (Ubuntu with e2fsprogs), which `coop setup` builds with the stock builder and installs into the runtime outside its image store, then removes from the store. It does not depend on any instance's image, so deleting or replacing images never affects growth or commits. `coop setup` reinstalls it when its recipe version changes.
 - **`coop commit --image <name>`** saves an APFS clone of the disk with its SSH host keys and machine-id removed. `coop up --image <name>` and `coop restore` then clone it, and every instance created from it generates its own identity.
-- **`coop restore`** swaps in a clone of a committed disk, or a fresh copy of a base image with `--reprovision`. It then grows the new disk back to the instance's size if that is larger. The operation is journaled: a restore interrupted by a crash is reconciled on the next `coop start` from the runtime's record, and it re-pins the host key only if the runtime's last committed operation is that restore (a higher disk generation alone is not enough).
+- **`coop restore`** swaps in a clone of a committed disk, or a fresh copy of a base image with `--reprovision`. It then grows the new disk back to the instance's size if that is larger. The operation is journaled: a restore interrupted by a crash is reconciled on the next `coop start` from the runtime's record, and it re-pins the host key only if the runtime's last committed operation is that restore (a higher disk generation alone is not enough, except for a restore journal written before operation ids).
 
 ### Stop, destroy, recovery
 
@@ -194,7 +194,7 @@ Runtime and builder commands run with a cleared environment: only `HOME`, `USER`
 
 ### Validation status
 
-Validated on macOS 27.0 (Apple M5 Max) with coop-sandbox 0.1.0 and containerization 0.45.0:
+Validated on macOS 27.0 (Apple M5 Max) with coop-sandbox 0.1.0 and containerization 0.45.0. Runtime 0.2.0 has re-run only the runtime suite; see the table above.
 
 - **Runtime ([`tests/integration-apple-sandbox.sh`](../tests/integration-apple-sandbox.sh); the selection experiment is in [`design/apple-sandbox-runtime.md`](design/apple-sandbox-runtime.md)):**
   - Peer isolation: a root guest cannot reach another sandbox by TCP, UDP, or ICMP over IPv4 or IPv6. That holds with forged on-link routes, static neighbour entries, spoofed source addresses, and broadcast/multicast, and after restarts; the host reaches each listener as the positive control.

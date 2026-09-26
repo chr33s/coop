@@ -384,9 +384,13 @@ exposure, and coop verifies the effective configuration anyway
 - **Host-key pinning and re-enrollment.** A changed key fails with
   `APPLE_HOST_KEY_CHANGED`. The only path that replaces a pin is a start after
   `coop restore`: coop replaced the disk itself, and the restore removed the
-  host keys. That path is journaled. After a crash, the runtime's disk
-  generation counter must prove the disk was replaced before the flag is set.
-  Flag any other path that re-enrolls.
+  host keys. That path is journaled with an operation id. After a crash, the
+  runtime's record must show both a higher disk generation and that
+  operation as its last committed one before the flag is set. The one
+  exception: a restore journal written before operation ids (a crash under
+  an earlier build) falls back to the generation check alone. It is still
+  coop's own journaled restore, never something the guest can cause. Flag
+  any other path that re-enrolls.
 - **Runtime subprocesses** get a cleared environment. Only `HOME`, `USER`,
   `LOGNAME`, `TMPDIR`, locale, and a fixed `PATH` are passed (`cli.rs`), so
   `SSH_AUTH_SOCK`, provider and GitHub tokens, `DYLD_*`, and `CONTAINER_*`
@@ -442,10 +446,12 @@ exposure, and coop verifies the effective configuration anyway
     guard covers owner startup, including launchd respawns);
   - a rollback never overwrites a newer change;
   - a host key is re-pinned only after a restore correlated with coop's own
-    operation id, never on a disk-generation increase alone.
+    operation id. The only exception is the pre-operation-id journal fallback
+    described under host-key pinning above.
 
-  Weakening any of these (skipping the guard, re-pinning on generation alone,
-  guessing at unreadable staged state) is a finding.
+  Weakening any of these (skipping the guard, re-pinning on generation alone
+  outside that fallback, or guessing at unreadable staged state) is a
+  finding.
 
 ## `coop update` trust chain
 

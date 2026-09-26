@@ -158,21 +158,32 @@ what unit tests cannot:
   secret in the caller's environment;
 - pinned SSH over the native channel;
 - stop/start persistence, CPU/memory changes, disk sizes and offline growth,
-  commit/restore (including a guest that disables its own `rm`), crash
-  recovery with launchd respawn, and concurrent sandboxes;
+  commit/restore (including a guest that disables its own `rm`), and crash
+  recovery with launchd respawn;
+- interrupted mutations: a `grow`, `commit`, or `restore` client killed at
+  fractions of its uninterrupted duration (`KILL_FRACTIONS`) must reconcile
+  to the old or the new state, with no staged or scratch files and a record
+  that matches the installed disk;
+- rounds of 1, 4, and 8 sandboxes booted at once (`CONCURRENCY`), each
+  running the full peer probe against a fixed peer and its ring neighbour
+  in parallel;
 - the maintenance image (install, and survival after its store image is
   deleted) and same-sandbox races (concurrent grows, start against grow);
 - `coop` itself end to end (the `coop` phase): `setup`, `up`, `status`,
   `exec`, `stop`/`start`, `resize --mem/--vcpus/--size`, rollback of a
   `resize --start` whose boot fails, `commit`, `restore` with host-key
-  re-pinning, `destroy`, and image deletion.
+  re-pinning, `destroy`, and image deletion. The phase also checks coop's
+  own sandbox for host mounts, agent forwarding, and canary leakage. It
+  requires coop to refuse a changed host key and a restore it did not
+  make. It kills `coop restore` and `coop resize --size` partway
+  (`COOP_KILL_FRACTIONS`), and the next `start` must recover.
 
 It builds the runtime, a small test image (`tests/fixtures/apple-sandbox/`),
 and an `apple-container` build of coop, all under a temporary work directory,
 and removes its state root, sandboxes, and images on exit:
 
 ```bash
-./tests/integration-apple-sandbox.sh                   # ~10 min
+./tests/integration-apple-sandbox.sh                   # ~20 min
 ./tests/integration-apple-sandbox.sh --only isolation,snapshots
 ```
 

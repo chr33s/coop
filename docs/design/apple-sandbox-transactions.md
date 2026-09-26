@@ -253,25 +253,34 @@ mutation/recovery paths.
 - **Real hardware (`tests/integration-apple-sandbox.sh`):**
   - maintenance install, and survival after its store image is deleted;
   - two concurrent grows of one sandbox applying once;
-  - a start racing a grow serializing to one valid outcome.
+  - a start racing a grow serializing to one valid outcome;
+  - `grow`, `commit`, and `restore` clients killed at fractions of their uninterrupted duration,
+    each reconciling to one committed state;
+  - `coop restore` and `coop resize --size` killed partway, with the next
+    `coop start` recovering;
+  - an out-of-band runtime restore refused as host-key authorization.
 
 **Not covered by automation:**
 
 - an application image over 4 GiB of unpacked content;
-- a crash between the disk rename and the record write inside a real grow
-  (covered at unit level by failure injection);
+- a deterministic crash between the disk rename and the record write inside
+  a real grow (covered at unit level by failure injection; the real-hardware
+  kills land wherever the delay falls);
 - sudden power loss.
 
 **Recorded run.** The latest real-hardware run of this design:
 
 | Field | Value |
 | --- | --- |
-| Tree | `4a9050b` plus its review fixes (uncommitted when run) |
+| Tree | `2e1bf20` plus the expanded suite (uncommitted when run) |
 | Hardware | Apple M5 Max |
 | OS | macOS 27.0 (26A428) |
 | Toolchain | `container` 1.4.1, `containerization` 0.45.0, Swift 6.4 |
-| Command | `./tests/integration-apple-sandbox.sh` (all phases) |
-| Result | 103 passed, 0 failed, 1 skipped: host services on the NAT gateway, reachable by design (includes the `coop` end-to-end phase) |
+| Command | `./tests/integration-apple-sandbox.sh` (all phases), then `--only recovery,coop` |
+| Result | All phases: 154 passed, 1 failed, 1 skipped. The failure was the coop-phase canary check matching its own command line in the guest's sudo journal; with that fixed, `recovery,coop` passed 89 of 89. The skip is host services on the NAT gateway, reachable by design. |
+
+Killed operations in the `recovery,coop` run: 3 of 7 grows, 5 of 7 commits,
+and 2 of 7 restores had applied when killed; every one settled consistently.
 
 The coop-level `./tests/run-integration.sh` (Lima, and Firecracker remotely)
 was not run for this change.

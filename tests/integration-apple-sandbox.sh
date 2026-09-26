@@ -7,12 +7,15 @@ set -uo pipefail
 # (docs/trust-model.md): peer isolation between sandboxes, no host mounts,
 # agent sockets, or canary leakage, pinned SSH over the native channel, and
 # the lifecycle (persistence, resources, disk growth, commit/restore, crash
-# recovery, concurrency).
+# recovery and interrupted mutations, concurrency).
 #
 # Usage: tests/integration-apple-sandbox.sh [--only PHASE[,PHASE...]] [--keep]
 #   Phases: setup disks machine isolation exposure identity persistence
 #           resources growth snapshots recovery concurrency coop
-#   CYCLES=5 stop/start cycles; CONCURRENT=4 sandboxes.
+#   CYCLES=5 stop/start cycles; CONCURRENCY="1 4 8" sandboxes per round;
+#   KILL_FRACTIONS="50 75 90 95 100 105 110": an interrupted mutation is
+#   killed at these percentages of the time an uninterrupted one took;
+#   COOP_KILL_FRACTIONS="25 50 75" the same for coop's.
 #
 # Needs Apple Silicon, macOS 26+, Swift 6.2+, jq, and stock Apple `container`
 # with its service running (builds the test image, supplies the kernel). It
@@ -30,7 +33,7 @@ for candidate in /usr/local/bin/container /opt/homebrew/bin/container; do
     [[ -x "$candidate" ]] && { CONTAINER="$candidate"; break; }
 done
 [[ -n "$CONTAINER" ]] || { echo "SKIP: no Apple container CLI installed"; exit 0; }
-for tool in swift cargo jq ssh ssh-keygen nc openssl; do
+for tool in swift cargo jq ssh ssh-keygen nc openssl python3; do
     command -v "$tool" >/dev/null || { echo "Missing prerequisite: $tool" >&2; exit 1; }
 done
 
@@ -54,7 +57,9 @@ IMAGE="local/coop-sandbox-test:$RUN"
 MAINTENANCE="local/coop-sandbox-test-maintenance:$RUN"
 SANDBOX="$WORK/bin/coop-sandbox"
 CYCLES="${CYCLES:-5}"
-CONCURRENT="${CONCURRENT:-4}"
+CONCURRENCY="${CONCURRENCY:-1 4 8}"
+KILL_FRACTIONS="${KILL_FRACTIONS:-50 75 90 95 100 105 110}"
+COOP_KILL_FRACTIONS="${COOP_KILL_FRACTIONS:-25 50 75}"
 # A secret that exists only in this script's environment; it must never reach
 # the runtime, its logs, the image, or a guest.
 CANARY="coop-test-canary-$(openssl rand -hex 16)"
@@ -80,6 +85,22 @@ fail() {
 skip() {
     skip_count=$((skip_count + 1))
     echo "  SKIP  $1${2:+ ($2)}"
+}
+
+now_ms() { python3 -c 'import time; print(int(time.time() * 1000))'; }
+
+# timed_ms CMD...: run CMD and print how long it took, in milliseconds.
+timed_ms() {
+    local t0
+    t0="$(now_ms)"
+    "$@" >/dev/null 2>&1
+    echo $(($(now_ms) - t0))
+}
+
+# delay_s MS PERCENT: PERCENT of MS, as seconds for sleep.
+delay_s() {
+    local ms=$(($1 * $2 / 100))
+    printf '%d.%03d' $((ms / 1000)) $((ms % 1000))
 }
 
 check() {
@@ -137,6 +158,46 @@ ready() {
 
 boot() { sbx start "$1" >/dev/null && ready "$1"; }
 verify() { guest "$1" /usr/local/sbin/coop-test-verify; }
+
+# ── Peer isolation probes ─────────────────────────────────────
+
+# peer-probe.sh prints at least this many results; fewer means it failed.
+MIN_PROBES=17
+
+# listeners TARGET: TCP/UDP echo on 7777/7778 as systemd units.
+listeners() {
+    guest "$1" sh -c '
+        sysctl -qw net.ipv4.icmp_echo_ignore_broadcasts=0
+        systemctl is-active --quiet coop-test-tcp || systemd-run --quiet --unit=coop-test-tcp socat TCP6-LISTEN:7777,ipv6only=0,fork,reuseaddr SYSTEM:"echo pong"
+        systemctl is-active --quiet coop-test-udp || systemd-run --quiet --unit=coop-test-udp socat UDP6-RECVFROM:7778,ipv6only=0,fork SYSTEM:"echo upong"' >/dev/null
+    sleep 0.5
+}
+
+# probe_pair ATTACKER TARGET: prints "REACHED|HOST_MISSES|PROBES". The target
+# must already run listeners. Probes rewrite the attacker's routes and
+# addresses, so one attacker runs one probe_pair at a time.
+probe_pair() {
+    local from="$1" to="$2" t4 t6 mac ll results reached host
+    t4="$(ip4 "$to")"
+    t6="$(ip6 "$to")"
+    mac="$(guest "$to" cat /sys/class/net/eth0/address)"
+    ll="$(guest "$to" ip -6 -o addr show eth0 scope link | awk '{print $4}' | cut -d/ -f1 | head -1)"
+    guest_in "$from" sh -c 'cat > /tmp/probe.sh && chmod +x /tmp/probe.sh' <"$FIXTURES/peer-probe.sh"
+    results="$(guest "$from" /tmp/probe.sh "$t4" "$t6" "$mac" "$ll")"
+    reached="$(jq -rs '[.[] | select(.reached) | .probe] | join(",")' <<<"$results")"
+    # TCP and IPv6 replies reach host sockets; IPv4 UDP/ICMP replies from
+    # vmnet guests do not on macOS, so those are not host controls.
+    host="$("$FIXTURES/host-probe.sh" "$t4" "$t6" | jq -r '[to_entries[] | select(.value == false and (.key | IN("ipv4-icmp","ipv4-udp") | not)) | .key] | join(",")')"
+    echo "$reached|$host|$(grep -c '"probe"' <<<"$results")"
+}
+
+# isolated RESULT: a probe_pair result with every vector blocked, every host
+# control answered, and the full probe set run.
+isolated() {
+    local reached host n
+    IFS='|' read -r reached host n <<<"$1"
+    [[ -z "$reached" && -z "$host" && "${n:-0}" -ge $MIN_PROBES ]]
+}
 
 cleanup() {
     local rc=$?
@@ -312,31 +373,18 @@ fi
 if want isolation; then
     echo ""
     echo "=== Phase: isolation ==="
-    # listeners TARGET: TCP/UDP echo on 7777/7778 as systemd units.
-    listeners() {
-        guest "$1" sh -c '
-            sysctl -qw net.ipv4.icmp_echo_ignore_broadcasts=0
-            systemctl is-active --quiet coop-test-tcp || systemd-run --quiet --unit=coop-test-tcp socat TCP6-LISTEN:7777,ipv6only=0,fork,reuseaddr SYSTEM:"echo pong"
-            systemctl is-active --quiet coop-test-udp || systemd-run --quiet --unit=coop-test-udp socat UDP6-RECVFROM:7778,ipv6only=0,fork SYSTEM:"echo upong"' >/dev/null
-        sleep 0.5
-    }
     # probe ATTACKER TARGET LABEL: every vector blocked, host control reaches the target.
     probe() {
-        local from="$1" to="$2" label="$3" t4 t6 mac ll reached host
-        listeners "$to"
-        t4="$(ip4 "$to")"
-        t6="$(ip6 "$to")"
-        mac="$(guest "$to" cat /sys/class/net/eth0/address)"
-        ll="$(guest "$to" ip -6 -o addr show eth0 scope link | awk '{print $4}' | cut -d/ -f1 | head -1)"
-        guest_in "$from" sh -c 'cat > /tmp/probe.sh && chmod +x /tmp/probe.sh' <"$FIXTURES/peer-probe.sh"
-        reached="$(guest "$from" /tmp/probe.sh "$t4" "$t6" "$mac" "$ll" | jq -rs '[.[] | select(.reached) | .probe] | join(",")')"
-        # TCP and IPv6 replies reach host sockets; IPv4 UDP/ICMP replies from
-        # vmnet guests do not on macOS, so those are not host controls.
-        host="$("$FIXTURES/host-probe.sh" "$t4" "$t6" | jq -r '[to_entries[] | select(.value == false and (.key | IN("ipv4-icmp","ipv4-udp") | not)) | .key] | join(",")')"
+        local label="$3" result reached host n
+        listeners "$2"
+        result="$(probe_pair "$1" "$2")"
+        IFS='|' read -r reached host n <<<"$result"
         if [[ -n "$reached" ]]; then
             fail "$label: guest blocked on every vector" "reached via $reached"
         elif [[ -n "$host" ]]; then
             fail "$label: host positive control reaches the target" "no reply over $host"
+        elif [[ "${n:-0}" -lt $MIN_PROBES ]]; then
+            fail "$label: the probe ran" "only ${n:-0} of at least $MIN_PROBES results"
         else
             pass "$label: TCP/UDP/ICMP over IPv4/IPv6, forged routes, static neighbours, spoofed source, broadcast/multicast all blocked"
         fi
@@ -574,32 +622,198 @@ if want recovery; then
     check "reconcile removes an uncommitted create" jq -e 'any(.action == "removed-uncommitted-create")' <<<"$(sbx reconcile)"
     check "delete refuses another owner" refuses sbx delete "$r" --owner someone-else
     check "delete removes the sandbox" sbx delete "$r" --owner "$RUN"
+
+    # Interrupted mutations: SIGKILL the client of a grow, commit, or restore
+    # at fractions of its uninterrupted duration, then reconcile. No staged
+    # or scratch state may remain, and the record must describe the installed
+    # disk
+    # (docs/design/apple-sandbox-transactions.md INV-03, INV-04).
+    t="$(name txn)"
+    tdir="$ROOT/sandboxes/$t"
+    create "$t"
+    boot "$t"
+    guest "$t" sh -c 'echo base > /var/lib/coop-test/txn && sync'
+    sbx stop "$t"
+    sbx commit "$t" txn-base >/dev/null
+    rec() { sbx inspect "$t" | jq -r ".record.$1"; }
+    # interrupt DELAY CMD...: run CMD, SIGKILL it after DELAY seconds, reconcile.
+    interrupt() {
+        local d="$1" pid
+        shift
+        "$@" >/dev/null 2>&1 &
+        pid=$!
+        sleep "$d"
+        kill -9 "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null
+        sbx reconcile >/dev/null
+    }
+    settled() {
+        [[ ! -e "$tdir/disk-update.pending.json" ]] &&
+            [[ -z "$(find "$tdir" "$ROOT/disks" -maxdepth 1 \( -name '.update-*' -o -name '.tmp-*' -o -name '.pending-*' \
+                -o -name '.grow-*' -o -name '.restore-*' -o -name '.maintenance-*' \) 2>/dev/null)" ]]
+    }
+    # The installed disk file: inode and size. `create` sizes it from the
+    # image unpacker, so only a disk a grow or restore installed has exactly
+    # the recorded size.
+    disk() { stat -f '%i %z' "$tdir/rootfs.ext4"; }
+    # installed APPLIED BEFORE: an applied update installed a new disk of the
+    # recorded size; any other outcome left the previous disk in place.
+    installed() {
+        local now inode size
+        now="$(disk)"
+        read -r inode size <<<"$now"
+        if (($1)); then
+            test "${inode}" != "${2%% *}" -a "$size" = "$(rec diskBytes)"
+        else
+            test "$now" = "$2"
+        fi
+    }
+    fs_matches_record() {
+        local size
+        size="$(guest "$t" df -B1 --output=size / | tail -1 | xargs)"
+        test "${size:-0}" -ge $(($(rec diskBytes) * 95 / 100)) -a "${size:-0}" -le "$(rec diskBytes)"
+    }
+
+    ms="$(timed_ms sbx grow "$t" --disk-gib 9)"
+    bad=""
+    applied=0
+    tries=0
+    for f in $KILL_FRACTIONS; do
+        d="$(delay_s "$ms" "$f")"
+        tries=$((tries + 1))
+        op="grow-$RUN-$tries"
+        before="$(rec diskBytes)"
+        file="$(disk)"
+        target=$((before / 1073741824 + 2))
+        interrupt "$d" "$SANDBOX" grow --root "$ROOT" "$t" --disk-gib "$target" --operation "$op"
+        settled || bad+=" unsettled@$d"
+        if [[ "$(rec lastOperation)" == "$op" ]]; then
+            applied=$((applied + 1))
+            [[ "$(rec diskBytes)" == $((target * 1073741824)) ]] || bad+=" record@$d"
+            installed 1 "$file" || bad+=" disk@$d"
+        else
+            [[ "$(rec diskBytes)" == "$before" ]] || bad+=" record@$d"
+            installed 0 "$file" || bad+=" disk@$d"
+        fi
+    done
+    label="killed grows settle to the old or the new disk ($applied of $tries applied; uninterrupted ${ms} ms)"
+    if [[ -z "$bad" ]]; then pass "$label"; else fail "$label" "$bad"; fi
+    # Timed here, while the disk still holds the base content.
+    restore_ms="$(timed_ms sbx restore "$t" txn-base)"
+    check "the sandbox boots after the interrupted grows" boot "$t"
+    check "its filesystem matches the recorded disk size" fs_matches_record
+    guest "$t" sh -c 'echo newer > /var/lib/coop-test/txn && sync'
+    sbx stop "$t"
+
+    ms="$(timed_ms sbx commit "$t" txn-timed)"
+    sbx2 disk delete txn-timed
+    bad=""
+    applied=0
+    tries=0
+    for f in $KILL_FRACTIONS; do
+        d="$(delay_s "$ms" "$f")"
+        tries=$((tries + 1))
+        interrupt "$d" "$SANDBOX" commit --root "$ROOT" "$t" "txn-c$tries"
+        settled || bad+=" unsettled@$d"
+        disk="$ROOT/disks/txn-c$tries"
+        if [[ -e "$disk.ext4" && -e "$disk.json" ]]; then
+            applied=$((applied + 1))
+            sbx2 disk delete "txn-c$tries"
+        elif [[ -e "$disk.ext4" || -e "$disk.json" ]]; then
+            bad+=" half-published@$d"
+        fi
+    done
+    label="killed commits publish a whole disk or none ($applied of $tries applied; uninterrupted ${ms} ms)"
+    if [[ -z "$bad" ]]; then pass "$label"; else fail "$label" "$bad"; fi
+
+    ms="$restore_ms"
+    bad=""
+    applied=0
+    tries=0
+    for f in $KILL_FRACTIONS; do
+        d="$(delay_s "$ms" "$f")"
+        tries=$((tries + 1))
+        op="restore-$RUN-$tries"
+        gen="$(rec diskGeneration)"
+        file="$(disk)"
+        interrupt "$d" "$SANDBOX" restore --root "$ROOT" "$t" txn-base --operation "$op"
+        settled || bad+=" unsettled@$d"
+        if [[ "$(rec lastOperation)" == "$op" ]]; then
+            applied=$((applied + 1))
+            [[ "$(rec diskGeneration)" == $((gen + 1)) ]] || bad+=" generation@$d"
+            # Not size: a restore keeps a committed disk's own size when it
+            # needs no growth.
+            [[ "$(disk | cut -d' ' -f1)" != "${file%% *}" ]] || bad+=" disk@$d"
+        else
+            [[ "$(rec diskGeneration)" == "$gen" ]] || bad+=" generation@$d"
+            installed 0 "$file" || bad+=" disk@$d"
+        fi
+    done
+    label="killed restores settle to the old or the new disk ($applied of $tries applied; uninterrupted ${ms} ms)"
+    if [[ -z "$bad" ]]; then pass "$label"; else fail "$label" "$bad"; fi
+    check "the sandbox boots after the interrupted restores" boot "$t"
+    expected=newer
+    ((applied > 0)) && expected=base
+    check "its content is the $expected disk the record describes" test "$(guest "$t" cat /var/lib/coop-test/txn)" = "$expected"
+    check "its filesystem matches the recorded disk size" fs_matches_record
+    sbx stop "$t"
+    check "an uninterrupted grow still applies" sbx grow "$t" --disk-gib $(($(rec diskBytes) / 1073741824 + 1))
+    sbx delete "$t" --owner "$RUN"
+    sbx2 disk delete txn-base
 fi
 
 if want concurrency; then
     echo ""
     echo "=== Phase: concurrency ==="
-    sbx stop "$A"; sbx stop "$B"
-    names=()
-    for ((i = 1; i <= CONCURRENT; i++)); do
-        names+=("$(name "c$i")")
-        create "$(name "c$i")"
+    # Each round boots COUNT sandboxes at once beside B, the fixed peer, so a
+    # one-sandbox round still has a neighbour. Every new sandbox attacks B and
+    # its ring successor, and B attacks the first, with the full peer probe.
+    # Attackers run in parallel; each one's probes run in sequence.
+    sbx stop "$A" >/dev/null 2>&1
+    [[ "$(state "$B")" == running ]] || boot "$B"
+    listeners "$B"
+    for count in $CONCURRENCY; do
+        names=()
+        for ((i = 1; i <= count; i++)); do
+            names+=("$(name "n${count}c$i")")
+            create "$(name "n${count}c$i")" 2 1024 8
+        done
+        for n in "${names[@]}"; do sbx start "$n" >/dev/null & done
+        wait
+        all=1
+        for n in "${names[@]}"; do ready "$n" || all=0; done
+        check "$count at once: all boot" test "$all" = 1
+        check "$count at once: each has its own address" \
+            test "$( { ip4 "$B"; for n in "${names[@]}"; do ip4 "$n"; done; } | sort -u | wc -l | tr -d ' ')" = $((count + 1))
+        check "$count at once: each has its own subnet" \
+            test "$(for n in "$B" "${names[@]}"; do sbx inspect "$n" | jq -r '.effective.interfaces[0].network'; done | sort -u | wc -l | tr -d ' ')" = $((count + 1))
+        for n in "${names[@]}"; do listeners "$n"; done
+        out="$WORK/concurrency-$count"
+        mkdir -p "$out"
+        for ((i = 0; i < count; i++)); do
+            (
+                probe_pair "${names[i]}" "$B" >"$out/c$((i + 1))-B"
+                if ((count > 1)); then
+                    probe_pair "${names[i]}" "${names[(i + 1) % count]}" >"$out/c$((i + 1))-c$(((i + 1) % count + 1))"
+                fi
+            ) &
+        done
+        probe_pair "$B" "${names[0]}" >"$out/B-c1" &
+        wait
+        bad=""
+        pairs=0
+        for f in "$out"/*; do
+            pairs=$((pairs + 1))
+            isolated "$(<"$f")" || bad+=" ${f##*/}=$(<"$f")"
+        done
+        if [[ -z "$bad" ]]; then
+            pass "$count at once: all $pairs directed pairs blocked on every vector, host reaches every target"
+        else
+            fail "$count at once: all $pairs directed pairs blocked on every vector, host reaches every target" \
+                "attacker-target=reached|host misses|probes:$bad"
+        fi
+        for n in "${names[@]}"; do sbx stop "$n" >/dev/null; sbx delete "$n" --owner "$RUN"; done
     done
-    for n in "${names[@]}"; do sbx start "$n" >/dev/null & done
-    wait
-    all=1
-    for n in "${names[@]}"; do ready "$n" || all=0; done
-    check "$CONCURRENT sandboxes boot in parallel" test "$all" = 1
-    check "each has its own address" test "$(for n in "${names[@]}"; do ip4 "$n"; done | sort -u | wc -l | tr -d ' ')" = "$CONCURRENT"
-    check "each has its own subnet" test "$(for n in "${names[@]}"; do sbx inspect "$n" | jq -r '.effective.interfaces[0].network'; done | sort -u | wc -l | tr -d ' ')" = "$CONCURRENT"
-    first="${names[0]}"
-    leaks=0
-    for n in "${names[@]:1}"; do
-        t4="$(ip4 "$n")"
-        guest "$first" sh -c "timeout 3 nc -z -w2 $t4 22 || ping -c1 -W2 $t4 >/dev/null 2>&1" && leaks=$((leaks + 1))
-    done
-    check "none reaches another" test "$leaks" = 0
-    for n in "${names[@]}"; do sbx stop "$n"; sbx delete "$n" --owner "$RUN"; done
 fi
 
 if want coop; then
@@ -640,6 +854,56 @@ if want coop; then
     check "coop start boots it again" coop start e2e --no-agents --no-github
     check "guest data survives stop/start" test "$(coop exec e2e -- sh -c 'cat ~/snap-before' 2>/dev/null)" = before
 
+    # What coop's own sandbox exposes, with a live agent and the canary in
+    # coop's environment.
+    mid="$(machine_id e2e)"
+    eff="$(csbx inspect "$mid" | jq .effective)"
+    check "coop's sandbox: kernel pseudo-filesystems only" \
+        jq -e '[.mounts[] | select(.type | IN("proc","sysfs","devtmpfs","mqueue","tmpfs","cgroup2","devpts") | not)] | length == 0' <<<"$eff"
+    check "coop's sandbox: no relays, ports, or agent forwarding" \
+        jq -e '.socketRelays == 0 and .publishedPorts == 0 and .sshAgentForwarding == false' <<<"$eff"
+    mi="$(coop exec e2e -- cat /proc/self/mountinfo)"
+    check "coop's guest: no file-sharing mounts or host paths" \
+        refuses grep -Eq ' - (virtiofs|9p|fuse|fuse\.[^ ]+|nfs4?|cifs|smb3?|smbfs) |/Users/' <<<"$mi"
+    # shellcheck disable=SC2016 # Expand in the guest.
+    agent="$(
+        eval "$(ssh-agent -s)" >/dev/null
+        coop exec e2e -- sh -c 'echo ${SSH_AUTH_SOCK:-none}'
+        ssh-agent -k >/dev/null
+    )"
+    check "coop exec forwards no host agent" test "$agent" = none
+    # The pattern splits the canary with an empty group: sudo logs its
+    # command line to the guest journal, which must not be a match.
+    pattern="${CANARY:0:24}()${CANARY:24}"
+    leaks="$(coop exec e2e -- sudo sh -c "grep -rlsE '$pattern' / --exclude-dir=proc --exclude-dir=sys --exclude-dir=dev | head -3
+        cat /proc/[0-9]*/environ 2>/dev/null | tr '\0' '\n' | grep -cE '$pattern'")"
+    if [[ "$leaks" == 0 ]]; then
+        pass "the canary in coop's environment reaches no guest file or process"
+    else
+        fail "the canary in coop's environment reaches no guest file or process" "$(tr '\n' ' ' <<<"$leaks")"
+    fi
+
+    # Pinned identity: coop refuses a guest whose host key changed, both on a
+    # live connection and at the next start.
+    coop exec e2e -- sudo sh -c 'cp -a /etc/ssh/ssh_host_ed25519_key /etc/ssh/ssh_host_ed25519_key.pub /root/ &&
+        rm -f /etc/ssh/ssh_host_ed25519_key /etc/ssh/ssh_host_ed25519_key.pub &&
+        ssh-keygen -q -t ed25519 -N "" -f /etc/ssh/ssh_host_ed25519_key && systemctl restart ssh' >/dev/null 2>&1
+    check "coop exec refuses a changed host key" refuses coop exec e2e -- true
+    coop stop e2e >/dev/null 2>&1
+    changed="$(coop start e2e --no-agents --no-github 2>&1)"
+    check "coop start refuses a changed host key" grep -q APPLE_HOST_KEY_CHANGED <<<"$changed"
+    check "the refused start leaves the sandbox stopped" test "$(csbx inspect "$mid" | jq -r .status)" = stopped
+    # repair CMD...: run CMD as root over the runtime's own channel, which
+    # needs no SSH, with the sandbox stopped before and after.
+    repair() {
+        csbx start "$mid" >/dev/null
+        for _ in $(seq 100); do csbx exec "$mid" -- true >/dev/null 2>&1 && break; sleep 0.2; done
+        csbx exec "$mid" -- "$@" >/dev/null 2>&1
+        csbx stop "$mid" >/dev/null
+    }
+    repair cp -a /root/ssh_host_ed25519_key /root/ssh_host_ed25519_key.pub /etc/ssh/
+    check "the pinned key restored, coop starts again" coop start e2e --no-agents --no-github
+
     # sshd will not start on the next boot, so a restart after a resize fails.
     coop exec e2e -- sudo systemctl mask ssh.service ssh.socket >/dev/null 2>&1
     coop stop e2e >/dev/null 2>&1
@@ -650,13 +914,9 @@ if want coop; then
     check "the failed restart leaves the sandbox stopped" test "$(csbx inspect "$(machine_id e2e)" | jq -r .status)" = stopped
     check "the failed restart rolls the memory back" test "$(record e2e memoryBytes)" = $((3072 * 1024 * 1024))
     check "no journal is left behind" test ! -e "$CSTATE/instances/e2e/operation.json"
-    # Repair sshd over the runtime's own channel, which needs no SSH.
-    mid="$(machine_id e2e)"
-    csbx start "$mid" >/dev/null
-    for _ in $(seq 100); do csbx exec "$mid" -- true >/dev/null 2>&1 && break; sleep 0.2; done
-    csbx exec "$mid" -- systemctl unmask ssh.service ssh.socket >/dev/null 2>&1
-    csbx stop "$mid" >/dev/null
-    check "resize --size grows the disk" coop resize e2e --size 12
+    repair systemctl unmask ssh.service ssh.socket
+    resize_ms="$(timed_ms coop resize e2e --size 12)"
+    check "resize --size grows the disk" test "$(record e2e diskBytes)" = $((12 * 1073741824))
     check "start after the resizes succeeds" coop start e2e --no-agents --no-github
     check "the guest sees the new vCPU count (+1 runtime vCPU)" test "$(coop exec e2e -- nproc)" = 4
     size="$(coop exec e2e -- df -B1 --output=size / | tail -1 | xargs)"
@@ -667,11 +927,56 @@ if want coop; then
     coop start e2e --no-agents --no-github >/dev/null 2>&1
     coop exec e2e -- sh -c 'echo after > ~/snap-after' >/dev/null
     coop stop e2e >/dev/null 2>&1
-    check "coop restore replaces the disk" coop restore e2e --image e2e-snap
+    gen="$(record e2e diskGeneration)"
+    restore_ms="$(timed_ms coop restore e2e --image e2e-snap)"
+    check "coop restore replaces the disk" test "$(record e2e diskGeneration)" -gt "$gen"
     check "start after restore re-pins the new host key" coop start e2e --no-agents --no-github
     check "restore keeps data from before the commit" test "$(coop exec e2e -- sh -c 'cat ~/snap-before' 2>/dev/null)" = before
     check "restore drops data written after the commit" \
         test "$(coop exec e2e -- sh -c 'test -e ~/snap-after && echo present || echo absent')" = absent
+
+    # Interrupted coop mutations: SIGKILL coop and its runtime client partway
+    # through; the next start reconciles coop's journal with the runtime.
+    # kill_coop DELAY ARGS...: run coop ARGS, kill it and its children after DELAY.
+    kill_coop() {
+        local d="$1" pid
+        shift
+        "$COOP" --config "$CCFG" "$@" </dev/null >/dev/null 2>&1 &
+        pid=$!
+        sleep "$d"
+        pkill -9 -P "$pid" 2>/dev/null
+        kill -9 "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null
+    }
+    gib=12
+    for f in $COOP_KILL_FRACTIONS; do
+        for op in restore resize; do
+            coop stop e2e >/dev/null 2>&1
+            if [[ "$op" == restore ]]; then
+                d="$(delay_s "$restore_ms" "$f")"
+                kill_coop "$d" restore e2e --image e2e-snap
+            else
+                d="$(delay_s "$resize_ms" "$f")"
+                gib=$((gib + 1))
+                kill_coop "$d" resize e2e --size "$gib"
+            fi
+            check "a $op killed after ${d}s: the next start recovers" coop start e2e --no-agents --no-github
+            check "a $op killed after ${d}s: no journal is left" test ! -e "$CSTATE/instances/e2e/operation.json"
+            check "a $op killed after ${d}s: pinned SSH works" test "$(coop exec e2e -- echo ok 2>/dev/null)" = ok
+            size="$(coop exec e2e -- df -B1 --output=size / | tail -1 | xargs)"
+            check "a $op killed after ${d}s: the filesystem matches the record" \
+                test "${size:-0}" -ge $(($(record e2e diskBytes) * 95 / 100))
+        done
+    done
+
+    # A disk-generation increase coop did not make does not authorize a new
+    # host key (INV-07): an out-of-band restore resets the guest's identity.
+    coop stop e2e >/dev/null 2>&1
+    mid="$(machine_id e2e)"
+    csbx commit "$mid" oob >/dev/null && csbx restore "$mid" oob >/dev/null
+    check "coop start refuses a restore it did not make" refuses coop start e2e --no-agents --no-github
+    check "that refused start leaves the sandbox stopped" test "$(csbx inspect "$mid" | jq -r .status)" = stopped
+    "$SANDBOX" disk delete --root "$CROOT" oob >/dev/null 2>&1
 
     check "coop destroy removes the instance" coop destroy e2e
     check "the runtime has no sandbox left" test "$(csbx list | jq length)" = 0

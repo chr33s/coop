@@ -82,10 +82,13 @@ jobs:
       - name: Integration test — coop uninstall
         run: ./tests/integration-uninstall.sh
 
-  # The opt-in Apple Container backend compiles only on macOS. Unit tests use
-  # a scripted runtime; nothing here needs Apple Container installed.
+  # The opt-in Apple sandbox backend compiles only on macOS. Unit tests use a
+  # scripted runtime, and the coop-sandbox tests boot no VM; nothing here needs
+  # Apple Container or virtualization.
   apple-container:
-    runs-on: macos-latest
+    # Pinned: macos/coop-sandbox needs Swift 6.2+ and the macOS 26 SDK
+    # (vmnet networks); this image's default Xcode is 26.x.
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -96,6 +99,11 @@ jobs:
 
       - name: Unit tests (apple-container)
         run: cargo test --features apple-container
+
+      - name: coop-sandbox build and unit tests
+        run: |
+          swift --version
+          swift test --package-path macos/coop-sandbox --force-resolved-versions
 
   deny:
     runs-on: ubuntu-latest

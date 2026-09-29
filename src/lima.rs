@@ -12,7 +12,7 @@ use crate::config::{CoopConfig, GiB, ImageName, Instance, InstanceName, MiB};
 use crate::devcontainer_oci::{ResolvedFeature, installed_features};
 use crate::guest::{
     BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_CLAUDE_CODE,
-    SCRIPT_CODEX, SCRIPT_CODEX_ACCOUNT, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO,
+    SCRIPT_CODEX, SCRIPT_CODEX_ACCOUNT, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, SCRIPT_GROK,
 };
 use crate::remote_command::RemoteCommand;
 use crate::setup::{SetupOptions, TEMPLATE_VERSION, TemplateConfig, utc_timestamp};
@@ -110,16 +110,20 @@ pub fn create_and_start(
     };
 
     // Clean up leftover Lima instance from a previous failed start
-    if let Some(state) = lima_state(&inst.name) {
+    if let Some(state) = lima_state(&inst.name)? {
+        if matches!(state, LimaState::Unknown(_)) {
+            bail!("Lima instance '{name}' has state {state}; refusing to replace it");
+        }
         tracing::warn!(
             "Lima instance '{name}' already exists (status: {state}) — \
              cleaning up before re-creating"
         );
-        if let Err(e) = Command::new("limactl")
+        let deletion = Command::new("limactl")
             .args(["delete", "--force", &name])
             .status()
-        {
-            tracing::debug!("Failed to force-delete stale instance (non-fatal): {e}");
+            .context("Failed to delete stale Lima instance")?;
+        if !deletion.success() {
+            bail!("Failed to delete stale Lima instance '{name}'");
         }
     }
 
@@ -178,8 +182,10 @@ pub fn create_and_start(
 pub fn start_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
     let name = lima_name(inst);
 
-    if is_running(inst) {
-        bail!("Lima instance '{name}' is already running");
+    match lima_state(&inst.name)? {
+        Some(LimaState::Stopped) => {}
+        Some(state) => bail!("Lima instance '{name}' is {state}, not stopped"),
+        None => bail!("Lima instance '{name}' is absent"),
     }
 
     tracing::info!("Restarting stopped Lima instance '{name}'");
@@ -221,8 +227,8 @@ pub fn start_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
 
 /// Stop a Lima instance that has already been verified as running.
 ///
-/// The caller's `RunningInstance` token proves the precondition, so
-/// this skips the live-state probe and only handles the shutdown.
+/// The caller re-probes state while holding the instance operation lock;
+/// this function only handles the shutdown command.
 pub fn stop_running(inst: &Instance) -> Result<()> {
     let name = lima_name(inst);
 
@@ -247,16 +253,21 @@ pub fn destroy(inst: &Instance) -> Result<()> {
     tracing::info!("Deleting Lima instance '{name}'");
 
     // If the instance doesn't exist in Lima, nothing to do
-    if lima_state(&inst.name).is_none() {
+    let state = lima_state(&inst.name)?;
+    if state.is_none() {
         tracing::debug!("Lima instance '{name}' not found — already deleted");
         return Ok(());
     }
 
     // Stop first if running
-    if is_running(inst)
+    if state == Some(LimaState::Running)
         && let Err(e) = Command::new("limactl").args(["stop", &name]).status()
     {
         tracing::debug!("Failed to stop Lima instance '{name}' before delete (non-fatal): {e}");
+    }
+
+    if let Some(LimaState::Unknown(status)) = &state {
+        bail!("Lima instance '{name}' has unknown state '{status}' — refusing delete");
     }
 
     let status = Command::new("limactl")
@@ -275,10 +286,9 @@ pub fn destroy(inst: &Instance) -> Result<()> {
 
 /// Resize the disk of a stopped Lima instance.
 ///
-/// Records the new size as `disk:` in lima.yaml, then truncates the disk to
-/// it. Cloud-init's `growpart` expands the partition and filesystem on next
-/// boot. Re-running at the current size re-records `disk:`, which repairs an
-/// instance whose lima.yaml lags its disk.
+/// Truncates the disk to the new size and updates `lima.yaml` `disk:`
+/// to match, so the next start sees the grown size. Cloud-init's
+/// `growpart` expands the partition and filesystem on next boot.
 pub fn resize_disk(_cfg: &CoopConfig, inst: &Instance, new_size: crate::config::GiB) -> Result<()> {
     let disk = disk_path(inst)?;
 
@@ -319,15 +329,43 @@ pub fn resize_disk(_cfg: &CoopConfig, inst: &Instance, new_size: crate::config::
         "Resizing instance '{}' from {current_gib} to {new_gib} GiB",
         inst.name,
     );
-    let status = Command::new("truncate")
+
+    // Lima re-reads `disk:` from lima.yaml on start. Growing the file
+    // without updating that field makes the next start look like a
+    // shrink, which Lima rejects.
+    let yaml_path = lima_home()?.join(lima_name(inst)).join("lima.yaml");
+    let original = fs::read_to_string(&yaml_path)
+        .with_context(|| format!("Failed to read {}", yaml_path.display()))?;
+    let disk_value = format!("\"{}GiB\"", new_size.as_u32());
+    let edited = set_yaml_scalar(&original, "disk", &disk_value)
+        .with_context(|| format!("No top-level 'disk' key in {}", yaml_path.display()))?;
+    crate::fs_util::atomic_write_with_mode(&yaml_path, &edited, 0o644)?;
+
+    let restore_yaml = || {
+        if let Err(restore) = crate::fs_util::atomic_write_with_mode(&yaml_path, &original, 0o644) {
+            tracing::error!(
+                "Failed to restore {} after a failed truncate: {restore}",
+                yaml_path.display()
+            );
+        }
+    };
+
+    match Command::new("truncate")
         .arg("-s")
         .arg(format!("{new_size}G"))
         .arg(&disk)
         .status()
-        .context("Failed to run truncate")?;
-
-    if !status.success() {
-        bail!("truncate failed for {}", disk.display());
+        .context("Failed to run truncate")
+    {
+        Ok(status) if status.success() => {}
+        Ok(_) => {
+            restore_yaml();
+            bail!("truncate failed for {}", disk.display());
+        }
+        Err(e) => {
+            restore_yaml();
+            return Err(e);
+        }
     }
 
     tracing::info!(
@@ -517,7 +555,7 @@ pub fn disk_path(inst: &Instance) -> Result<PathBuf> {
 /// preserves anything else verbatim in `Unknown` so a new Lima state
 /// can't be silently misread as "not running".
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum LimaState {
+pub(crate) enum LimaState {
     Running,
     Stopped,
     Broken,
@@ -531,13 +569,6 @@ impl LimaState {
             "Stopped" => Self::Stopped,
             "Broken" => Self::Broken,
             other => Self::Unknown(other.to_string()),
-        }
-    }
-
-    fn is_running(&self) -> bool {
-        match self {
-            Self::Running => true,
-            Self::Stopped | Self::Broken | Self::Unknown(_) => false,
         }
     }
 }
@@ -555,7 +586,11 @@ impl std::fmt::Display for LimaState {
 
 /// Check if a Lima instance is running.
 pub fn is_running(inst: &Instance) -> bool {
-    lima_state(&inst.name).is_some_and(|s| s.is_running())
+    matches!(lima_state(&inst.name), Ok(Some(LimaState::Running)))
+}
+
+pub(crate) fn probe_state(inst: &Instance) -> Result<Option<LimaState>> {
+    lima_state(&inst.name)
 }
 
 /// Like [`is_running`], but a failed `limactl` query is an error rather
@@ -615,7 +650,7 @@ pub fn status(cfg: &CoopConfig, inst: &Instance) -> Result<String> {
         cfg.ssh_key_path().display(),
     );
 
-    if state.is_running()
+    if matches!(state, LimaState::Running)
         && let Ok(target) = ssh_target(cfg, inst)
         && let Some(usage) = crate::backend::query_resource_usage(&target)
     {
@@ -784,10 +819,13 @@ fn needs_rebuild(
 
     let (wanted_m, wanted_p) = crate::guest::collect_baked_lists(cfg, profiles);
     let (wanted_cm, wanted_cp) = crate::guest::collect_codex_baked_lists(cfg);
+    let (wanted_gm, wanted_gp) = crate::guest::collect_grok_baked_lists(cfg);
     existing.marketplaces != wanted_m
         || existing.plugins != wanted_p
         || existing.codex_marketplaces != wanted_cm
         || existing.codex_plugins != wanted_cp
+        || existing.grok_marketplaces != wanted_gm
+        || existing.grok_plugins != wanted_gp
 }
 
 fn build_golden_image(
@@ -908,6 +946,8 @@ fn build_golden_image(
         plugins: baked.plugins,
         codex_marketplaces: baked.codex_marketplaces,
         codex_plugins: baked.codex_plugins,
+        grok_marketplaces: baked.grok_marketplaces,
+        grok_plugins: baked.grok_plugins,
         guest_user: guest_user.clone(),
         oci_features: installed_features(oci_features),
     };
@@ -1053,6 +1093,8 @@ struct BakedLists {
     plugins: Vec<String>,
     codex_marketplaces: Vec<String>,
     codex_plugins: Vec<String>,
+    grok_marketplaces: Vec<String>,
+    grok_plugins: Vec<String>,
 }
 
 impl BakedLists {
@@ -1061,12 +1103,14 @@ impl BakedLists {
             && self.plugins.is_empty()
             && self.codex_marketplaces.is_empty()
             && self.codex_plugins.is_empty()
+            && self.grok_marketplaces.is_empty()
+            && self.grok_plugins.is_empty()
     }
 }
 
-/// Install Claude and Codex marketplaces and plugins in the builder VM via
-/// SSH. Returns the lists that were installed (for recording in
-/// `TemplateConfig`).
+/// Install Claude, Codex, and Grok Build marketplaces and plugins in the
+/// builder VM via SSH. Returns the lists that were installed (for
+/// recording in `TemplateConfig`).
 fn install_builder_plugins(
     cfg: &CoopConfig,
     profiles: &[ProfileDef],
@@ -1074,11 +1118,14 @@ fn install_builder_plugins(
 ) -> Result<BakedLists> {
     let (marketplaces, plugins) = crate::guest::collect_baked_lists(cfg, profiles);
     let (codex_marketplaces, codex_plugins) = crate::guest::collect_codex_baked_lists(cfg);
+    let (grok_marketplaces, grok_plugins) = crate::guest::collect_grok_baked_lists(cfg);
     let baked = BakedLists {
         marketplaces,
         plugins,
         codex_marketplaces,
         codex_plugins,
+        grok_marketplaces,
+        grok_plugins,
     };
 
     if baked.is_empty() {
@@ -1114,6 +1161,14 @@ fn install_builder_plugins(
     }
     if !baked.codex_plugins.is_empty() {
         crate::backend::install_codex_plugins(&session, &codex_bin, &baked.codex_plugins)?;
+    }
+
+    let grok_bin = guest_user.grok_bin();
+    if !baked.grok_marketplaces.is_empty() {
+        crate::backend::install_grok_marketplaces(&session, &grok_bin, &baked.grok_marketplaces)?;
+    }
+    if !baked.grok_plugins.is_empty() {
+        crate::backend::install_grok_plugins(&session, &grok_bin, &baked.grok_plugins)?;
     }
 
     Ok(baked)
@@ -1557,6 +1612,10 @@ pub(crate) fn compose_provision_script(
     s.push_str(SCRIPT_CODEX_ACCOUNT);
     s.push('\n');
 
+    // Grok Build (official installer, runs as the guest user)
+    s.push_str(SCRIPT_GROK);
+    s.push('\n');
+
     // Test hook: inject a provision failure to exercise error detection.
     // Only activates when COOP_TEST_INJECT_PROVISION_FAILURE is set.
     if std::env::var("COOP_TEST_INJECT_PROVISION_FAILURE").is_ok() {
@@ -1600,8 +1659,9 @@ echo "{user} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/{user}"
 chmod 440 "/etc/sudoers.d/{user}"
 
 echo "  [guest] Setting up home and SSH for {user} user..."
+# Image skel files arrive as root; this is the guest user's home.
 mkdir -p "{home}"
-chown "{user}:{user}" "{home}"
+chown -R "{user}:{user}" "{home}"
 chmod 755 "{home}"
 install -d -o "{user}" -g "{user}" "{home}/.local"
 install -d -o "{user}" -g "{user}" "{home}/.local/bin"
@@ -1612,29 +1672,35 @@ chown -R "{user}:{user}" "{home}/.ssh"
 chmod 700 "{home}/.ssh"
 chmod 600 "{home}/.ssh/authorized_keys"
 
-echo "  [guest] Adding {user} ~/.local/bin to /etc/environment PATH..."
+echo "  [guest] Adding {user} ~/.grok/bin and ~/.local/bin to /etc/environment PATH..."
 # pam_env reads /etc/environment for every SSH session — login, non-login,
 # and non-interactive (`ssh host cmd`) alike — so this is the one layer that
-# reaches `coop claude` (a remote command), its Bash-tool subshells, and VS
-# Code remote sessions. The .profile/.bashrc appends did not: .profile is
-# login-only and the .bashrc line sat below Ubuntu's non-interactive guard.
-# pam_env does no variable expansion, so the home path is baked in literally.
+# reaches `coop claude` / `coop grok` (a remote command), their Bash-tool
+# subshells, and VS Code remote sessions. The .profile/.bashrc appends did
+# not: .profile is login-only and the .bashrc line sat below Ubuntu's
+# non-interactive guard. pam_env does no variable expansion, so the home
+# path is baked in literally.
 #
 # /etc/environment is system-wide, so this prepends the guest user's writable
-# ~/.local/bin to PATH for every account, including root. That's safe here:
+# bin dirs to PATH for every account, including root. That's safe here:
 # sudo keeps Ubuntu's default secure_path (we set no override), so it ignores
-# ~/.local/bin, and the guest is a single-user dev VM where that user already
+# those dirs, and the guest is a single-user dev VM where that user already
 # has passwordless root — there is no privilege boundary to cross.
-if ! grep -q '^PATH="{home}/.local/bin:' /etc/environment 2>/dev/null; then
-    if grep -q '^PATH="' /etc/environment 2>/dev/null; then
-        sed -i 's|^PATH="|PATH="{home}/.local/bin:|' /etc/environment
+if ! grep -q '^PATH="{home}/.grok/bin:' /etc/environment 2>/dev/null; then
+    if grep -q '^PATH="{home}/.local/bin:' /etc/environment 2>/dev/null; then
+        sed -i 's|^PATH="{home}/.local/bin:|PATH="{home}/.grok/bin:{home}/.local/bin:|' /etc/environment
+    elif grep -q '^PATH="' /etc/environment 2>/dev/null; then
+        sed -i 's|^PATH="|PATH="{home}/.grok/bin:{home}/.local/bin:|' /etc/environment
     else
-        echo 'PATH="{home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games"' >> /etc/environment
+        echo 'PATH="{home}/.grok/bin:{home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games"' >> /etc/environment
     fi
 fi
 
 echo '  [guest] Symlinking claude into system PATH...'
 ln -sf "{home}/.local/bin/claude" /usr/local/bin/claude
+
+echo '  [guest] Symlinking grok into system PATH...'
+ln -sf "{home}/.grok/bin/grok" /usr/local/bin/grok
 
 echo '  [guest] Installing claude-yolo shortcut...'
 cat > /usr/local/bin/claude-yolo <<'YOLOEOF'
@@ -1642,6 +1708,13 @@ cat > /usr/local/bin/claude-yolo <<'YOLOEOF'
 exec claude --dangerously-skip-permissions "$@"
 YOLOEOF
 chmod 755 /usr/local/bin/claude-yolo
+
+echo '  [guest] Installing grok-yolo shortcut...'
+cat > /usr/local/bin/grok-yolo <<'YOLOEOF'
+#!/bin/bash
+exec grok --always-approve --trust --cwd /workspace "$@"
+YOLOEOF
+chmod 755 /usr/local/bin/grok-yolo
 
 echo '  [guest] Installing codex-yolo shortcut...'
 cat > /usr/local/bin/codex-yolo <<'YOLOEOF'
@@ -1865,11 +1938,16 @@ fn lima_home() -> Result<PathBuf> {
     Ok(home.join(".lima"))
 }
 
-/// Get the lifecycle state for a Lima instance, or `None` if the
-/// instance is not present in `limactl list`.
-fn lima_state(name: &InstanceName) -> Option<LimaState> {
-    let info = limactl_info(name).ok()?;
-    info["status"].as_str().map(LimaState::from_status_str)
+/// Get the lifecycle state for a Lima instance. Absence is distinct from
+/// malformed output and a failed `limactl` probe.
+fn lima_state(name: &InstanceName) -> Result<Option<LimaState>> {
+    let Some(info) = limactl_list_entry_optional(&lima_name_for(name))? else {
+        return Ok(None);
+    };
+    let status = info["status"]
+        .as_str()
+        .context("Lima status is missing or invalid")?;
+    Ok(Some(LimaState::from_status_str(status)))
 }
 
 /// Get full instance info from limactl for a coop instance.
@@ -1880,20 +1958,21 @@ fn limactl_info(name: &InstanceName) -> Result<serde_json::Value> {
 /// Find a `limactl list --json` entry by its Lima VM name (the
 /// `coop-<instance>` form, or the special `coop-builder`).
 fn limactl_list_entry(lima_name: &str) -> Result<serde_json::Value> {
-    find_limactl_entry(lima_name)?
+    limactl_list_entry_optional(lima_name)?
         .with_context(|| format!("Lima instance '{lima_name}' not found in limactl list"))
 }
 
-/// [`limactl_list_entry`], with `Ok(None)` when the listing succeeded but has
-/// no VM named `lima_name`.
-fn find_limactl_entry(lima_name: &str) -> Result<Option<serde_json::Value>> {
+fn limactl_list_entry_optional(lima_name: &str) -> Result<Option<serde_json::Value>> {
     let output = Command::new("limactl")
         .args(["list", "--json"])
         .output()
         .context("Failed to run limactl list")?;
 
     if !output.status.success() {
-        bail!("limactl list failed");
+        bail!(
+            "limactl list failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
 
     // limactl list --json outputs one JSON object per line (NDJSON)
@@ -1921,6 +2000,140 @@ fn find_limactl_entry(lima_name: &str) -> Result<Option<serde_json::Value>> {
 #[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
 mod tests {
     use super::*;
+    use crate::backend::VmBackend as _;
+
+    #[test]
+    fn backend_lima_state_gates_disk_and_metadata_mutations() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let Ok(mode) = std::env::var("COOP_TEST_LIMA_STATE") else {
+            for mode in [
+                "nonzero",
+                "malformed",
+                "missing_status",
+                "absent",
+                "Broken",
+                "Restarting",
+                "Running",
+                "Stopped",
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let script = root.path().join("limactl");
+                std::fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$COOP_TEST_LIMA_CALLS\"\ncase \"$1\" in\n list) case \"$COOP_TEST_LIMA_STATE\" in\n nonzero) exit 2;;\n malformed) echo 'bad json';;\n missing_status) echo '{\"name\":\"coop-test\"}';;\n absent) :;;\n *) printf '{\"name\":\"coop-test\",\"status\":\"%s\",\"sshLocalPort\":2222}\\n' \"$COOP_TEST_LIMA_STATE\";;\n esac;;\n stop) exit 0;;\n delete) rm -rf \"$LIMA_HOME/coop-test\";;\nesac\n").unwrap();
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+                let output = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "lima::tests::backend_lima_state_gates_disk_and_metadata_mutations",
+                    ])
+                    .env("COOP_TEST_LIMA_STATE", mode)
+                    .env("COOP_TEST_LIMA_ROOT", root.path())
+                    .env("COOP_TEST_LIMA_CALLS", root.path().join("calls"))
+                    .env("LIMA_HOME", root.path().join("lima"))
+                    .env(
+                        "PATH",
+                        format!(
+                            "{}:{}",
+                            root.path().display(),
+                            std::env::var("PATH").unwrap_or_default()
+                        ),
+                    )
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{mode}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let root = PathBuf::from(std::env::var("COOP_TEST_LIMA_ROOT").unwrap());
+        run_lima_state_case(&root, &mode);
+    }
+
+    fn run_lima_state_case(root: &Path, mode: &str) {
+        let cfg = CoopConfig::default();
+        let backend = crate::backend::LimaBackend::new();
+        let inst = Instance {
+            name: InstanceName::new("test").unwrap(),
+            index: crate::config::InstanceIndex::new(0).unwrap(),
+            dir: root.join("instance"),
+            image: ImageName::new("default").unwrap(),
+        };
+        std::fs::create_dir(&inst.dir).unwrap();
+        let metadata = inst.dir.join("instance.json");
+        std::fs::write(&metadata, "metadata sentinel").unwrap();
+        let lima_dir = root.join("lima/coop-test");
+        std::fs::create_dir_all(&lima_dir).unwrap();
+        let disk = lima_dir.join("disk");
+        std::fs::write(&disk, "disk sentinel").unwrap();
+        std::fs::write(lima_dir.join("lima.yaml"), "disk: \"1GiB\"\n").unwrap();
+
+        let stopped = backend.as_stopped(inst.clone());
+        if mode == "Stopped" {
+            let stopped = stopped.unwrap();
+            backend
+                .resize_disk(&cfg, &stopped, crate::config::GiB::new(1).unwrap())
+                .unwrap();
+            assert_eq!(std::fs::metadata(&disk).unwrap().len(), 1024 * 1024 * 1024);
+        } else {
+            assert!(stopped.is_err(), "{mode} minted StoppedInstance");
+            assert_eq!(std::fs::read_to_string(&disk).unwrap(), "disk sentinel");
+        }
+        let running = backend.as_running(&cfg, inst.clone());
+        match mode {
+            "Running" => assert!(running.unwrap().is_some()),
+            "Stopped" => assert!(running.unwrap().is_none()),
+            "absent" => {
+                let error = running.err().unwrap().to_string();
+                assert!(error.contains("absent"), "{error}");
+                let error = crate::commands::cmd_stop(&backend, &cfg, &inst)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("absent"), "{error}");
+            }
+            _ => assert!(running.is_err(), "{mode} was treated as stopped"),
+        }
+
+        let destroyed = backend.destroy_instance(&cfg, &inst);
+        if matches!(
+            mode,
+            "nonzero" | "malformed" | "missing_status" | "Restarting"
+        ) {
+            assert!(destroyed.is_err(), "{mode} removed metadata");
+            assert_eq!(
+                std::fs::read_to_string(&metadata).unwrap(),
+                "metadata sentinel"
+            );
+            assert!(disk.exists());
+        } else {
+            assert!(destroyed.is_ok(), "{mode}: {destroyed:?}");
+            assert!(!metadata.exists());
+        }
+    }
+
+    struct RestoreEnv {
+        lima_home: Option<std::ffi::OsString>,
+        path: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            // SAFETY: the resize spawn-failure test holds ENV_LOCK and is
+            // the only lima test that mutates these variables.
+            unsafe {
+                match &self.lima_home {
+                    Some(v) => std::env::set_var("LIMA_HOME", v),
+                    None => std::env::remove_var("LIMA_HOME"),
+                }
+                match &self.path {
+                    Some(v) => std::env::set_var("PATH", v),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+        }
+    }
 
     #[test]
     fn cloud_init_exit0_done_succeeds() {
@@ -1945,13 +2158,17 @@ mod tests {
     }
 
     #[test]
-    fn with_disk_size_updates_or_appends_the_disk_key() {
-        let yaml = "cpus: 2\ndisk: \"20GiB\"\nmounts: []\n";
-        assert_eq!(
-            with_disk_size(yaml, 40),
-            "cpus: 2\ndisk: \"40GiB\"\nmounts: []\n"
+    fn set_yaml_scalar_replaces_top_level_disk() {
+        let yaml = "cpus: 2\ndisk: \"8GiB\"\nmemory: \"4GiB\"\n";
+        let edited = set_yaml_scalar(yaml, "disk", "\"9GiB\"").unwrap();
+        assert!(
+            edited.contains("disk: \"9GiB\"\n"),
+            "disk not updated: {edited}"
         );
-        assert_eq!(with_disk_size("cpus: 2", 40), "cpus: 2\ndisk: \"40GiB\"\n");
+        assert!(
+            edited.contains("cpus: 2\n") && edited.contains("memory: \"4GiB\"\n"),
+            "unrelated keys changed: {edited}"
+        );
     }
 
     #[test]
@@ -1972,6 +2189,67 @@ mod tests {
         assert!(
             edited.contains("cpus: 8\n"),
             "top-level key not edited: {edited}"
+        );
+    }
+
+    #[test]
+    fn resize_disk_restores_yaml_when_truncate_cannot_spawn() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let lima_root = tempfile::TempDir::new().unwrap();
+        let shadow = tempfile::TempDir::new().unwrap();
+        // A self-symlink makes the first PATH hit fail with ELOOP.
+        // A directory or a file without +x returns EACCES, and
+        // posix_spawnp then continues to a later real `truncate`.
+        std::os::unix::fs::symlink("truncate", shadow.path().join("truncate")).unwrap();
+
+        let inst = Instance {
+            name: InstanceName::new("test").unwrap(),
+            index: crate::config::InstanceIndex::new(0).unwrap(),
+            dir: lima_root.path().to_path_buf(),
+            image: ImageName::new("test.img").unwrap(),
+        };
+        let inst_dir = lima_root.path().join(lima_name(&inst));
+        fs::create_dir_all(&inst_dir).unwrap();
+        let yaml_path = inst_dir.join("lima.yaml");
+        let original_yaml = "cpus: 2\ndisk: \"1GiB\"\nmemory: \"4GiB\"\n";
+        fs::write(&yaml_path, original_yaml).unwrap();
+        fs::write(inst_dir.join("disk"), b"").unwrap();
+
+        let cfg = CoopConfig::default();
+        let new_size = GiB::new(2).unwrap();
+
+        let prior_lima_home = std::env::var_os("LIMA_HOME");
+        let prior_path = std::env::var_os("PATH");
+        let _restore = RestoreEnv {
+            lima_home: prior_lima_home,
+            path: prior_path.clone(),
+        };
+
+        let mut path_dirs = vec![shadow.path().to_path_buf()];
+        if let Some(rest) = &prior_path {
+            path_dirs.extend(std::env::split_paths(rest));
+        }
+        let shadowed_path = std::env::join_paths(&path_dirs).unwrap();
+        // SAFETY: ENV_LOCK held; RestoreEnv drop restores both.
+        unsafe {
+            std::env::set_var("LIMA_HOME", lima_root.path());
+            std::env::set_var("PATH", shadowed_path);
+        }
+
+        let result = resize_disk(&cfg, &inst, new_size);
+
+        assert!(
+            result.is_err(),
+            "resize must fail when truncate cannot spawn: {result:?}"
+        );
+        let yaml = fs::read_to_string(&yaml_path).unwrap();
+        assert!(
+            yaml.contains("disk: \"1GiB\"\n"),
+            "lima.yaml must keep the original disk: after spawn failure: {yaml}"
         );
     }
 
@@ -2061,15 +2339,34 @@ mod tests {
         // PATH is set in /etc/environment (pam_env applies it to every SSH
         // session), with the guest home interpolated as a literal path.
         assert!(
-            script
-                .contains("sed -i 's|^PATH=\"|PATH=\"/home/ubuntu/.local/bin:|' /etc/environment"),
-            "should prepend ~/.local/bin to /etc/environment PATH",
+            script.contains(
+                "sed -i 's|^PATH=\"|PATH=\"/home/ubuntu/.grok/bin:/home/ubuntu/.local/bin:|' /etc/environment"
+            ),
+            "should prepend ~/.grok/bin and ~/.local/bin to /etc/environment PATH",
         );
         // The old PATH appends to .profile/.bashrc are gone (see issue #248).
         assert!(
             !script.contains(">> \"/home/ubuntu/.profile\"")
                 && !script.contains(">> \"/home/ubuntu/.bashrc\""),
             "should no longer append PATH to .profile/.bashrc",
+        );
+    }
+
+    #[test]
+    fn provision_script_chowns_guest_home_recursively() {
+        // Image skel files arrive as root; the guest must own their home.
+        let script = compose_provision_script(
+            "ssh-ed25519 AAAA test@test",
+            &[],
+            &[],
+            &GuestUser::default(),
+        );
+        assert!(
+            script
+                .lines()
+                .any(|line| line.trim() == r#"chown -R "ubuntu:ubuntu" "/home/ubuntu""#),
+            "guest home must be chowned recursively so image skel files \
+             are writable by the guest user:\n{script}"
         );
     }
 
@@ -2156,6 +2453,25 @@ mod tests {
             script.contains("exec codex-account --dangerously-bypass-approvals-and-sandbox"),
             "codex-yolo should route through the account wrapper so keyring \
              mode works from an in-guest shell",
+        );
+    }
+
+    #[test]
+    fn provision_script_installs_grok() {
+        let script = compose_provision_script(
+            "ssh-ed25519 AAAA test@test",
+            &[],
+            &[],
+            &GuestUser::default(),
+        );
+
+        assert!(
+            script.contains("Installing Grok Build CLI"),
+            "Lima provision script should install Grok Build CLI",
+        );
+        assert!(
+            script.contains("https://x.ai/cli/install.sh"),
+            "Lima provision script should use the official Grok installer",
         );
     }
 
@@ -2362,22 +2678,6 @@ Host h
             LimaState::from_status_str("Restarting"),
             LimaState::Unknown("Restarting".to_string()),
         );
-    }
-
-    #[test]
-    fn only_running_or_stopped_is_a_confirmed_state() {
-        assert!(running_from_state(&LimaState::Running).unwrap());
-        assert!(!running_from_state(&LimaState::Stopped).unwrap());
-        assert!(running_from_state(&LimaState::Broken).is_err());
-        assert!(running_from_state(&LimaState::Unknown("Restarting".into())).is_err());
-    }
-
-    #[test]
-    fn lima_state_only_running_is_running() {
-        assert!(LimaState::Running.is_running());
-        assert!(!LimaState::Stopped.is_running());
-        assert!(!LimaState::Broken.is_running());
-        assert!(!LimaState::Unknown("Restarting".to_string()).is_running());
     }
 
     #[test]

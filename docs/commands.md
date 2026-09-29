@@ -1,6 +1,6 @@
 # Command Reference
 
-coop creates isolated VM environments for running Claude Code, Codex, and Grok Build. It runs Firecracker microVMs on Linux and Lima VMs on macOS, selecting the backend automatically based on platform.
+coop creates isolated VM environments for running Claude Code, Codex, and Grok Build. It runs Firecracker microVMs on Linux and Lima VMs on macOS, selecting the backend at compile time by platform; a macOS build with the opt-in `apple-container` feature uses coop-sandbox VMs instead of Lima (see [backends](backends.md)).
 
 ## Global Flags
 

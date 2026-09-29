@@ -1568,6 +1568,7 @@ Host coop-test\n\
             port: NonZeroU16::new(2222).unwrap(),
             user: SshUser::new("ubuntu").unwrap(),
             key_path: root.join("key"),
+            host_keys: crate::backend::HostKeyPolicy::Unverified,
         };
         let running = RunningInstance::new(inst, target);
         let result = if mode.starts_with("local_") {

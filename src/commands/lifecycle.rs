@@ -1819,8 +1819,27 @@ pub(crate) fn cmd_stop(
     inst: &config::Instance,
 ) -> Result<()> {
     tracing::info!("Stopping instance '{}'", inst.name);
-    // Preserve probe errors: unknown state cannot be reported as stopped.
-    if let Some(running) = be.as_running(cfg, inst.clone())? {
+    // Probe live state once. The `RunningInstance` proof flows into
+    // `be.stop`, so the type system witnesses that we only ask the
+    // backend to stop something that was actually running.
+    // A failed probe is not "not running": reporting the instance stopped
+    // while it may still be up would leave its agent running unnoticed.
+    // The backend gets one more chance via its control-plane
+    // `stop_unproven`; the credential proxy is torn down either way.
+    let probe = match be.as_running(cfg, inst.clone()) {
+        Ok(probe) => probe,
+        Err(probe_err) => {
+            crate::proxy::stop(inst);
+            return be.stop_unproven(cfg, inst).map_err(|stop_err| {
+                probe_err.context(format!(
+                    "Could not determine whether instance '{}' is running, and it could \
+                     not be stopped without that ({stop_err:#})",
+                    inst.name
+                ))
+            });
+        }
+    };
+    if let Some(running) = probe {
         // Tear down forwards before shutting down the VM so the
         // control master can exit cleanly while SSH is still
         // reachable.
@@ -2614,6 +2633,7 @@ fn bytes_to_gib(bytes: u64) -> u32 {
 #[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
 #[expect(clippy::expect_used, reason = "test code — panics are assertions")]
 mod tests {
+    #[cfg(target_os = "linux")]
     use crate::backend::VmBackend as _;
 
     #[cfg(target_os = "linux")]

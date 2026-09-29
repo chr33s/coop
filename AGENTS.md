@@ -1,7 +1,8 @@
 # coop — agent and contributor guide
 
 Isolated VM environment for running Codex, Claude Code, and Grok Build —
-Firecracker on Linux, Lima on macOS.
+Firecracker on Linux, Lima on macOS (or the opt-in Apple sandbox backend with
+the `apple-container` feature).
 
 ## Agent entrypoint
 

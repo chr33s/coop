@@ -1528,6 +1528,7 @@ impl VmBackend for AppleContainerBackend {
         disk_gib: Option<GiB>,
         _mounts: &[Mount],
     ) -> Result<()> {
+        let _operation = crate::backend::lock_instance_operation(inst)?;
         boot_preflight(cfg)?;
         let (rt, q) = self.qualified_runtime()?;
         let owner = Owner::load(cfg)?;
@@ -1573,12 +1574,14 @@ impl VmBackend for AppleContainerBackend {
     }
 
     fn start_existing(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+        let _operation = crate::backend::lock_instance_operation(inst)?;
         boot_preflight(cfg)?;
         self.start_owned(cfg, inst)
     }
 
     fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<()> {
         let (inst, _target) = running.into_parts();
+        let _operation = crate::backend::lock_instance_operation(&inst)?;
         let rt = self.runtime()?;
         let _lock = state::lock_instance(&inst)?;
         let sidecar = Self::owned_sidecar(cfg, &inst)?;
@@ -1590,6 +1593,7 @@ impl VmBackend for AppleContainerBackend {
     /// no longer be reached safely can still be stopped (its disk is kept).
     /// Ownership is still required; an unfinished journal does not block it.
     fn stop_unproven(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+        let _operation = crate::backend::lock_instance_operation(inst)?;
         let owner = Owner::load(cfg)?;
         let sidecar = MachineSidecar::load(inst)?;
         sidecar.check_owner(&owner)?;
@@ -1607,6 +1611,7 @@ impl VmBackend for AppleContainerBackend {
         if !inst.dir.exists() {
             return Ok(());
         }
+        let _operation = crate::backend::lock_instance_operation(inst)?;
         // Held until the directory (lock file included) is gone, so no other
         // mutation can change the records this reads.
         let _lock = state::lock_instance(inst)?;
@@ -1802,7 +1807,9 @@ impl VmBackend for AppleContainerBackend {
         if !start_after {
             return Ok(());
         }
-        let Err(start_err) = self.start_existing(cfg, inst) else {
+        // `stopped` already holds the operation lock, so start without
+        // re-taking it.
+        let Err(start_err) = boot_preflight(cfg).and_then(|()| self.start_owned(cfg, inst)) else {
             return Ok(());
         };
         // A failed start stops the sandbox it booted; the rollback's own
@@ -2011,10 +2018,11 @@ impl VmBackend for AppleContainerBackend {
     }
 
     fn as_stopped(&self, inst: Instance) -> Result<StoppedInstance> {
+        let lock = crate::backend::lock_instance_operation(&inst)?;
         let sidecar = MachineSidecar::load(&inst)?;
         let rec = self.runtime()?.inspect(&sidecar.machine_id)?;
         match rec.status {
-            SandboxStatus::Stopped => Ok(StoppedInstance::new(inst)),
+            SandboxStatus::Stopped => Ok(StoppedInstance::new(inst, lock)),
             SandboxStatus::Running => bail!(
                 "Instance '{}' is running — stop it first with `coop stop {}`",
                 inst.name,
@@ -2193,6 +2201,8 @@ fn save_template_config(cfg: &CoopConfig, opts: &SetupOptions, manifest_id: &str
         plugins: Vec::new(),
         codex_marketplaces: Vec::new(),
         codex_plugins: Vec::new(),
+        grok_marketplaces: Vec::new(),
+        grok_plugins: Vec::new(),
         guest_user: opts.guest_user.clone(),
         oci_features: crate::devcontainer_oci::installed_features(&opts.oci_features),
     }

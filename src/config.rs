@@ -5614,7 +5614,7 @@ skip = ["not-a-slug"]
         let cfg = test_config(&tmp);
 
         // The malformed metadata may have held any valid index.
-        let broken = tmp.path().join("instances").join("broken");
+        let broken = state_root_of(tmp.path()).join("instances").join("broken");
         fs::create_dir_all(&broken).unwrap();
         fs::write(broken.join("instance.json"), "not json").unwrap();
 

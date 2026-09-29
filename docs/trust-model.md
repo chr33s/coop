@@ -14,7 +14,8 @@ they don't introduce one.
 ## The core boundary: the VM
 
 **coop's isolation boundary is the guest VM itself** — a Firecracker microVM on
-Linux, a Lima VM (Apple Virtualization.framework) on macOS. The point of the
+Linux, a Lima VM (Apple Virtualization.framework) on macOS, or a coop-sandbox VM
+(Apple `containerization`) in the opt-in `apple-container` macOS build. The point of the
 tool is to run AI coding agents (Claude Code, Codex, Grok Build) with broad
 autonomy *inside* that boundary, so the guest is deliberately permissive:
 

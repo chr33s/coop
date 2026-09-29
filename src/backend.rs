@@ -24,6 +24,7 @@ use crate::setup::SetupOptions;
 mod capabilities;
 mod endpoint_plan;
 mod host_keys;
+#[cfg(any(not(target_os = "macos"), test))]
 mod unproven_stop;
 
 pub use crate::backend::capabilities::{BackendCapabilities, Capability};
@@ -39,6 +40,7 @@ pub use crate::backend::host_keys::HostKeyPolicy;
 )]
 pub use crate::backend::host_keys::PinnedHostKey;
 pub(crate) use crate::backend::host_keys::quote_ssh_value;
+#[cfg(not(target_os = "macos"))]
 use crate::backend::unproven_stop::stop_if_probed_running;
 
 // ── Operation modes ───────────────────────────────────────────
@@ -192,7 +194,7 @@ impl StoppedInstance {
 
 const OPERATION_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn lock_instance_operation(inst: &Instance) -> Result<FileLock> {
+pub(crate) fn lock_instance_operation(inst: &Instance) -> Result<FileLock> {
     lock_sibling_bounded(&inst.dir, OPERATION_LOCK_TIMEOUT)
 }
 
@@ -1050,7 +1052,8 @@ impl VmBackend for FirecrackerBackend {
     }
 
     fn stop_unproven(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
-        stop_if_probed_running(Ok(inst.is_running()), || {
+        let _operation = lock_instance_operation(inst)?;
+        stop_if_probed_running(inst.probe_running(), || {
             crate::vm::FirecrackerVm::from_running_unchecked(cfg, inst).stop()
         })
     }
@@ -1237,6 +1240,10 @@ impl VmBackend for FirecrackerBackend {
 pub struct LimaBackend;
 
 #[cfg(any(target_os = "macos", test))]
+#[cfg_attr(
+    feature = "apple-container",
+    expect(dead_code, reason = "apple-container replaces Lima as PlatformBackend")
+)]
 impl LimaBackend {
     pub fn new() -> Self {
         Self
@@ -1245,6 +1252,7 @@ impl LimaBackend {
     /// Construct for a loaded config. This backend has no config-dependent
     /// state; the constructor exists so every `PlatformBackend` is built the
     /// same way.
+    #[cfg(target_os = "macos")]
     pub fn for_config(_cfg: &CoopConfig) -> Self {
         Self::new()
     }
@@ -1291,21 +1299,19 @@ impl VmBackend for LimaBackend {
         crate::lima::start_existing(cfg, inst)
     }
 
-    fn stop(&self, _cfg: &CoopConfig, running: RunningInstance) -> Result<()> {
+    fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<()> {
         let (inst, _target) = running.into_parts();
-        let _operation = lock_instance_operation(&inst)?;
-        match crate::lima::probe_state(&inst)? {
-            Some(crate::lima::LimaState::Running) => crate::lima::stop_running(&inst),
+        self.stop_unproven(cfg, &inst)
+    }
+
+    fn stop_unproven(&self, _cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+        let _operation = lock_instance_operation(inst)?;
+        match crate::lima::probe_state(inst)? {
+            Some(crate::lima::LimaState::Running) => crate::lima::stop_running(inst),
             Some(crate::lima::LimaState::Stopped) => Ok(()),
             Some(state) => bail!("Lima instance '{}' is {state}; cannot stop", inst.name),
             None => bail!("Lima instance '{}' is absent", inst.name),
         }
-    }
-
-    fn stop_unproven(&self, _cfg: &CoopConfig, inst: &Instance) -> Result<()> {
-        stop_if_probed_running(crate::lima::probe_running(inst), || {
-            crate::lima::stop_running(inst)
-        })
     }
 
     fn destroy_instance(&self, _cfg: &CoopConfig, inst: &Instance) -> Result<()> {
@@ -1670,8 +1676,15 @@ pub fn bootstrap_agents(
         setup_github_auth(session)?;
     }
 
-    bootstrap_claude(session, cfg, inst, mode, guest_host)?;
-    bootstrap_codex(session, cfg, inst, mode, guest_host)?;
+    // Reconcile local-model tunnels once for both agents, before either
+    // publishes a URL that depends on one: open what the current config
+    // needs, keep what is already live, and close what it no longer needs
+    // (local mode switched off, or an endpoint moved).
+    let tunnels = local_endpoint_tunnels(&ModelState::load_or_default(inst)?, cfg, route)?;
+    crate::proxy::sync_model_tunnels(inst, &session.target, &tunnels)?;
+
+    bootstrap_claude(session, cfg, inst, mode, route)?;
+    bootstrap_codex(session, cfg, inst, mode, route)?;
     bootstrap_grok(session, cfg, inst, mode)?;
 
     Ok(())
@@ -4325,6 +4338,7 @@ mod tests {
             port: NonZeroU16::new(22).unwrap(),
             user: SshUser::new("ubuntu").unwrap(),
             key_path: root.join("key"),
+            host_keys: HostKeyPolicy::Unverified,
         };
         LimaBackend::new()
             .stop(&CoopConfig::default(), RunningInstance::new(inst, target))
@@ -4399,6 +4413,93 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&disk).unwrap(), "after");
     }
 
+    fn test_route() -> LocalEndpointRoute {
+        LocalEndpointRoute::HostAddress("172.16.0.1".into())
+    }
+
+    #[test]
+    fn pinned_policy_emits_strict_options_once() {
+        let pinned = HostKeyPolicy::Pinned(PinnedHostKey {
+            known_hosts: PathBuf::from("/state/known_hosts"),
+            alias: Hostname::new("coop-abc").unwrap(),
+        });
+        let target = SshTarget {
+            host: Hostname::new("192.168.64.5").unwrap(),
+            port: NonZeroU16::new(22).unwrap(),
+            user: SshUser::new("coop").unwrap(),
+            key_path: PathBuf::from("/k"),
+            host_keys: pinned.clone(),
+        };
+        let opts = target.ssh_opts();
+        let joined = opts.join(" ");
+        assert!(joined.contains("StrictHostKeyChecking=yes"));
+        assert!(joined.contains("UserKnownHostsFile=/state/known_hosts"));
+        assert!(joined.contains("HostKeyAlias=coop-abc"));
+        assert!(joined.contains("ForwardAgent=no"));
+        assert!(joined.contains("IdentityAgent=none"));
+        assert!(!joined.contains("StrictHostKeyChecking=no"));
+        assert!(!joined.contains("/dev/null") || joined.contains("GlobalKnownHostsFile=/dev/null"));
+        assert!(!joined.contains("UserKnownHostsFile=/dev/null"));
+        assert!(target.rsync_ssh_cmd().contains("StrictHostKeyChecking=yes"));
+        assert!(
+            target
+                .scp_opts()
+                .join(" ")
+                .contains("HostKeyAlias=coop-abc")
+        );
+
+        let unpinned = SshTarget {
+            host_keys: HostKeyPolicy::Unverified,
+            ..target.clone()
+        };
+        assert_ne!(target.control_path(), unpinned.control_path());
+        let other_instance = SshTarget {
+            host_keys: HostKeyPolicy::Pinned(PinnedHostKey {
+                known_hosts: PathBuf::from("/state/known_hosts"),
+                alias: Hostname::new("coop-def").unwrap(),
+            }),
+            ..target.clone()
+        };
+        assert_ne!(
+            target.control_path(),
+            other_instance.control_path(),
+            "a reassigned address must not share another instance's master"
+        );
+        assert_eq!(
+            pinned.ssh_config_lines()[0],
+            "StrictHostKeyChecking yes".to_string()
+        );
+    }
+
+    #[test]
+    fn pinned_known_hosts_path_with_space_stays_one_value() {
+        let target = SshTarget {
+            host: Hostname::new("192.168.64.5").unwrap(),
+            port: NonZeroU16::new(22).unwrap(),
+            user: SshUser::new("coop").unwrap(),
+            key_path: PathBuf::from("/Users/me/Application Support/vm_key"),
+            host_keys: HostKeyPolicy::Pinned(PinnedHostKey {
+                known_hosts: PathBuf::from("/Users/me/Application Support/known_hosts"),
+                alias: Hostname::new("coop-abc").unwrap(),
+            }),
+        };
+        assert!(
+            target.ssh_opts().contains(
+                &"UserKnownHostsFile=\"/Users/me/Application Support/known_hosts\"".into()
+            )
+        );
+        let rsync = target.rsync_ssh_cmd();
+        assert!(
+            rsync.contains("'UserKnownHostsFile=\"/Users/me/Application Support/known_hosts\"'")
+        );
+        assert!(rsync.contains("'/Users/me/Application Support/vm_key'"));
+        assert!(
+            target.host_keys.ssh_config_lines().contains(
+                &"UserKnownHostsFile \"/Users/me/Application Support/known_hosts\"".into()
+            )
+        );
+    }
+
     const SAMPLE_OUTPUT: &str = "\
 0.12 0.08 0.03 1/42 1234
 MemTotal:        2048000 kB
@@ -4415,6 +4516,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             port: NonZeroU16::new(22).unwrap(),
             user: SshUser::new("ubuntu").unwrap(),
             key_path: PathBuf::from("/tmp/test-key"),
+            host_keys: crate::backend::HostKeyPolicy::Unverified,
         }
     }
 

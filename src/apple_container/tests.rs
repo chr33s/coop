@@ -971,13 +971,13 @@ fn restore_journals_the_generation_and_marks_reenrollment() {
     foreign.guest_user = crate::guest::GuestUser::new("dev").unwrap();
     foreign.save(&cfg, &other).unwrap();
     let err = be
-        .restore_disk(&cfg, &StoppedInstance::new(inst.clone()), &other)
+        .restore_disk(&cfg, &stopped_for_test(&inst), &other)
         .unwrap_err();
     assert!(format!("{err:#}").contains("guest user 'dev'"), "{err:#}");
     assert!(mutations(&calls).is_empty());
     assert!(Journal::try_load(&inst).unwrap().is_none());
 
-    be.restore_disk(&cfg, &StoppedInstance::new(inst.clone()), &image)
+    be.restore_disk(&cfg, &stopped_for_test(&inst), &image)
         .unwrap();
     assert_eq!(mutations(&calls), ["restore"]);
     let after = MachineSidecar::load(&inst).unwrap();
@@ -1021,7 +1021,7 @@ fn resize_grows_but_never_shrinks() {
             fail("unexpected")
         }),
     );
-    let stopped_inst = StoppedInstance::new(inst.clone());
+    let stopped_inst = stopped_for_test(&inst);
     let err = be
         .resize_disk(&cfg, &stopped_inst, GiB::new(4).unwrap())
         .unwrap_err();
@@ -1187,6 +1187,44 @@ fn stop_unproven_stops_without_qualification_or_ssh() {
     be.stop_unproven(&cfg, &inst).unwrap();
     assert!(*stopped.borrow());
     assert_eq!(mutations(&calls), ["stop"]);
+}
+
+/// A stop waits for the instance operation lock, so it cannot interleave
+/// with a multi-step mutation that holds a `StoppedInstance`.
+#[test]
+fn stop_unproven_waits_for_the_operation_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_cfg(tmp.path());
+    let owner = Owner::load_or_init(&cfg).unwrap();
+    let inst = test_inst(&cfg);
+    write_sidecar(&inst, &owner);
+    let off = inspect_json(&cfg, &owner, "stopped");
+    let (be, calls) = backend(
+        &cfg,
+        Box::new(move |args| {
+            if let Some(o) = version(args, false) {
+                return o;
+            }
+            if starts(args, &["inspect"]) {
+                return ok(&off);
+            }
+            fail("unexpected")
+        }),
+    );
+    let held = std::time::Duration::from_millis(200);
+    let lock = crate::backend::lock_instance_operation(&inst).unwrap();
+    let holder = std::thread::spawn(move || {
+        std::thread::sleep(held);
+        drop(lock);
+    });
+    let started = std::time::Instant::now();
+    be.stop_unproven(&cfg, &inst).unwrap();
+    assert!(
+        started.elapsed() >= held,
+        "stop ran while the lock was held"
+    );
+    holder.join().unwrap();
+    assert!(mutations(&calls).is_empty());
 }
 
 /// Stopping without proof still requires ownership of the record.
@@ -1561,7 +1599,7 @@ fn commit_saves_a_disk_manifest_from_the_runtime_record() {
         }),
     );
     let image = ImageName::new("snap").unwrap();
-    be.commit_disk(&cfg, &StoppedInstance::new(inst.clone()), &image)
+    be.commit_disk(&cfg, &stopped_for_test(&inst), &image)
         .unwrap();
     let call = calls
         .borrow()
@@ -1615,7 +1653,7 @@ fn failed_commit_deletes_its_disk() {
     );
     let image = ImageName::new("snap").unwrap();
     let err = be
-        .commit_disk(&cfg, &StoppedInstance::new(inst.clone()), &image)
+        .commit_disk(&cfg, &stopped_for_test(&inst), &image)
         .unwrap_err();
     assert!(
         format!("{err:#}").contains("metadata write failed"),
@@ -1666,7 +1704,7 @@ fn resource_change_that_does_not_apply_is_uncertain() {
     let err = be
         .set_machine_resources(
             &cfg,
-            &StoppedInstance::new(inst.clone()),
+            &stopped_for_test(&inst),
             None,
             NonZeroU8::new(6),
             false,
@@ -2366,7 +2404,7 @@ fn resource_changes_are_verified_and_rolled_back() {
     let sim = Sim::new(&cfg, &owner);
     sim_sandbox(&sim, &owner, SandboxStatus::Stopped);
     let (be, calls) = sim_backend(&cfg, &sim);
-    let stopped = StoppedInstance::new(inst.clone());
+    let stopped = stopped_for_test(&inst);
     let mem = Some(VmMemory::new(crate::config::MiB::new(4096).unwrap()).unwrap());
 
     sim.borrow_mut().faults = vec![Fault::SetIgnoresMemory];
@@ -2453,13 +2491,7 @@ fn failed_restart_after_change(faults: Vec<Fault>, prepare: fn(&mut Sim)) -> Fai
     let (be, calls) = sim_backend(&cfg, &sim);
     let mem = Some(VmMemory::new(crate::config::MiB::new(6144).unwrap()).unwrap());
     let err = be
-        .set_machine_resources(
-            &cfg,
-            &StoppedInstance::new(inst.clone()),
-            mem,
-            NonZeroU8::new(6),
-            true,
-        )
+        .set_machine_resources(&cfg, &stopped_for_test(&inst), mem, NonZeroU8::new(6), true)
         .unwrap_err();
     FailedRestart {
         err,
@@ -2735,11 +2767,7 @@ fn grow_requires_its_own_committed_operation() {
             }),
         );
         let err = be
-            .resize_disk(
-                &cfg,
-                &StoppedInstance::new(inst.clone()),
-                GiB::new(32).unwrap(),
-            )
+            .resize_disk(&cfg, &stopped_for_test(&inst), GiB::new(32).unwrap())
             .unwrap_err();
         assert!(
             matches!(kind(&err), AppleError::OperationUncertain(_)),
@@ -2784,11 +2812,7 @@ fn failed_grow_is_uncertain_only_when_it_committed() {
             }),
         );
         let err = be
-            .resize_disk(
-                &cfg,
-                &StoppedInstance::new(inst.clone()),
-                GiB::new(32).unwrap(),
-            )
+            .resize_disk(&cfg, &stopped_for_test(&inst), GiB::new(32).unwrap())
             .unwrap_err();
         let uncertain = matches!(
             err.downcast_ref::<AppleError>(),
@@ -2848,7 +2872,7 @@ fn restore_requires_its_own_committed_operation() {
             }),
         );
         let err = be
-            .restore_disk(&cfg, &StoppedInstance::new(inst.clone()), &image)
+            .restore_disk(&cfg, &stopped_for_test(&inst), &image)
             .unwrap_err();
         let case = format!("{ours} {raised}");
         assert!(
@@ -2996,4 +3020,11 @@ fn canonical_path_resolves_through_the_existing_ancestor() {
     let tmp = tempfile::tempdir().unwrap();
     let real = tmp.path().canonicalize().unwrap();
     assert_eq!(canonical_path(&tmp.path().join("a/b")), real.join("a/b"));
+}
+
+fn stopped_for_test(inst: &Instance) -> StoppedInstance {
+    StoppedInstance::new(
+        inst.clone(),
+        crate::backend::lock_instance_operation(inst).unwrap(),
+    )
 }

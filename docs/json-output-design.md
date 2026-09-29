@@ -544,5 +544,5 @@ For each command you add:
 - [ ] Add shape tests (edges: `null`, `[]`, array vs object, enum tokens).
 - [ ] Update `.cargo/mutants.toml` (exclude IO/stdout writers; keep pure builders
       in scope) **in the same PR**.
-- [ ] Run `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`,
+- [ ] Run `cargo fmt`, `cargo clippy --all-targets -- -D warnings`,
       `cargo test`, and `cargo mutants -f <touched> -- --lib`.

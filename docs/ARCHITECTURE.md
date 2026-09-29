@@ -2,7 +2,7 @@
 
 `coop` is a Rust CLI that orchestrates isolated VM environments for running AI
 coding agents (Claude Code, Codex, Grok Build). It manages the full VM lifecycle — setup,
-start, shell, stop, destroy, status, logs — behind two platform backends:
+start, shell, stop, destroy, status, logs — behind its platform backends:
 
 - **Linux** — Firecracker microVMs on KVM.
 - **macOS** — Lima VMs on Apple Virtualization.framework (`limactl`).

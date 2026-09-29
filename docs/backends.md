@@ -2,7 +2,7 @@
 
 coop selects its VM backend at compile time. macOS builds use Lima. Linux builds use Firecracker. A macOS build with the opt-in `apple-container` feature uses coop-sandbox VMs on Apple's `containerization` package instead of Lima (see [macOS / Apple sandbox](#macos--apple-sandbox-opt-in)). The binary determines the backend; there is no runtime override.
 
-All backends expose the same CLI commands and produce the same guest environment: Ubuntu with Docker, GitHub CLI, Claude Code, and Codex pre-installed. The backends differ in how they create and manage the VM underneath.
+All backends expose the same CLI commands and produce the same guest environment: Ubuntu with Docker, GitHub CLI, Claude Code, Codex, and Grok Build pre-installed. The backends differ in how they create and manage the VM underneath.
 
 ## macOS / Lima
 
@@ -43,7 +43,7 @@ The Lima template configures:
 
 ### Resize (disk, memory, vCPUs)
 
-Resizing a stopped instance's disk truncates the Lima disk to the new size and updates the instance `lima.yaml` `disk:` field to match, so the next start sees the grown size. Cloud-init's `growpart` module expands the partition and filesystem on next boot. Shrinking is not supported.
+Resizing a stopped instance's disk records the new size as `disk:` in its `lima.yaml` (Lima 2.x refuses to boot when the disk is larger than that value) and truncates the Lima disk to it. Cloud-init's `growpart` module expands the partition and filesystem on next boot. Shrinking is not supported. Re-running `coop resize --size` at the current size repairs an instance whose `lima.yaml` lags its disk.
 
 Memory and vCPU changes rewrite the `cpus`/`memory` fields in the instance's `lima.yaml`, which Lima re-reads on `limactl start`. The edit is written atomically, then coop starts the instance to validate and apply the new spec — if `limactl` rejects it (e.g. a spec larger than the host), the previous `lima.yaml` is restored. Without `--start` the instance is stopped again after the validating boot. The `lima.yaml` is authoritative: the global `[vm]` `cpus`/`memory` settings only seed *new* instances.
 
@@ -122,7 +122,7 @@ Instances created by the retired `container machine` backend (schema 1) are refu
 
 1. Checks the platform, resolves and qualifies coop-sandbox (`coop-sandbox version`: protocol 2, containerization 0.45.0), and creates `owner.json` and the VM-access key pair.
 2. Initializes the runtime root: copies the kernel after checking its pinned sha256, and pulls the pinned init image. Unless the runtime already has the current maintenance image, builds it (Ubuntu with e2fsprogs; log in `maintenance-build.log`), installs it with `coop-sandbox maintenance install`, and deletes the store copy.
-3. Renders a minimal build context in a private temporary directory: a Dockerfile `FROM ubuntu:24.04` pinned by digest, the same provisioning script Lima uses (packages, profiles, OCI features, guest user, Claude Code, Codex, Docker), and a machine-setup script. The context contains the coop **public** key only. There are no build arguments and no secrets.
+3. Renders a minimal build context in a private temporary directory: a Dockerfile `FROM ubuntu:24.04` pinned by digest, the same provisioning script Lima uses (packages, profiles, OCI features, guest user, Claude Code, Codex, Grok Build, Docker), and a machine-setup script. The context contains the coop **public** key only. There are no build arguments and no secrets.
 4. Checks that the builder's service is running, then runs `container build --platform linux/arm64 -t local/coop-<owner>:<hash>-<nonce>`, with output in `images/<name>/build.log`. Every build gets a fresh tag, so a rebuild never retags an image in use.
 5. Saves the image as an OCI archive, imports it into the runtime's private store, and deletes the builder's copy.
 6. Boots the image in a disposable sandbox with no credentials, passing the same isolation gate an instance does. It checks the required guest binaries and the guest user's uid (1000), and waits (up to `boot_timeout_seconds`) for `ssh` and `docker`. Then it stops and deletes the sandbox. The unpacked disk stays cached for the first `coop up`.

@@ -2210,6 +2210,8 @@ Host coop-app\n\
         assert!(block.contains("Port 2222"));
         assert!(block.contains("User ubuntu"));
         assert!(block.contains("IdentityFile /tmp/key"));
+        assert!(block.contains("    IdentityAgent none\n"));
+        assert!(block.contains("    ForwardAgent no\n"));
         assert!(block.contains("StrictHostKeyChecking no"));
         assert!(block.contains("UserKnownHostsFile /dev/null"));
     }

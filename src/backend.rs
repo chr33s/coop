@@ -4521,6 +4521,38 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
     }
 
     #[test]
+    fn every_transport_disables_host_agent_for_both_host_key_policies() {
+        for policy in [
+            HostKeyPolicy::Unverified,
+            HostKeyPolicy::Pinned(PinnedHostKey {
+                known_hosts: PathBuf::from("/state/known_hosts"),
+                alias: Hostname::new("coop-abc").unwrap(),
+            }),
+        ] {
+            let target = SshTarget {
+                host_keys: policy,
+                ..ssh_test_target()
+            };
+            for (name, opts) in [
+                ("ssh", target.ssh_opts()),
+                ("scp", target.scp_opts()),
+                ("mux", target.ssh_opts_mux()),
+            ] {
+                for option in ["IdentityAgent=none", "ForwardAgent=no"] {
+                    assert_eq!(
+                        opts.iter().filter(|opt| opt.as_str() == option).count(),
+                        1,
+                        "{name} must disable the host agent exactly once: {option}"
+                    );
+                }
+            }
+            let rsync = target.rsync_ssh_cmd();
+            assert!(rsync.contains("-o IdentityAgent=none"));
+            assert!(rsync.contains("-o ForwardAgent=no"));
+        }
+    }
+
+    #[test]
     fn every_transport_is_bounded_against_a_wedged_guest() {
         let target = ssh_test_target();
         let ssh = target.ssh_opts();

@@ -44,6 +44,10 @@ impl HostKeyPolicy {
             Self::Unverified => vec![
                 "StrictHostKeyChecking=no".into(),
                 "UserKnownHostsFile=/dev/null".into(),
+                // Coop-owned connections use the coop key and never expose
+                // or consult the host's authentication agent.
+                "ForwardAgent=no".into(),
+                "IdentityAgent=none".into(),
             ],
             Self::Pinned(pin) => vec![
                 "StrictHostKeyChecking=yes".into(),
@@ -106,6 +110,8 @@ mod tests {
             vec![
                 "StrictHostKeyChecking no".to_string(),
                 "UserKnownHostsFile /dev/null".to_string(),
+                "ForwardAgent no".to_string(),
+                "IdentityAgent none".to_string(),
             ]
         );
     }
